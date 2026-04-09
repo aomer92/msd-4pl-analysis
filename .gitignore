@@ -1,0 +1,29 @@
+# PyInstaller build artifacts
+build/
+dist/
+*.spec
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Virtual environment
+msd_env/
+
+# Runtime files
+last_run.json
+.msd_4pl_last_run.json
+
+# Test/experiment data
+test_mock/
+
+# macOS
+.DS_Store
+
+# Experiment data folders (raw instrument output)
+185-008_ControlVariability/
+20260402_HTTVariability_185-005/
+20260407_KCNT1MSDDevelopment/
+KCNT1AssayDevelopment/
+MSD_4PL_Analysis/
