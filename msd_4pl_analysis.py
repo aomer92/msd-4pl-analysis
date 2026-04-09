@@ -125,7 +125,7 @@ The Excel workbook contains:
     by sample name, with averaged signals and concentrations.
 """
 
-import re, sys, argparse, os, tempfile, json
+import re, sys, argparse, os, tempfile, json, subprocess, platform
 
 LAST_RUN_PATH = os.path.join(os.path.expanduser('~'), '.msd_4pl_last_run.json')
 from io import StringIO
@@ -1049,8 +1049,21 @@ def create_output(results, output_path, msd_path, raw_plate_blocks, units=None, 
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════════════════
 # MAIN
 # ═══════════════════════════════════════════════════════════════════════════════
+
+def _open_file(path):
+    """Open a file with the system default application (cross-platform)."""
+    try:
+        if platform.system() == 'Darwin':
+            subprocess.Popen(['open', path])
+        elif platform.system() == 'Windows':
+            os.startfile(path)
+        else:
+            subprocess.Popen(['xdg-open', path])
+    except Exception as e:
+        print(f"Note: could not auto-open file: {e}")
 
 def run_analysis(msd_path, platemap_path, output_path, spots_override=None, units=None, cv_threshold=25, dilution_factors=None, lloq_method='current'):
     print("=" * 60)
@@ -1202,6 +1215,7 @@ def run_analysis(msd_path, platemap_path, output_path, spots_override=None, unit
     print(f"Generating Excel: {output_path}")
     create_output(results, output_path, msd_path, raw_plate_blocks, units, cv_threshold, plate_dilution_factors, lloq_method)
     print("Done!")
+    _open_file(output_path)
 
     # Save last run parameters
     last_args = {
