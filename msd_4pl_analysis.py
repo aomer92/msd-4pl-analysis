@@ -668,6 +668,47 @@ def calculate_lloq_signal(signals, lloq_method='current'):
     return None
 
 
+def parse_total_protein_csv(filepath):
+    """
+    Parse a total protein CSV file. Expects columns:
+      'External Animal Number', 'Tissue Type', 'Total Protein Result'
+    Multiple rows with the same (animal, tissue) are averaged.
+    Returns dict {(animal_str, tissue_str): avg_total_protein}
+    """
+    df = pd.read_csv(filepath, dtype=str)
+    df.columns = [c.strip() for c in df.columns]
+    required = {'External Animal Number', 'Tissue Type', 'Total Protein Result'}
+    missing = required - set(df.columns)
+    if missing:
+        raise ValueError(f"Total protein CSV missing columns: {missing}")
+    tp_map = {}
+    for _, row in df.iterrows():
+        animal = str(row['External Animal Number']).strip()
+        tissue = str(row['Tissue Type']).strip()
+        try:
+            val = float(row['Total Protein Result'])
+        except (ValueError, TypeError):
+            continue
+        key = (animal, tissue)
+        if key not in tp_map:
+            tp_map[key] = []
+        tp_map[key].append(val)
+    return {k: float(np.mean(v)) for k, v in tp_map.items()}
+
+
+def _extract_animal_tissue(sample_name):
+    """
+    Parse animal number and tissue type from a sample name.
+    Expects format: '{TissueType}-{AnimalNumber}' or '{TissueType}-{AnimalNumber}_{suffix}'
+    e.g. 'fCtx-1001_P1' → ('1001', 'fCtx')
+    Returns (animal_str, tissue_str) or (None, None) if no match.
+    """
+    m = re.match(r'^([A-Za-z]+)-(\d+)', sample_name.strip())
+    if m:
+        return m.group(2), m.group(1)  # (animal, tissue)
+    return None, None
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # EXCEL OUTPUT
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -714,7 +755,7 @@ def _section_title(ws, row, title, span=5):
     ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=span)
 
 
-def create_output(results, output_path, msd_path, raw_plate_blocks, units=None, cv_threshold=25, plate_dilution_factors=None, lloq_method='current'):
+def create_output(results, output_path, msd_path, raw_plate_blocks, units=None, cv_threshold=25, plate_dilution_factors=None, lloq_method='current', total_protein_map=None):
     wb = Workbook()
     wb.remove(wb.active)
     tmp_dir = tempfile.mkdtemp(prefix='msd_charts_')
@@ -949,7 +990,7 @@ def create_output(results, output_path, msd_path, raw_plate_blocks, units=None, 
     # ── All Unknowns Combined ─────────────────────────────────────────
     ws_all = wb.create_sheet("All Unknowns")
     all_h = ["Sample Name", "Group", "Plate", "Wells", "Avg Signal", avg_interp_header,
-             "Dilution Factor", corrected_header, "%CV", "Flag"]
+             "Dilution Factor", corrected_header, "Total Protein (µg/µL)", "%CV", "Flag"]
     _header_row(ws_all, 1, all_h)
     arow = 2
 
@@ -1022,13 +1063,21 @@ def create_output(results, output_path, msd_path, raw_plate_blocks, units=None, 
         corrected_cell = ws_all.cell(row=arow, column=8)
         corrected_cell.value = round(corrected_conc, 4) if np.isfinite(corrected_conc) else "N/A"
         corrected_cell.number_format = '#,##0.0000'
-        cv_cell = ws_all.cell(row=arow, column=9)
+        # Total Protein lookup (col 9)
+        tp_cell = ws_all.cell(row=arow, column=9)
+        if total_protein_map:
+            animal, tissue = _extract_animal_tissue(sample_name)
+            tp_val = total_protein_map.get((animal, tissue)) if animal else None
+            if tp_val is not None:
+                tp_cell.value = round(tp_val, 4)
+                tp_cell.number_format = '0.0000'
+        cv_cell = ws_all.cell(row=arow, column=10)
         cv_cell.value = round(cv, 1) if np.isfinite(cv) else "N/A"
         cv_cell.number_format = '0.0'
         if np.isfinite(cv):
             cv_cell.fill = CV_BAD_FILL if cv > cv_threshold else CV_GOOD_FILL
-        ws_all.cell(row=arow, column=10, value=flag)
-        cell_flag = ws_all.cell(row=arow, column=10)
+        ws_all.cell(row=arow, column=11, value=flag)
+        cell_flag = ws_all.cell(row=arow, column=11)
         cell_flag.font = PASS_FONT if flag == "In Range" else (WARN_FONT if flag in ["> ULOQ", "< LLOQ"] else FAIL_FONT)
         _style_row(ws_all, arow, len(all_h))
         arow += 1
@@ -1065,7 +1114,7 @@ def _open_file(path):
     except Exception as e:
         print(f"Note: could not auto-open file: {e}")
 
-def run_analysis(msd_path, platemap_path, output_path, spots_override=None, units=None, cv_threshold=25, dilution_factors=None, lloq_method='current'):
+def run_analysis(msd_path, platemap_path, output_path, spots_override=None, units=None, cv_threshold=25, dilution_factors=None, lloq_method='current', total_protein_path=None):
     print("=" * 60)
     print("MSD 4PL ANALYSIS")
     print("=" * 60)
@@ -1211,9 +1260,18 @@ def run_analysis(msd_path, platemap_path, output_path, spots_override=None, unit
             print(f"  - {label}")
         sys.exit(1)
 
+    # Parse total protein CSV if provided
+    total_protein_map = None
+    if total_protein_path:
+        try:
+            total_protein_map = parse_total_protein_csv(total_protein_path)
+            print(f"\nLoaded total protein data: {len(total_protein_map)} animal/tissue entries")
+        except Exception as e:
+            print(f"Warning: could not load total protein CSV: {e}")
+
     print(f"\n{'=' * 60}")
     print(f"Generating Excel: {output_path}")
-    create_output(results, output_path, msd_path, raw_plate_blocks, units, cv_threshold, plate_dilution_factors, lloq_method)
+    create_output(results, output_path, msd_path, raw_plate_blocks, units, cv_threshold, plate_dilution_factors, lloq_method, total_protein_map)
     print("Done!")
     _open_file(output_path)
 
@@ -1226,7 +1284,8 @@ def run_analysis(msd_path, platemap_path, output_path, spots_override=None, unit
         'units': units,
         'cv_threshold': cv_threshold,
         'dilution_factors': list(plate_dilution_factors.values()) if plate_dilution_factors else None,
-        'lloq_method': lloq_method
+        'lloq_method': lloq_method,
+        'total_protein': total_protein_path
     }
     with open(LAST_RUN_PATH, 'w') as f:
         json.dump(last_args, f)
@@ -1261,6 +1320,7 @@ def run_interactive():
             cv_threshold_var.set(str(last_args.get('cv_threshold', '25')))
             lloq_method_var.set(last_args.get('lloq_method', 'current'))
             dilution_factors_var.set(','.join(str(x) for x in last_args.get('dilution_factors', [])) if last_args.get('dilution_factors') else '')
+            total_protein_var.set(last_args.get('total_protein', ''))
         except FileNotFoundError:
             messagebox.showinfo("No Last Run", "No previous run found to load.")
 
@@ -1273,6 +1333,7 @@ def run_interactive():
         cv_threshold = cv_threshold_var.get().strip()
         lloq_method = lloq_method_var.get()
         dilution_factors = dilution_factors_var.get().strip()
+        total_protein_path = total_protein_var.get().strip()
 
         if not msd_path or not platemap_path or not output_path:
             messagebox.showerror("Error", "Please select MSD file, plate map, and output location.")
@@ -1282,6 +1343,7 @@ def run_interactive():
         units = units if units else None
         cv_threshold = float(cv_threshold) if cv_threshold else None
         dilution_factors = dilution_factors if dilution_factors else None
+        total_protein_path = total_protein_path if total_protein_path else None
 
         root.destroy()
 
@@ -1300,11 +1362,11 @@ def run_interactive():
             print(f"Dilution factors: {dilution_factors}")
         print(f"LLOQ method: {lloq_method}")
 
-        run_analysis(msd_path, platemap_path, output_path, spots_override, units, cv_threshold, dilution_factors, lloq_method)
+        run_analysis(msd_path, platemap_path, output_path, spots_override, units, cv_threshold, dilution_factors, lloq_method, total_protein_path)
 
     root = tk.Tk()
     root.title("MSD 4PL Analysis Tool")
-    root.geometry("800x500")
+    root.geometry("800x540")
     root.resizable(False, False)
 
     # Variables
@@ -1316,6 +1378,7 @@ def run_interactive():
     cv_threshold_var = tk.StringVar(value="25")
     lloq_method_var = tk.StringVar(value="current")
     dilution_factors_var = tk.StringVar()
+    total_protein_var = tk.StringVar()
 
     # Layout
     frame = ttk.Frame(root, padding="10")
@@ -1354,9 +1417,13 @@ def run_interactive():
     ttk.Label(frame, text="Dilution Factors (comma-separated):").grid(row=7, column=0, sticky=tk.W, pady=2)
     ttk.Entry(frame, textvariable=dilution_factors_var, width=50).grid(row=7, column=1, pady=2)
 
+    ttk.Label(frame, text="Total Protein CSV (optional):").grid(row=8, column=0, sticky=tk.W, pady=2)
+    ttk.Entry(frame, textvariable=total_protein_var, width=50).grid(row=8, column=1, pady=2)
+    ttk.Button(frame, text="Browse", command=lambda: browse_file(total_protein_var, "Select Total Protein CSV", [("CSV Files", "*.csv"), ("All Files", "*.*")])).grid(row=8, column=2, pady=2)
+
     # Buttons
     button_frame = ttk.Frame(frame)
-    button_frame.grid(row=8, column=0, columnspan=3, pady=10)
+    button_frame.grid(row=9, column=0, columnspan=3, pady=10)
     ttk.Button(button_frame, text="Load Last Run", command=load_last_run).pack(side=tk.LEFT, padx=5)
     ttk.Button(button_frame, text="Run Analysis", command=run).pack(side=tk.LEFT, padx=5)
     ttk.Button(button_frame, text="Cancel", command=root.destroy).pack(side=tk.LEFT, padx=5)
@@ -1379,6 +1446,8 @@ if __name__ == '__main__':
                         help='LLOQ calculation method: current mean+10*SD or 3x blank mean')
     parser.add_argument('--dilution-factors', default=None,
                         help='Optional per-plate dilution factors as comma-separated values (e.g. 1,2,1)')
+    parser.add_argument('--total-protein', default=None,
+                        help='Optional total protein CSV for normalisation (External Animal Number + Tissue Type)')
     parser.add_argument('--gui', action='store_true', help='Launch interactive file picker dialogs')
     parser.add_argument('--rerun', action='store_true', help='Rerun the last analysis with saved parameters')
     args = parser.parse_args()
@@ -1395,6 +1464,7 @@ if __name__ == '__main__':
             args.cv_threshold = last_args.get('cv_threshold', 25)
             args.lloq_method = last_args.get('lloq_method', 'current')
             args.dilution_factors = last_args.get('dilution_factors')
+            args.total_protein = last_args.get('total_protein')
             args.gui = False
             print("Rerunning with last parameters:")
             print(f"  MSD: {args.msd}")
@@ -1418,7 +1488,7 @@ if __name__ == '__main__':
     if args.gui or (not args.msd and not args.platemap and not args.rerun):
         run_interactive()
     elif args.msd and args.platemap:
-        run_analysis(args.msd, args.platemap, args.output, args.spots, args.units, args.cv_threshold, args.dilution_factors, args.lloq_method)
+        run_analysis(args.msd, args.platemap, args.output, args.spots, args.units, args.cv_threshold, args.dilution_factors, args.lloq_method, args.total_protein)
     else:
         print("Error: provide both --msd and --platemap, or use --gui for interactive mode.")
         parser.print_help()
