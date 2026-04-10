@@ -1183,6 +1183,8 @@ def create_output(results, output_path, msd_path, raw_plate_blocks, units=None, 
             })
 
     for (sample_name, curve_group, plate) in sorted(unknown_groups.keys()):
+        if _identify_qc_level(sample_name):
+            continue  # QC samples reported in Summary sheet QC Recovery table
         group = unknown_groups[(sample_name, curve_group, plate)]
         signals = [g['signal'] for g in group if np.isfinite(g['signal'])]
         concs = [g['interp_conc'] for g in group if np.isfinite(g['interp_conc'])]
