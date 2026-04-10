@@ -429,22 +429,16 @@ def generate_overlay_chart(results, tmp_dir, qc_overlay_points=None, qc_expected
     qc_cmap = plt.cm.get_cmap('Set1')
     qc_level_colors = {level: qc_cmap(i % 9) for i, level in enumerate(QC_LEVELS)}
 
-    # ±30% expected concentration bands (drawn before QC points so points sit on top)
-    if qc_expected_concentrations:
-        band_legend_added = set()
-        for level, exp_conc in qc_expected_concentrations.items():
-            if exp_conc is None or not (np.isfinite(exp_conc) and exp_conc > 0):
-                continue
-            lo = exp_conc * 0.70
-            hi = exp_conc * 1.30
-            qc_color = qc_level_colors.get(level, 'grey')
-            band_label = f"{level} ±30% ({exp_conc:.3g})" if level not in band_legend_added else None
-            ax.axvspan(lo, hi, alpha=0.12, color=qc_color, zorder=1, label=band_label)
-            ax.axvline(exp_conc, color=qc_color, linewidth=0.8, linestyle='--', zorder=2)
-            band_legend_added.add(level)
-            # Expand axis range to include bands
-            global_conc_min = min(global_conc_min, lo)
-            global_conc_max = max(global_conc_max, hi)
+    # ±30% expected concentration band (single value, drawn before QC points)
+    if qc_expected_concentrations is not None and np.isfinite(qc_expected_concentrations) and qc_expected_concentrations > 0:
+        exp_conc = qc_expected_concentrations
+        lo, hi = exp_conc * 0.70, exp_conc * 1.30
+        ax.axvspan(lo, hi, alpha=0.15, color='steelblue', zorder=1,
+                   label=f"QC ±30% ({exp_conc:.3g})")
+        ax.axvline(exp_conc, color='steelblue', linewidth=1.0, linestyle='--', zorder=2)
+        # Expand axis range to include band
+        global_conc_min = min(global_conc_min, lo)
+        global_conc_max = max(global_conc_max, hi)
 
     # QC overlay points (corrected conc vs original signal)
     if qc_overlay_points:
@@ -480,7 +474,7 @@ def generate_overlay_chart(results, tmp_dir, qc_overlay_points=None, qc_expected
     ax.tick_params(which='both', direction='in', top=True, right=True)
     ax.grid(True, which='major', alpha=0.15, linewidth=0.5)
 
-    n_qc_bands = len(qc_expected_concentrations) if qc_expected_concentrations else 0
+    n_qc_bands = 1 if (qc_expected_concentrations is not None) else 0
     n_qc_pts  = len(set(pt['level'] for pt in (qc_overlay_points or []))) if qc_overlay_points else 0
     n_series = len(fitted) + n_qc_bands + n_qc_pts
     if n_series <= 6:
@@ -1475,9 +1469,8 @@ def run_interactive():
         saved_qc = entry.get('qc_dilution_factors') or {}
         for level in QC_LEVELS:
             qc_df_vars[level].set(str(saved_qc[level]) if saved_qc.get(level) is not None else '')
-        saved_exp = entry.get('qc_expected_concentrations') or {}
-        for level in QC_LEVELS:
-            qc_exp_vars[level].set(str(saved_exp[level]) if saved_exp.get(level) is not None else '')
+        saved_exp = entry.get('qc_expected_concentrations')
+        qc_exp_var.set(str(saved_exp) if saved_exp is not None else '')
 
     def load_selected_run():
         sel = history_lb.curselection()
@@ -1523,17 +1516,15 @@ def run_interactive():
                     return
         qc_dilution_factors = qc_dilution_factors if qc_dilution_factors else None
 
-        # Collect expected QC concentrations
-        qc_expected_concentrations = {}
-        for level in QC_LEVELS:
-            val_str = qc_exp_vars[level].get().strip()
-            if val_str:
-                try:
-                    qc_expected_concentrations[level] = float(val_str)
-                except ValueError:
-                    messagebox.showerror("Error", f"Invalid expected concentration for {level}: '{val_str}'")
-                    return
-        qc_expected_concentrations = qc_expected_concentrations if qc_expected_concentrations else None
+        # Collect single expected QC concentration
+        qc_expected_concentrations = None
+        val_str = qc_exp_var.get().strip()
+        if val_str:
+            try:
+                qc_expected_concentrations = float(val_str)
+            except ValueError:
+                messagebox.showerror("Error", f"Invalid expected QC concentration: '{val_str}'")
+                return
 
         root.destroy()
 
@@ -1574,7 +1565,7 @@ def run_interactive():
     dilution_factors_var = tk.StringVar()
     total_protein_var = tk.StringVar()
     qc_df_vars = {level: tk.StringVar() for level in QC_LEVELS}
-    qc_exp_vars = {level: tk.StringVar() for level in QC_LEVELS}
+    qc_exp_var = tk.StringVar()
 
     # Layout
     frame = ttk.Frame(root, padding="10")
@@ -1631,14 +1622,12 @@ def run_interactive():
         ttk.Entry(qc_lf, textvariable=qc_df_vars[level], width=9).grid(
             row=1, column=col_offset + 1, padx=6, pady=1)
 
-    # Row 2: Expected Concentrations
-    ttk.Label(qc_lf, text="Expected Conc.:").grid(row=2, column=0, sticky=tk.W, padx=(4, 8), pady=1)
-    for col_offset, level in enumerate(QC_LEVELS):
-        ttk.Entry(qc_lf, textvariable=qc_exp_vars[level], width=9).grid(
-            row=2, column=col_offset + 1, padx=6, pady=1)
-
-    ttk.Label(qc_lf, text="(±30% bands plotted on overlay)", foreground='grey').grid(
-        row=3, column=0, columnspan=6, sticky=tk.W, padx=4, pady=(0, 2))
+    # Row 2: Single expected concentration (shared across all QC levels)
+    exp_row = ttk.Frame(qc_lf)
+    exp_row.grid(row=2, column=0, columnspan=6, sticky=tk.W, pady=(4, 2))
+    ttk.Label(exp_row, text="Expected Conc. (all QC):").pack(side=tk.LEFT, padx=(4, 6))
+    ttk.Entry(exp_row, textvariable=qc_exp_var, width=12).pack(side=tk.LEFT)
+    ttk.Label(exp_row, text="  ← ±30% band plotted on overlay", foreground='grey').pack(side=tk.LEFT, padx=(6, 0))
 
     # ── Previous Runs section ──────────────────────────────────────────
     hist_lf = ttk.LabelFrame(frame, text="Previous Runs (click to select, then Load)", padding="6")
