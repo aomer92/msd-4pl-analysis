@@ -672,8 +672,8 @@ def parse_total_protein_csv(filepath):
     """
     Parse a total protein CSV file. Expects columns:
       'External Animal Number', 'Tissue Type', 'Total Protein Result'
-    Multiple rows with the same (animal, tissue) are averaged.
-    Returns dict {(animal_str, tissue_str): avg_total_protein}
+    Multiple rows with the same (animal, tissue) are kept in order of appearance.
+    Returns dict {(animal_str, tissue_str): [val1, val2, ...]}
     """
     df = pd.read_csv(filepath, dtype=str)
     df.columns = [c.strip() for c in df.columns]
@@ -693,7 +693,7 @@ def parse_total_protein_csv(filepath):
         if key not in tp_map:
             tp_map[key] = []
         tp_map[key].append(val)
-    return {k: float(np.mean(v)) for k, v in tp_map.items()}
+    return tp_map
 
 
 def _extract_animal_tissue(sample_name):
@@ -1001,6 +1001,8 @@ def create_output(results, output_path, msd_path, raw_plate_blocks, units=None, 
              "%CV", "Flag", "Dilution Factor", corrected_header, "Total Protein", "Normalized Protein Concentration"]
     _header_row(ws_all, 1, all_h)
     arow = 2
+    # Track how many TP values have been consumed per (animal, tissue) key
+    tp_index = defaultdict(int)
 
     # Collect all standards for uloq/lloq
     all_std_concs = set()
@@ -1085,12 +1087,16 @@ def create_output(results, output_path, msd_path, raw_plate_blocks, units=None, 
         corrected_cell = ws_all.cell(row=arow, column=11)
         corrected_cell.value = round(corrected_conc, 4) if np.isfinite(corrected_conc) else "N/A"
         corrected_cell.number_format = '#,##0.0000'
-        # Total Protein (col 12)
+        # Total Protein (col 12) — consume values in order of appearance per (animal, tissue)
         tp_val = None
         tp_cell = ws_all.cell(row=arow, column=12)
-        if total_protein_map:
-            tp_val = total_protein_map.get((animal, tissue)) if animal else None
-            if tp_val is not None:
+        if total_protein_map and animal:
+            tp_key = (animal, tissue)
+            tp_list = total_protein_map.get(tp_key, [])
+            idx = tp_index[tp_key]
+            if idx < len(tp_list):
+                tp_val = tp_list[idx]
+                tp_index[tp_key] += 1
                 tp_cell.value = round(tp_val, 4)
                 tp_cell.number_format = '0.0000'
         # Normalized Protein Concentration (col 13)
