@@ -851,7 +851,8 @@ def create_output(results, output_path, msd_path, raw_plate_blocks, units=None, 
     tmp_dir = tempfile.mkdtemp(prefix='msd_charts_')
 
     # Pre-collect QC overlay points (corrected conc + signal) for overlay chart
-    qc_overlay_points = []
+    qc_overlay_points = []   # used by chart
+    qc_summary_rows = []     # used by Summary sheet table
     if qc_dilution_factors:
         qc_groups = defaultdict(list)
         for res in results:
@@ -861,7 +862,7 @@ def create_output(results, output_path, msd_path, raw_plate_blocks, units=None, 
                 if level and level in qc_dilution_factors:
                     key = (sname, res.get('group', ''), res['plate'])
                     qc_groups[key].append({'signal': unk['signal'], 'interp_conc': unk['interp_conc'], 'level': level})
-        for (sname, grp, plate), entries in qc_groups.items():
+        for (sname, grp, plate), entries in sorted(qc_groups.items()):
             sigs = [e['signal'] for e in entries if np.isfinite(e['signal'])]
             concs = [e['interp_conc'] for e in entries if np.isfinite(e['interp_conc'])]
             level = entries[0]['level']
@@ -869,9 +870,13 @@ def create_output(results, output_path, msd_path, raw_plate_blocks, units=None, 
             avg_sig = np.mean(sigs) if sigs else np.nan
             avg_conc = np.mean(concs) if concs else np.nan
             corrected = avg_conc * qc_factor if np.isfinite(avg_conc) else np.nan
+            recovery = (corrected / qc_expected_concentrations * 100
+                        if qc_expected_concentrations and np.isfinite(corrected) else np.nan)
+            row = {'sample_name': sname, 'level': level, 'plate': plate, 'group': grp,
+                   'avg_signal': avg_sig, 'corrected_conc': corrected, 'recovery': recovery}
+            qc_summary_rows.append(row)
             if np.isfinite(corrected) and np.isfinite(avg_sig) and corrected > 0 and avg_sig > 0:
-                qc_overlay_points.append({'sample_name': sname, 'level': level,
-                                          'signal': avg_sig, 'corrected_conc': corrected})
+                qc_overlay_points.append({**row, 'signal': avg_sig})
 
     # Pre-generate all charts before Excel writing (sequential — matplotlib mathtext is not thread-safe)
     overlay_path = generate_overlay_chart(
@@ -935,9 +940,46 @@ def create_output(results, output_path, msd_path, raw_plate_blocks, units=None, 
     for ci in range(1, len(headers) + 1):
         ws.column_dimensions[get_column_letter(ci)].width = 16
 
+    # ── QC Recovery Table on Summary sheet ───────────────────────────
+    next_row = len(results) + 3
+    if qc_summary_rows:
+        _section_title(ws, next_row, "QC Recovery")
+        next_row += 1
+        qc_h = ["Sample Name", "Level", "Plate", "Group", "Avg Signal",
+                corrected_header, "Expected Conc.", "% Recovery"]
+        _header_row(ws, next_row, qc_h)
+        next_row += 1
+        for qr in qc_summary_rows:
+            ws.cell(row=next_row, column=1, value=qr['sample_name'])
+            ws.cell(row=next_row, column=2, value=qr['level'])
+            ws.cell(row=next_row, column=3, value=qr['plate'])
+            ws.cell(row=next_row, column=4, value=qr['group'] or "")
+            sig_cell = ws.cell(row=next_row, column=5,
+                               value=round(qr['avg_signal'], 1) if np.isfinite(qr['avg_signal']) else "N/A")
+            sig_cell.number_format = '#,##0'
+            corr_cell = ws.cell(row=next_row, column=6,
+                                value=round(qr['corrected_conc'], 4) if np.isfinite(qr['corrected_conc']) else "N/A")
+            corr_cell.number_format = '#,##0.0000'
+            exp_cell = ws.cell(row=next_row, column=7,
+                               value=qc_expected_concentrations if qc_expected_concentrations else "")
+            if qc_expected_concentrations:
+                exp_cell.number_format = '#,##0.0###'
+            rec_cell = ws.cell(row=next_row, column=8)
+            if np.isfinite(qr['recovery']):
+                rec_cell.value = round(qr['recovery'], 1)
+                rec_cell.number_format = '0.0'
+                rec_cell.font = PASS_FONT if 70.0 <= qr['recovery'] <= 130.0 else FAIL_FONT
+            else:
+                rec_cell.value = "N/A"
+            _style_row(ws, next_row, len(qc_h))
+            next_row += 1
+        for ci, w in enumerate([18, 10, 8, 10, 14, 24, 16, 12], 1):
+            ws.column_dimensions[get_column_letter(ci)].width = w
+        next_row += 1  # blank row before chart
+
     # Overlay chart of all curves on Summary sheet (pre-generated above)
     if overlay_path:
-        overlay_row = len(results) + 4  # 2 rows below the table
+        overlay_row = next_row + 1
         img = XlImage(overlay_path)
         img.width = 900
         img.height = 560
@@ -1107,7 +1149,7 @@ def create_output(results, output_path, msd_path, raw_plate_blocks, units=None, 
     # ── All Unknowns Combined ─────────────────────────────────────────
     ws_all = wb.create_sheet("All Unknowns")
     all_h = ["Sample Name", "Animal", "Tissue", "Plate", "Wells", "Avg Signal", avg_interp_header,
-             "%CV", "Flag", "Dilution Factor", corrected_header, "Total Protein", "Normalized Protein Concentration", "% Recovery"]
+             "%CV", "Flag", "Dilution Factor", corrected_header, "Total Protein", "Normalized Protein Concentration"]
     _header_row(ws_all, 1, all_h)
     arow = 2
     # Track how many TP values have been consumed per (animal, tissue) key
@@ -1223,14 +1265,6 @@ def create_output(results, output_path, msd_path, raw_plate_blocks, units=None, 
         if tp_val is not None and np.isfinite(corrected_conc) and tp_val != 0:
             norm_cell.value = round(corrected_conc / tp_val, 6)
             norm_cell.number_format = '0.000000'
-        # % Recovery (col 14) — QC samples only, requires expected concentration
-        recovery_cell = ws_all.cell(row=arow, column=14)
-        qc_level_for_recovery = _identify_qc_level(sample_name)
-        if qc_level_for_recovery and qc_expected_concentrations and np.isfinite(corrected_conc) and qc_expected_concentrations > 0:
-            recovery = corrected_conc / qc_expected_concentrations * 100
-            recovery_cell.value = round(recovery, 1)
-            recovery_cell.number_format = '0.0'
-            recovery_cell.font = PASS_FONT if 70.0 <= recovery <= 130.0 else FAIL_FONT
         _style_row(ws_all, arow, len(all_h))
         arow += 1
 
