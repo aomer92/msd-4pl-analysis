@@ -1107,7 +1107,7 @@ def create_output(results, output_path, msd_path, raw_plate_blocks, units=None, 
     # ── All Unknowns Combined ─────────────────────────────────────────
     ws_all = wb.create_sheet("All Unknowns")
     all_h = ["Sample Name", "Animal", "Tissue", "Plate", "Wells", "Avg Signal", avg_interp_header,
-             "%CV", "Flag", "Dilution Factor", corrected_header, "Total Protein", "Normalized Protein Concentration"]
+             "%CV", "Flag", "Dilution Factor", corrected_header, "Total Protein", "Normalized Protein Concentration", "% Recovery"]
     _header_row(ws_all, 1, all_h)
     arow = 2
     # Track how many TP values have been consumed per (animal, tissue) key
@@ -1223,6 +1223,14 @@ def create_output(results, output_path, msd_path, raw_plate_blocks, units=None, 
         if tp_val is not None and np.isfinite(corrected_conc) and tp_val != 0:
             norm_cell.value = round(corrected_conc / tp_val, 6)
             norm_cell.number_format = '0.000000'
+        # % Recovery (col 14) — QC samples only, requires expected concentration
+        recovery_cell = ws_all.cell(row=arow, column=14)
+        qc_level_for_recovery = _identify_qc_level(sample_name)
+        if qc_level_for_recovery and qc_expected_concentrations and np.isfinite(corrected_conc) and qc_expected_concentrations > 0:
+            recovery = corrected_conc / qc_expected_concentrations * 100
+            recovery_cell.value = round(recovery, 1)
+            recovery_cell.number_format = '0.0'
+            recovery_cell.font = PASS_FONT if 70.0 <= recovery <= 130.0 else FAIL_FONT
         _style_row(ws_all, arow, len(all_h))
         arow += 1
 
