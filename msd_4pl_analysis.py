@@ -998,7 +998,7 @@ def create_output(results, output_path, msd_path, raw_plate_blocks, units=None, 
     # ── All Unknowns Combined ─────────────────────────────────────────
     ws_all = wb.create_sheet("All Unknowns")
     all_h = ["Sample Name", "Animal", "Tissue", "Plate", "Wells", "Avg Signal", avg_interp_header,
-             "Dilution Factor", corrected_header, "Total Protein", "Normalized Protein Concentration", "%CV", "Flag"]
+             "%CV", "Flag", "Dilution Factor", corrected_header, "Total Protein", "Normalized Protein Concentration"]
     _header_row(ws_all, 1, all_h)
     arow = 2
 
@@ -1066,34 +1066,38 @@ def create_output(results, output_path, msd_path, raw_plate_blocks, units=None, 
         ws_all.cell(row=arow, column=6).number_format = '#,##0'
         ws_all.cell(row=arow, column=7, value=round(avg_conc, 4) if np.isfinite(avg_conc) else "N/A")
         ws_all.cell(row=arow, column=7).number_format = '#,##0.0000'
-        df_cell = ws_all.cell(row=arow, column=8)
+        # %CV (col 8)
+        cv_cell = ws_all.cell(row=arow, column=8)
+        cv_cell.value = round(cv, 1) if np.isfinite(cv) else "N/A"
+        cv_cell.number_format = '0.0'
+        if np.isfinite(cv):
+            cv_cell.fill = CV_BAD_FILL if cv > cv_threshold else CV_GOOD_FILL
+        # Flag (col 9)
+        ws_all.cell(row=arow, column=9, value=flag)
+        cell_flag = ws_all.cell(row=arow, column=9)
+        cell_flag.font = PASS_FONT if flag == "In Range" else (WARN_FONT if flag in ["> ULOQ", "< LLOQ"] else FAIL_FONT)
+        # Dilution Factor (col 10)
+        df_cell = ws_all.cell(row=arow, column=10)
         df_cell.value = factor if plate in plate_dilution_factors else ""
         if plate in plate_dilution_factors:
             df_cell.number_format = '0.###'
-        corrected_cell = ws_all.cell(row=arow, column=9)
+        # Corrected Avg Interp. Conc. (col 11)
+        corrected_cell = ws_all.cell(row=arow, column=11)
         corrected_cell.value = round(corrected_conc, 4) if np.isfinite(corrected_conc) else "N/A"
         corrected_cell.number_format = '#,##0.0000'
-        # Total Protein lookup (col 10)
+        # Total Protein (col 12)
         tp_val = None
-        tp_cell = ws_all.cell(row=arow, column=10)
+        tp_cell = ws_all.cell(row=arow, column=12)
         if total_protein_map:
             tp_val = total_protein_map.get((animal, tissue)) if animal else None
             if tp_val is not None:
                 tp_cell.value = round(tp_val, 4)
                 tp_cell.number_format = '0.0000'
-        # Normalized Protein Concentration = Corrected Avg Conc / Total Protein (col 11)
-        norm_cell = ws_all.cell(row=arow, column=11)
+        # Normalized Protein Concentration (col 13)
+        norm_cell = ws_all.cell(row=arow, column=13)
         if tp_val is not None and np.isfinite(corrected_conc) and tp_val != 0:
             norm_cell.value = round(corrected_conc / tp_val, 6)
             norm_cell.number_format = '0.000000'
-        cv_cell = ws_all.cell(row=arow, column=12)
-        cv_cell.value = round(cv, 1) if np.isfinite(cv) else "N/A"
-        cv_cell.number_format = '0.0'
-        if np.isfinite(cv):
-            cv_cell.fill = CV_BAD_FILL if cv > cv_threshold else CV_GOOD_FILL
-        ws_all.cell(row=arow, column=13, value=flag)
-        cell_flag = ws_all.cell(row=arow, column=13)
-        cell_flag.font = PASS_FONT if flag == "In Range" else (WARN_FONT if flag in ["> ULOQ", "< LLOQ"] else FAIL_FONT)
         _style_row(ws_all, arow, len(all_h))
         arow += 1
 
