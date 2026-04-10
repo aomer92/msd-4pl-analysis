@@ -698,15 +698,23 @@ def parse_total_protein_csv(filepath):
 
 def _extract_animal_tissue(sample_name):
     """
-    Parse animal number and tissue type from a sample name.
-    Expects format: '{TissueType}-{AnimalNumber}' or '{TissueType}-{AnimalNumber}_{suffix}'
-    e.g. 'fCtx-1001_P1' → ('1001', 'fCtx')
-    Returns (animal_str, tissue_str) or (None, None) if no match.
+    Flexible extraction of animal number and tissue from a sample name.
+    - Strips any trailing _suffix (e.g. _P1, _rep2) before parsing
+    - Splits by '-' and scans segments regardless of order or extras:
+        Animal → first purely numeric segment        (e.g. '1001')
+        Tissue → longest purely alphabetic segment   (e.g. 'fCtx' beats 'XX')
+    - Returns (None, None) if no animal number found (e.g. HQC, Buffer Only)
+    Handles any ordering or extra segments:
+        fCtx-1001_P1, 1001-fCtx, fCtx-XX-1001, 1001-XX-fCtx, etc.
     """
-    m = re.match(r'^([A-Za-z]+)-(\d+)', sample_name.strip())
-    if m:
-        return m.group(2), m.group(1)  # (animal, tissue)
-    return None, None
+    base = sample_name.strip().split('_')[0]   # drop _P1, _rep2, etc.
+    segments = base.split('-')
+    animal = next((s for s in segments if s.isdigit()), None)
+    if animal is None:
+        return None, None   # no animal ID → QC or non-sample name
+    alpha_segs = [s for s in segments if s.isalpha()]
+    tissue = max(alpha_segs, key=len) if alpha_segs else None
+    return animal, tissue
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
