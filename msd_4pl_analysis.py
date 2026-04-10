@@ -128,6 +128,37 @@ The Excel workbook contains:
 import re, sys, argparse, os, tempfile, json, subprocess, platform
 
 LAST_RUN_PATH = os.path.join(os.path.expanduser('~'), '.msd_4pl_last_run.json')
+MAX_RUN_HISTORY = 5
+
+def _load_run_history():
+    """Return list of up to MAX_RUN_HISTORY prior run dicts, newest first.
+    Handles legacy single-dict format transparently."""
+    try:
+        with open(LAST_RUN_PATH, 'r') as f:
+            data = json.load(f)
+        if isinstance(data, dict):          # legacy single-entry
+            return [data]
+        return data[:MAX_RUN_HISTORY]
+    except (FileNotFoundError, json.JSONDecodeError):
+        return []
+
+def _save_run_to_history(entry):
+    """Prepend entry to the run history list and trim to MAX_RUN_HISTORY."""
+    from datetime import datetime
+    entry.setdefault('timestamp', datetime.now().strftime('%Y-%m-%d %H:%M'))
+    history = _load_run_history()
+    history.insert(0, entry)
+    history = history[:MAX_RUN_HISTORY]
+    with open(LAST_RUN_PATH, 'w') as f:
+        json.dump(history, f, indent=2)
+
+def _run_label(entry):
+    """Short human-readable label for a run history entry."""
+    ts  = entry.get('timestamp', '')
+    msd = os.path.basename(entry.get('msd') or '') or '—'
+    out = os.path.basename(entry.get('output') or '') or '—'
+    return f"{ts}  |  {msd}  →  {out}"
+
 from io import StringIO
 from collections import defaultdict
 try:
@@ -1408,8 +1439,7 @@ def run_analysis(msd_path, platemap_path, output_path, spots_override=None, unit
         'qc_dilution_factors': qc_dilution_factors,
         'qc_expected_concentrations': qc_expected_concentrations
     }
-    with open(LAST_RUN_PATH, 'w') as f:
-        json.dump(last_args, f)
+    _save_run_to_history(last_args)
 
 
 def run_interactive():
@@ -1429,27 +1459,36 @@ def run_interactive():
         if filename:
             var.set(filename)
 
-    def load_last_run():
-        try:
-            with open(LAST_RUN_PATH, 'r') as f:
-                last_args = json.load(f)
-            msd_var.set(last_args.get('msd', ''))
-            platemap_var.set(last_args.get('platemap', ''))
-            output_var.set(last_args.get('output', 'msd_4pl_results.xlsx'))
-            spots_var.set(str(last_args.get('spots', '')))
-            units_var.set(last_args.get('units', ''))
-            cv_threshold_var.set(str(last_args.get('cv_threshold', '25')))
-            lloq_method_var.set(last_args.get('lloq_method', 'current'))
-            dilution_factors_var.set(','.join(str(x) for x in last_args.get('dilution_factors', [])) if last_args.get('dilution_factors') else '')
-            total_protein_var.set(last_args.get('total_protein', ''))
-            saved_qc = last_args.get('qc_dilution_factors') or {}
-            for level in QC_LEVELS:
-                qc_df_vars[level].set(str(saved_qc.get(level, '')) if saved_qc.get(level) is not None else '')
-            saved_exp = last_args.get('qc_expected_concentrations') or {}
-            for level in QC_LEVELS:
-                qc_exp_vars[level].set(str(saved_exp.get(level, '')) if saved_exp.get(level) is not None else '')
-        except FileNotFoundError:
-            messagebox.showinfo("No Last Run", "No previous run found to load.")
+    def _apply_run_entry(entry):
+        """Populate all form fields from a history entry dict."""
+        msd_var.set(entry.get('msd', ''))
+        platemap_var.set(entry.get('platemap', ''))
+        output_var.set(entry.get('output', 'msd_4pl_results.xlsx'))
+        spots_var.set(str(entry.get('spots') or ''))
+        units_var.set(entry.get('units') or '')
+        cv_threshold_var.set(str(entry.get('cv_threshold') or '25'))
+        lloq_method_var.set(entry.get('lloq_method') or 'current')
+        dilution_factors_var.set(
+            ','.join(str(x) for x in entry['dilution_factors'])
+            if entry.get('dilution_factors') else '')
+        total_protein_var.set(entry.get('total_protein') or '')
+        saved_qc = entry.get('qc_dilution_factors') or {}
+        for level in QC_LEVELS:
+            qc_df_vars[level].set(str(saved_qc[level]) if saved_qc.get(level) is not None else '')
+        saved_exp = entry.get('qc_expected_concentrations') or {}
+        for level in QC_LEVELS:
+            qc_exp_vars[level].set(str(saved_exp[level]) if saved_exp.get(level) is not None else '')
+
+    def load_selected_run():
+        sel = history_lb.curselection()
+        if not sel:
+            messagebox.showinfo("No Selection", "Please click a run in the list to select it.")
+            return
+        idx = sel[0]
+        history = _load_run_history()
+        if idx >= len(history):
+            return
+        _apply_run_entry(history[idx])
 
     def run():
         msd_path = msd_var.get().strip()
@@ -1521,7 +1560,7 @@ def run_interactive():
 
     root = tk.Tk()
     root.title("MSD 4PL Analysis Tool")
-    root.geometry("820x680")
+    root.geometry("820x780")
     root.resizable(False, False)
 
     # Variables
@@ -1601,10 +1640,42 @@ def run_interactive():
     ttk.Label(qc_lf, text="(±30% bands plotted on overlay)", foreground='grey').grid(
         row=3, column=0, columnspan=6, sticky=tk.W, padx=4, pady=(0, 2))
 
-    # Buttons
+    # ── Previous Runs section ──────────────────────────────────────────
+    hist_lf = ttk.LabelFrame(frame, text="Previous Runs (click to select, then Load)", padding="6")
+    hist_lf.grid(row=10, column=0, columnspan=3, sticky=(tk.W, tk.E), pady=(8, 2))
+    hist_lf.columnconfigure(0, weight=1)
+
+    # Listbox + scrollbar
+    lb_frame = ttk.Frame(hist_lf)
+    lb_frame.grid(row=0, column=0, sticky=(tk.W, tk.E))
+    lb_frame.columnconfigure(0, weight=1)
+
+    history_lb = tk.Listbox(lb_frame, height=5, activestyle='dotbox',
+                            selectmode=tk.SINGLE, font=('TkFixedFont', 9),
+                            relief='flat', borderwidth=1, highlightthickness=1)
+    history_lb.grid(row=0, column=0, sticky=(tk.W, tk.E))
+
+    lb_scroll = ttk.Scrollbar(lb_frame, orient=tk.VERTICAL, command=history_lb.yview)
+    lb_scroll.grid(row=0, column=1, sticky=(tk.N, tk.S))
+    history_lb.configure(yscrollcommand=lb_scroll.set)
+
+    # Populate listbox from saved history
+    _history_data = _load_run_history()
+    for entry in _history_data:
+        history_lb.insert(tk.END, _run_label(entry))
+    if not _history_data:
+        history_lb.insert(tk.END, '  (no previous runs)')
+        history_lb.configure(state=tk.DISABLED)
+
+    # Double-click also loads
+    history_lb.bind('<Double-Button-1>', lambda _e: load_selected_run())
+
+    load_btn = ttk.Button(hist_lf, text="Load Selected Run", command=load_selected_run)
+    load_btn.grid(row=1, column=0, sticky=tk.E, pady=(4, 0))
+
+    # ── Action buttons ─────────────────────────────────────────────────
     button_frame = ttk.Frame(frame)
-    button_frame.grid(row=10, column=0, columnspan=3, pady=10)
-    ttk.Button(button_frame, text="Load Last Run", command=load_last_run).pack(side=tk.LEFT, padx=5)
+    button_frame.grid(row=11, column=0, columnspan=3, pady=10)
     ttk.Button(button_frame, text="Run Analysis", command=run).pack(side=tk.LEFT, padx=5)
     ttk.Button(button_frame, text="Cancel", command=root.destroy).pack(side=tk.LEFT, padx=5)
 
@@ -1633,36 +1704,25 @@ if __name__ == '__main__':
     args = parser.parse_args()
 
     if args.rerun:
-        try:
-            with open(LAST_RUN_PATH, 'r') as f:
-                last_args = json.load(f)
-            args.msd = last_args.get('msd')
-            args.platemap = last_args.get('platemap')
-            args.output = last_args.get('output', 'msd_4pl_results.xlsx')
-            args.spots = last_args.get('spots')
-            args.units = last_args.get('units')
-            args.cv_threshold = last_args.get('cv_threshold', 25)
-            args.lloq_method = last_args.get('lloq_method', 'current')
-            args.dilution_factors = last_args.get('dilution_factors')
-            args.total_protein = last_args.get('total_protein')
-            args.gui = False
-            print("Rerunning with last parameters:")
-            print(f"  MSD: {args.msd}")
-            print(f"  Plate map: {args.platemap}")
-            print(f"  Output: {args.output}")
-            if args.spots:
-                print(f"  Spots: {args.spots}")
-            if args.units:
-                print(f"  Units: {args.units}")
-            if args.cv_threshold is not None:
-                print(f"  CV threshold: {args.cv_threshold}")
-            if args.lloq_method:
-                print(f"  LLOQ method: {args.lloq_method}")
-            if args.dilution_factors is not None:
-                print(f"  Dilution factors: {args.dilution_factors}")
-        except FileNotFoundError:
+        history = _load_run_history()
+        if not history:
             print("No previous run found. Use --msd and --platemap or --gui.")
             sys.exit(1)
+        last_args = history[0]
+        args.msd = last_args.get('msd')
+        args.platemap = last_args.get('platemap')
+        args.output = last_args.get('output', 'msd_4pl_results.xlsx')
+        args.spots = last_args.get('spots')
+        args.units = last_args.get('units')
+        args.cv_threshold = last_args.get('cv_threshold', 25)
+        args.lloq_method = last_args.get('lloq_method', 'current')
+        args.dilution_factors = last_args.get('dilution_factors')
+        args.total_protein = last_args.get('total_protein')
+        args.gui = False
+        print(f"Rerunning: {_run_label(last_args)}")
+        print(f"  MSD: {args.msd}")
+        print(f"  Plate map: {args.platemap}")
+        print(f"  Output: {args.output}")
 
     # No args or --gui → open GUI (default when double-clicked as .app)
     if args.gui or (not args.msd and not args.platemap and not args.rerun):
