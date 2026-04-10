@@ -157,6 +157,17 @@ warnings.filterwarnings('ignore')
 # 4PL MODEL
 # ═══════════════════════════════════════════════════════════════════════════════
 
+QC_LEVELS = ["ULOQ", "HQC", "MQC", "LQC", "LLOQ"]
+
+def _identify_qc_level(sample_name):
+    """Return which QC level (ULOQ/HQC/MQC/LQC/LLOQ) this sample represents, or None."""
+    upper = sample_name.upper()
+    for level in QC_LEVELS:
+        if level in upper:
+            return level
+    return None
+
+
 def four_pl(x, a, b, c, d):
     """4PL: a=min asymptote, b=Hill slope, c=inflection (EC50), d=max asymptote"""
     return d + (a - d) / (1.0 + (x / c) ** b)
@@ -332,10 +343,12 @@ def generate_std_curve_chart(res, tmp_dir, lloq_method='current'):
     return fpath
 
 
-def generate_overlay_chart(results, tmp_dir):
+def generate_overlay_chart(results, tmp_dir, qc_overlay_points=None):
     """
     Generate an overlay plot showing all fitted standard curves on one chart.
-    Each spot/group gets its own color. Returns path to saved PNG.
+    Each spot/group gets its own color. QC points (if provided) are overlaid
+    as star markers using their corrected concentration and original signal.
+    Returns path to saved PNG.
     """
     fitted = [r for r in results if r.get('params') is not None]
     if not fitted:
@@ -380,6 +393,28 @@ def generate_overlay_chart(results, tmp_dir):
         ax.scatter(std_concs, std_sigs, s=25, color=color, zorder=4,
                    edgecolors='black', linewidths=0.3, alpha=0.8)
 
+    # QC overlay points (corrected conc vs original signal)
+    if qc_overlay_points:
+        qc_cmap = plt.cm.get_cmap('Set1')
+        qc_level_colors = {level: qc_cmap(i % 9) for i, level in enumerate(QC_LEVELS)}
+        plotted_levels = set()
+        for pt in qc_overlay_points:
+            conc = pt.get('corrected_conc')
+            sig = pt.get('signal')
+            level = pt.get('level', pt.get('sample_name', ''))
+            if conc is None or sig is None:
+                continue
+            if not (np.isfinite(conc) and np.isfinite(sig) and conc > 0 and sig > 0):
+                continue
+            qc_color = qc_level_colors.get(level, 'black')
+            lbl = f"QC: {level}" if level not in plotted_levels else None
+            ax.scatter(conc, sig, s=120, marker='*', color=qc_color, zorder=6,
+                       edgecolors='black', linewidths=0.5, label=lbl, alpha=0.95)
+            plotted_levels.add(level)
+            # Expand axis range to include QC points
+            global_conc_min = min(global_conc_min, conc)
+            global_conc_max = max(global_conc_max, conc)
+
     ax.set_xscale('log')
     ax.set_yscale('log')
 
@@ -394,7 +429,7 @@ def generate_overlay_chart(results, tmp_dir):
     ax.tick_params(which='both', direction='in', top=True, right=True)
     ax.grid(True, which='major', alpha=0.15, linewidth=0.5)
 
-    n_series = len(fitted)
+    n_series = len(fitted) + (len(set(pt['level'] for pt in (qc_overlay_points or []))) if qc_overlay_points else 0)
     if n_series <= 6:
         ax.legend(loc='lower right', fontsize=8, framealpha=0.9)
     else:
@@ -763,13 +798,36 @@ def _section_title(ws, row, title, span=5):
     ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=span)
 
 
-def create_output(results, output_path, msd_path, raw_plate_blocks, units=None, cv_threshold=25, plate_dilution_factors=None, lloq_method='current', total_protein_map=None):
+def create_output(results, output_path, msd_path, raw_plate_blocks, units=None, cv_threshold=25, plate_dilution_factors=None, lloq_method='current', total_protein_map=None, qc_dilution_factors=None):
     wb = Workbook()
     wb.remove(wb.active)
     tmp_dir = tempfile.mkdtemp(prefix='msd_charts_')
 
+    # Pre-collect QC overlay points (corrected conc + signal) for overlay chart
+    qc_overlay_points = []
+    if qc_dilution_factors:
+        qc_groups = defaultdict(list)
+        for res in results:
+            for unk in res.get('unknowns', []):
+                sname = unk.get('sample_name', '')
+                level = _identify_qc_level(sname)
+                if level and level in qc_dilution_factors:
+                    key = (sname, res.get('group', ''), res['plate'])
+                    qc_groups[key].append({'signal': unk['signal'], 'interp_conc': unk['interp_conc'], 'level': level})
+        for (sname, grp, plate), entries in qc_groups.items():
+            sigs = [e['signal'] for e in entries if np.isfinite(e['signal'])]
+            concs = [e['interp_conc'] for e in entries if np.isfinite(e['interp_conc'])]
+            level = entries[0]['level']
+            qc_factor = qc_dilution_factors[level]
+            avg_sig = np.mean(sigs) if sigs else np.nan
+            avg_conc = np.mean(concs) if concs else np.nan
+            corrected = avg_conc * qc_factor if np.isfinite(avg_conc) else np.nan
+            if np.isfinite(corrected) and np.isfinite(avg_sig) and corrected > 0 and avg_sig > 0:
+                qc_overlay_points.append({'sample_name': sname, 'level': level,
+                                          'signal': avg_sig, 'corrected_conc': corrected})
+
     # Pre-generate all charts before Excel writing (sequential — matplotlib mathtext is not thread-safe)
-    overlay_path = generate_overlay_chart(results, tmp_dir)
+    overlay_path = generate_overlay_chart(results, tmp_dir, qc_overlay_points if qc_overlay_points else None)
     chart_map = {id(res): generate_std_curve_chart(res, tmp_dir, lloq_method) for res in results}
 
     unit_suffix = f" ({units})" if units else ""
@@ -1038,7 +1096,16 @@ def create_output(results, output_path, msd_path, raw_plate_blocks, units=None, 
         avg_signal = np.mean(signals) if signals else np.nan
         avg_conc = np.mean(concs) if concs else np.nan
         wells = ', '.join(sorted(g['well'] for g in group))
-        factor = plate_dilution_factors.get(plate, 1.0)
+
+        # Determine dilution factor: QC-specific factor takes priority over plate factor
+        qc_level = _identify_qc_level(sample_name) if qc_dilution_factors else None
+        if qc_level and qc_level in (qc_dilution_factors or {}):
+            factor = qc_dilution_factors[qc_level]
+            is_qc_factor = True
+        else:
+            factor = plate_dilution_factors.get(plate, 1.0)
+            is_qc_factor = plate in plate_dilution_factors
+
         corrected_conc = avg_conc * factor if np.isfinite(avg_conc) else np.nan
 
         flag = ""
@@ -1080,8 +1147,9 @@ def create_output(results, output_path, msd_path, raw_plate_blocks, units=None, 
         cell_flag.font = PASS_FONT if flag == "In Range" else (WARN_FONT if flag in ["> ULOQ", "< LLOQ"] else FAIL_FONT)
         # Dilution Factor (col 10)
         df_cell = ws_all.cell(row=arow, column=10)
-        df_cell.value = factor if plate in plate_dilution_factors else ""
-        if plate in plate_dilution_factors:
+        has_factor = is_qc_factor or (plate in plate_dilution_factors)
+        df_cell.value = factor if has_factor else ""
+        if has_factor:
             df_cell.number_format = '0.###'
         # Corrected Avg Interp. Conc. (col 11)
         corrected_cell = ws_all.cell(row=arow, column=11)
@@ -1139,7 +1207,7 @@ def _open_file(path):
     except Exception as e:
         print(f"Note: could not auto-open file: {e}")
 
-def run_analysis(msd_path, platemap_path, output_path, spots_override=None, units=None, cv_threshold=25, dilution_factors=None, lloq_method='current', total_protein_path=None):
+def run_analysis(msd_path, platemap_path, output_path, spots_override=None, units=None, cv_threshold=25, dilution_factors=None, lloq_method='current', total_protein_path=None, qc_dilution_factors=None):
     print("=" * 60)
     print("MSD 4PL ANALYSIS")
     print("=" * 60)
@@ -1296,7 +1364,7 @@ def run_analysis(msd_path, platemap_path, output_path, spots_override=None, unit
 
     print(f"\n{'=' * 60}")
     print(f"Generating Excel: {output_path}")
-    create_output(results, output_path, msd_path, raw_plate_blocks, units, cv_threshold, plate_dilution_factors, lloq_method, total_protein_map)
+    create_output(results, output_path, msd_path, raw_plate_blocks, units, cv_threshold, plate_dilution_factors, lloq_method, total_protein_map, qc_dilution_factors)
     print("Done!")
     _open_file(output_path)
 
@@ -1310,7 +1378,8 @@ def run_analysis(msd_path, platemap_path, output_path, spots_override=None, unit
         'cv_threshold': cv_threshold,
         'dilution_factors': list(plate_dilution_factors.values()) if plate_dilution_factors else None,
         'lloq_method': lloq_method,
-        'total_protein': total_protein_path
+        'total_protein': total_protein_path,
+        'qc_dilution_factors': qc_dilution_factors
     }
     with open(LAST_RUN_PATH, 'w') as f:
         json.dump(last_args, f)
@@ -1346,6 +1415,9 @@ def run_interactive():
             lloq_method_var.set(last_args.get('lloq_method', 'current'))
             dilution_factors_var.set(','.join(str(x) for x in last_args.get('dilution_factors', [])) if last_args.get('dilution_factors') else '')
             total_protein_var.set(last_args.get('total_protein', ''))
+            saved_qc = last_args.get('qc_dilution_factors') or {}
+            for level in QC_LEVELS:
+                qc_df_vars[level].set(str(saved_qc.get(level, '')) if saved_qc.get(level) is not None else '')
         except FileNotFoundError:
             messagebox.showinfo("No Last Run", "No previous run found to load.")
 
@@ -1370,6 +1442,18 @@ def run_interactive():
         dilution_factors = dilution_factors if dilution_factors else None
         total_protein_path = total_protein_path if total_protein_path else None
 
+        # Collect QC dilution factors
+        qc_dilution_factors = {}
+        for level in QC_LEVELS:
+            val_str = qc_df_vars[level].get().strip()
+            if val_str:
+                try:
+                    qc_dilution_factors[level] = float(val_str)
+                except ValueError:
+                    messagebox.showerror("Error", f"Invalid QC dilution factor for {level}: '{val_str}'")
+                    return
+        qc_dilution_factors = qc_dilution_factors if qc_dilution_factors else None
+
         root.destroy()
 
         print(f"\nMSD file:   {msd_path}")
@@ -1386,12 +1470,14 @@ def run_interactive():
         if dilution_factors:
             print(f"Dilution factors: {dilution_factors}")
         print(f"LLOQ method: {lloq_method}")
+        if qc_dilution_factors:
+            print(f"QC dilution factors: {qc_dilution_factors}")
 
-        run_analysis(msd_path, platemap_path, output_path, spots_override, units, cv_threshold, dilution_factors, lloq_method, total_protein_path)
+        run_analysis(msd_path, platemap_path, output_path, spots_override, units, cv_threshold, dilution_factors, lloq_method, total_protein_path, qc_dilution_factors)
 
     root = tk.Tk()
     root.title("MSD 4PL Analysis Tool")
-    root.geometry("800x540")
+    root.geometry("820x680")
     root.resizable(False, False)
 
     # Variables
@@ -1404,12 +1490,12 @@ def run_interactive():
     lloq_method_var = tk.StringVar(value="current")
     dilution_factors_var = tk.StringVar()
     total_protein_var = tk.StringVar()
+    qc_df_vars = {level: tk.StringVar() for level in QC_LEVELS}
 
     # Layout
     frame = ttk.Frame(root, padding="10")
     frame.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
 
-    # File selections
     # File selections
     ttk.Label(frame, text="MSD Data File:").grid(row=0, column=0, sticky=tk.W, pady=2)
     ttk.Entry(frame, textvariable=msd_var, width=50).grid(row=0, column=1, pady=2)
@@ -1446,9 +1532,17 @@ def run_interactive():
     ttk.Entry(frame, textvariable=total_protein_var, width=50).grid(row=8, column=1, pady=2)
     ttk.Button(frame, text="Browse", command=lambda: browse_file(total_protein_var, "Select Total Protein CSV", [("CSV Files", "*.csv"), ("All Files", "*.*")])).grid(row=8, column=2, pady=2)
 
+    # QC Dilution Factors section
+    qc_lf = ttk.LabelFrame(frame, text="QC Dilution Factors (optional — for samples containing ULOQ/HQC/MQC/LQC/LLOQ)", padding="6")
+    qc_lf.grid(row=9, column=0, columnspan=3, sticky=(tk.W, tk.E), pady=(8, 4))
+    qc_lf.columnconfigure(1, weight=0)
+    for col_offset, level in enumerate(QC_LEVELS):
+        ttk.Label(qc_lf, text=f"{level}:").grid(row=0, column=col_offset * 2, sticky=tk.E, padx=(8, 2))
+        ttk.Entry(qc_lf, textvariable=qc_df_vars[level], width=8).grid(row=0, column=col_offset * 2 + 1, sticky=tk.W, padx=(0, 4))
+
     # Buttons
     button_frame = ttk.Frame(frame)
-    button_frame.grid(row=9, column=0, columnspan=3, pady=10)
+    button_frame.grid(row=10, column=0, columnspan=3, pady=10)
     ttk.Button(button_frame, text="Load Last Run", command=load_last_run).pack(side=tk.LEFT, padx=5)
     ttk.Button(button_frame, text="Run Analysis", command=run).pack(side=tk.LEFT, padx=5)
     ttk.Button(button_frame, text="Cancel", command=root.destroy).pack(side=tk.LEFT, padx=5)
