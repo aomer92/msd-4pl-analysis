@@ -154,10 +154,12 @@ def _save_run_to_history(entry):
 
 def _run_label(entry):
     """Short human-readable label for a run history entry."""
+    status = entry.get('status', '')
+    icon = '✓' if status == 'pass' else ('✗' if status == 'fail' else ' ')
     ts  = entry.get('timestamp', '')
     msd = os.path.basename(entry.get('msd') or '') or '—'
     out = os.path.basename(entry.get('output') or '') or '—'
-    return f"{ts}  |  {msd}  →  {out}"
+    return f"{icon}  {ts}  |  {msd}  →  {out}"
 
 from io import StringIO
 from collections import defaultdict
@@ -186,9 +188,10 @@ def _ensure_deps():
         import warnings; warnings.filterwarnings('ignore')
     except ModuleNotFoundError as e:
         missing = str(e).split("'")[1] if "'" in str(e) else str(e)
-        print(f"Missing required package: {missing}")
-        print("Install with:  python3 -m pip install numpy pandas scipy openpyxl matplotlib")
-        sys.exit(1)
+        msg = (f"Missing required package: {missing}\n"
+               f"Install with: python3 -m pip install numpy pandas scipy openpyxl matplotlib")
+        print(msg)
+        raise RuntimeError(msg) from e
 
     # Openpyxl style constants (constructed once, reused across all sheets)
     g['HEADER_FILL'] = PatternFill('solid', fgColor='2F5496')
@@ -1313,6 +1316,608 @@ def _open_file(path):
     except Exception as e:
         print(f"Note: could not auto-open file: {e}")
 
+def generate_html_report(results, html_path, msd_path, units=None,
+                          qc_dilution_factors=None, qc_expected_concentrations=None,
+                          plate_dilution_factors=None, lloq_method='current',
+                          total_protein_map=None):
+    """Generate a self-contained interactive HTML report alongside the Excel output."""
+    try:
+        import plotly.graph_objects as go
+        import plotly.offline as poff
+    except ImportError:
+        print("Note: plotly not installed — HTML report skipped. Install with: pip install plotly")
+        return
+
+    plate_dilution_factors = plate_dilution_factors or {}
+    unit_suffix = f" ({units})" if units else ""
+
+    # ── Recompute QC summary rows ─────────────────────────────────────────────
+    qc_summary_rows = []
+    qc_overlay_points = []
+    if qc_dilution_factors:
+        qc_groups = defaultdict(list)
+        for res in results:
+            for unk in res.get('unknowns', []):
+                sname = unk.get('sample_name', '')
+                level = _identify_qc_level(sname)
+                if level and level in qc_dilution_factors:
+                    key = (sname, res.get('group', ''), res['plate'])
+                    qc_groups[key].append({'signal': unk['signal'], 'interp_conc': unk['interp_conc'], 'level': level})
+        for (sname, grp, plate), entries in sorted(qc_groups.items()):
+            sigs = [e['signal'] for e in entries if np.isfinite(e['signal'])]
+            concs = [e['interp_conc'] for e in entries if np.isfinite(e['interp_conc'])]
+            level = entries[0]['level']
+            qc_factor = qc_dilution_factors[level]
+            avg_sig = np.mean(sigs) if sigs else np.nan
+            avg_conc = np.mean(concs) if concs else np.nan
+            corrected = avg_conc * qc_factor if np.isfinite(avg_conc) else np.nan
+            recovery = (corrected / qc_expected_concentrations * 100
+                        if qc_expected_concentrations and np.isfinite(corrected) else np.nan)
+            row_data = {'sample_name': sname, 'level': level, 'plate': plate, 'group': grp,
+                        'avg_signal': avg_sig, 'corrected_conc': corrected, 'recovery': recovery}
+            qc_summary_rows.append(row_data)
+            if np.isfinite(corrected) and np.isfinite(avg_sig) and corrected > 0 and avg_sig > 0:
+                qc_overlay_points.append({**row_data, 'signal': avg_sig})
+
+    # ── Per-spot standard curve figures ──────────────────────────────────────
+    curve_divs = []
+    for res in results:
+        plate, spot, group = res['plate'], res['spot'], res.get('group', '')
+        label = f"Plate {plate}, Spot {spot}" + (f", Group {group}" if group else "")
+        fig = go.Figure()
+
+        # Collect all positive values to compute explicit axis ranges
+        all_concs_pos, all_sigs_pos = [], []
+        std_concs, std_means = [], []
+
+        if res.get('standards'):
+            std_groups_local = {}
+            for s in res['standards']:
+                key = s['conc']
+                if key not in std_groups_local:
+                    std_groups_local[key] = {'conc': key, 'signals': []}
+                std_groups_local[key]['signals'].append(s['signal'])
+            std_concs = sorted(std_groups_local.keys())
+            std_means = [np.mean(std_groups_local[c]['signals']) for c in std_concs]
+            all_concs_pos = [c for c in std_concs if c > 0]
+            all_sigs_pos  = [s for s in std_means if s > 0]
+            fig.add_trace(go.Scatter(
+                x=std_concs, y=std_means,
+                mode='markers', name='Standards',
+                marker=dict(color='#2F5496', size=9, symbol='circle'),
+                hovertemplate='Conc: %{x:.4g}<br>Signal: %{y:,.0f}<extra>Standards</extra>'
+            ))
+
+        lloq_sig = res.get('lloq_sig')
+        x_fit, y_fit = [], []
+        if res['params'] is not None:
+            concs_for_fit = [s['conc'] for s in res.get('standards', []) if s['conc'] > 0]
+            if concs_for_fit:
+                c_min, c_max = min(concs_for_fit), max(concs_for_fit)
+                x_fit = list(np.logspace(np.log10(c_min * 0.5), np.log10(c_max * 2), 300))
+                y_fit = [four_pl(x, *res['params']) for x in x_fit]
+                all_sigs_pos += [v for v in y_fit if v > 0]
+                fig.add_trace(go.Scatter(
+                    x=x_fit, y=y_fit,
+                    mode='lines', name='4PL Fit',
+                    line=dict(color='#E06C4A', width=2),
+                    hovertemplate='Conc: %{x:.4g}<br>Signal: %{y:,.0f}<extra>4PL Fit</extra>'
+                ))
+
+            if lloq_sig is not None and lloq_sig > 0:
+                fig.add_hline(y=lloq_sig, line=dict(color='#F4A522', dash='dash', width=1.5),
+                              annotation_text=f'LLOQ: {lloq_sig:,.0f}',
+                              annotation_position='bottom right')
+                all_sigs_pos.append(lloq_sig)
+
+        # Compute explicit log10 axis ranges so data fills the chart properly
+        if all_concs_pos:
+            x_range = [np.log10(min(all_concs_pos)) - 0.25,
+                       np.log10(max(all_concs_pos)) + 0.25]
+        else:
+            x_range = None
+        if all_sigs_pos:
+            y_range = [np.log10(min(all_sigs_pos)) - 0.15,
+                       np.log10(max(all_sigs_pos)) + 0.15]
+        else:
+            y_range = None
+
+        r2_str = f"R² = {res['r2']:.6f}" if res.get('r2') is not None else "Fit Failed"
+        fig.update_layout(
+            title=dict(text=f"{label}<br><sup>{r2_str}</sup>", x=0.5, font=dict(size=13)),
+            xaxis=dict(title=f'Concentration{unit_suffix}', type='log',
+                       showgrid=True, gridcolor='#ddd',
+                       exponentformat='power', showexponent='all',
+                       range=x_range),
+            yaxis=dict(title='Signal', type='log',
+                       showgrid=True, gridcolor='#ddd',
+                       exponentformat='power', showexponent='all',
+                       range=y_range),
+            plot_bgcolor='white', paper_bgcolor='white',
+            legend=dict(orientation='v', x=1.02, y=1),
+            margin=dict(l=70, r=130, t=75, b=55),
+            autosize=True, height=400
+        )
+        div_id = f"curve_p{plate}_s{spot}_{group or 'default'}"
+        curve_divs.append((label, fig.to_html(full_html=False, include_plotlyjs=False,
+                                               div_id=div_id, config={'responsive': True})))
+
+    # ── Overlay figure ────────────────────────────────────────────────────────
+    overlay_fig = go.Figure()
+    colors = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd',
+              '#8c564b', '#e377c2', '#7f7f7f', '#bcbd22', '#17becf']
+    for i, res in enumerate(results):
+        if res['params'] is None:
+            continue
+        concs_for_fit = [s['conc'] for s in res.get('standards', []) if s['conc'] > 0]
+        if not concs_for_fit:
+            continue
+        c_min, c_max = min(concs_for_fit), max(concs_for_fit)
+        x_fit = list(np.logspace(np.log10(c_min * 0.5), np.log10(c_max * 2), 200))
+        y_fit = [four_pl(x, *res['params']) for x in x_fit]
+        plate, spot, group = res['plate'], res['spot'], res.get('group', '')
+        trace_label = f"P{plate} S{spot}" + (f" {group}" if group else "")
+        color = colors[i % len(colors)]
+        overlay_fig.add_trace(go.Scatter(
+            x=x_fit, y=y_fit,
+            mode='lines', name=trace_label,
+            line=dict(color=color, width=1.5),
+            hovertemplate=f'%{{x:.4g}} → %{{y:,.0f}}<extra>{trace_label}</extra>'
+        ))
+
+    if qc_overlay_points:
+        qc_level_colors = {'ULOQ': '#e41a1c', 'HQC': '#ff7f00', 'MQC': '#4daf4a',
+                           'LQC': '#377eb8', 'LLOQ': '#984ea3'}
+        qc_by_level = defaultdict(list)
+        for qp in qc_overlay_points:
+            qc_by_level[qp['level']].append(qp)
+        for level, pts in qc_by_level.items():
+            xs = [p['corrected_conc'] for p in pts]
+            ys = [p['signal'] for p in pts]
+            names = [f"{p['sample_name']} (P{p['plate']})" for p in pts]
+            overlay_fig.add_trace(go.Scatter(
+                x=xs, y=ys,
+                mode='markers', name=f'QC {level}',
+                marker=dict(color=qc_level_colors.get(level, 'black'), size=12, symbol='star'),
+                customdata=names,
+                hovertemplate='Conc: %{x:.4g}<br>Signal: %{y:,.0f}<br>%{customdata}<extra>QC ' + level + '</extra>'
+            ))
+
+    if qc_expected_concentrations and qc_expected_concentrations > 0:
+        lo = qc_expected_concentrations * 0.7
+        hi = qc_expected_concentrations * 1.3
+        overlay_fig.add_vrect(
+            x0=lo, x1=hi,
+            fillcolor='steelblue', opacity=0.15,
+            layer='below', line_width=0,
+            annotation_text=f'±30% ({lo:,.1f}–{hi:,.1f})',
+            annotation_position='top right'
+        )
+
+    # Compute explicit x-range from curve traces and QC points so that
+    # add_vrect boundaries don't blow out the log-scale axis autorange.
+    _overlay_x_vals = []
+    for res in results:
+        if res['params'] is None:
+            continue
+        concs_for_fit = [s['conc'] for s in res.get('standards', []) if s['conc'] > 0]
+        if concs_for_fit:
+            _overlay_x_vals.append(min(concs_for_fit) * 0.5)
+            _overlay_x_vals.append(max(concs_for_fit) * 2.0)
+    if qc_overlay_points:
+        for _qp in qc_overlay_points:
+            if np.isfinite(_qp['corrected_conc']) and _qp['corrected_conc'] > 0:
+                _overlay_x_vals.append(_qp['corrected_conc'])
+    overlay_x_range = None
+    if _overlay_x_vals:
+        overlay_x_range = [np.log10(min(_overlay_x_vals)) - 0.2,
+                           np.log10(max(_overlay_x_vals)) + 0.2]
+
+    overlay_fig.update_layout(
+        title=dict(text='Standard Curve Overlay', x=0.5),
+        xaxis=dict(title=f'Concentration{unit_suffix}', type='log',
+                   showgrid=True, gridcolor='#eee',
+                   exponentformat='power', showexponent='all',
+                   range=overlay_x_range),
+        yaxis=dict(title='Signal', type='log',
+                   showgrid=True, gridcolor='#eee',
+                   exponentformat='power', showexponent='all'),
+        plot_bgcolor='white', paper_bgcolor='white',
+        legend=dict(orientation='v', x=1.02, y=1,
+                    itemclick='toggle', itemdoubleclick='toggleothers'),
+        margin=dict(l=60, r=200, t=60, b=60),
+        height=520
+    )
+    overlay_div = overlay_fig.to_html(full_html=False, include_plotlyjs=False,
+                                       div_id='overlay_chart', config={'responsive': True})
+
+    # ── Summary table rows ────────────────────────────────────────────────────
+    summary_rows_html = []
+    for res in results:
+        plate, spot, group = res['plate'], res['spot'], res.get('group', '')
+        a = b = c = d = r2 = lloq_sig_disp = lloq_conc_disp = status = flags = 'N/A'
+        if res['params'] is not None:
+            a, b, c, d = [f"{v:.4g}" for v in res['params']]
+            r2 = f"{res['r2']:.6f}"
+            r2_val = res['r2']
+            status = 'Good' if r2_val >= 0.99 else ('Acceptable' if r2_val >= 0.95 else 'Poor')
+            flags = ''
+        else:
+            status = 'Failed'
+            flags = 'No standards' if res.get('no_standards') else ''
+        lloq_sig = res.get('lloq_sig')
+        if lloq_sig is not None:
+            lloq_sig_disp = f"{lloq_sig:,.1f}"
+            if res['params'] is not None:
+                try:
+                    lconc = inverse_4pl(lloq_sig, *res['params'])
+                    if np.isfinite(lconc) and lconc > 0:
+                        lloq_conc_disp = f"{lconc:.4g}"
+                except Exception:
+                    pass
+        status_class = {'Good': 'status-good', 'Acceptable': 'status-warn',
+                        'Poor': 'status-fail', 'Failed': 'status-fail'}.get(status, '')
+        summary_rows_html.append(
+            f"<tr><td>{plate}</td><td>{spot}</td><td>{group}</td>"
+            f"<td>{a}</td><td>{b}</td><td>{c}</td><td>{d}</td>"
+            f"<td>{lloq_sig_disp}</td><td>{lloq_conc_disp}</td><td>{r2}</td>"
+            f"<td>{flags}</td><td class='{status_class}'>{status}</td></tr>"
+        )
+
+    # ── QC Recovery table HTML ────────────────────────────────────────────────
+    qc_table_html = ''
+    if qc_summary_rows:
+        qc_hdr = f"Corrected Avg Interp. Conc.{unit_suffix}"
+        qc_rows_html = []
+        for qr in qc_summary_rows:
+            rec = qr['recovery']
+            if np.isfinite(rec):
+                rec_class = 'status-good' if 70 <= rec <= 130 else 'status-fail'
+                rec_str = f"{rec:.1f}%"
+            else:
+                rec_class = ''
+                rec_str = 'N/A'
+            avg_sig_str = f"{qr['avg_signal']:,.1f}" if np.isfinite(qr['avg_signal']) else 'N/A'
+            corr_str = f"{qr['corrected_conc']:.4g}" if np.isfinite(qr['corrected_conc']) else 'N/A'
+            exp_str = f"{qc_expected_concentrations:.4g}" if qc_expected_concentrations else ''
+            qc_rows_html.append(
+                f"<tr><td>{qr['sample_name']}</td><td>{qr['level']}</td>"
+                f"<td>{qr['plate']}</td><td>{qr['group'] or ''}</td>"
+                f"<td>{avg_sig_str}</td><td>{corr_str}</td><td>{exp_str}</td>"
+                f"<td class='{rec_class}'>{rec_str}</td></tr>"
+            )
+        qc_table_html = f"""
+    <h2>QC Recovery</h2>
+    <div class="table-wrap">
+    <table id="qcTable" class="data-table sortable">
+      <thead><tr>
+        <th onclick="sortTable(this)">Sample Name</th>
+        <th onclick="sortTable(this)">Level</th>
+        <th onclick="sortTable(this)">Plate</th>
+        <th onclick="sortTable(this)">Group</th>
+        <th onclick="sortTable(this)">Avg Signal</th>
+        <th onclick="sortTable(this)">{qc_hdr}</th>
+        <th onclick="sortTable(this)">Expected Conc.</th>
+        <th onclick="sortTable(this)">% Recovery</th>
+      </tr></thead>
+      <tbody>{''.join(qc_rows_html)}</tbody>
+    </table>
+    </div>"""
+
+    # ── All Unknowns table rows (global sort + TP assignment matches create_output) ──
+    # Build global unknowns dict keyed by (sample_name, group, plate) — same as create_output
+    all_unk_groups = defaultdict(lambda: {'signals': [], 'concs': [], 'wells': [],
+                                          'spot': None, 'group': '', 'plate': None,
+                                          'lloq_sig': None, 'params': None, 'uloq_conc': None})
+    for res in results:
+        plate, spot, group = res['plate'], res['spot'], res.get('group', '')
+        lloq_sig = res.get('lloq_sig')
+        params = res['params']
+        uloq_conc = lloq_conc_num = None
+        if params is not None:
+            try:
+                stds = res.get('standards', [])
+                uloq_conc = max((s['conc'] for s in stds if np.isfinite(s['conc'])), default=None)
+                if lloq_sig is not None:
+                    lc = inverse_4pl(lloq_sig, *params)
+                    lloq_conc_num = lc if np.isfinite(lc) and lc > 0 else None
+            except Exception:
+                pass
+        for u in res.get('unknowns', []):
+            sname = u['sample_name']
+            if _identify_qc_level(sname):
+                continue
+            key = (sname, group, plate)
+            d = all_unk_groups[key]
+            d['spot'] = spot; d['group'] = group; d['plate'] = plate
+            d['lloq_sig'] = lloq_sig; d['params'] = params
+            d['uloq_conc'] = uloq_conc; d['lloq_conc_num'] = lloq_conc_num
+            if np.isfinite(u['signal']):
+                d['signals'].append(u['signal'])
+            if np.isfinite(u['interp_conc']):
+                d['concs'].append(u['interp_conc'])
+            d['wells'].append(u['well'])
+
+    tp_index = defaultdict(int)
+    unk_rows_html = []
+    for (sname, group, plate), data in sorted(all_unk_groups.items()):
+        spot = data['spot']
+        lloq_sig = data['lloq_sig']
+        uloq_conc = data.get('uloq_conc')
+        lloq_conc_num = data.get('lloq_conc_num')
+
+        avg_sig = np.mean(data['signals']) if data['signals'] else np.nan
+        avg_conc = np.mean(data['concs']) if data['concs'] else np.nan
+        cv = np.nan
+        if len(data['concs']) > 1 and np.isfinite(avg_conc) and avg_conc != 0:
+            cv = np.std(data['concs'], ddof=1) / avg_conc * 100
+
+        flag = ''
+        if np.isfinite(avg_sig) and lloq_sig is not None and avg_sig < lloq_sig:
+            flag = '< LLOQ'
+        elif np.isfinite(avg_conc):
+            if uloq_conc and avg_conc > uloq_conc:
+                flag = '> ULOQ'
+            elif lloq_conc_num and avg_conc < lloq_conc_num:
+                flag = '< LLOQ'
+            else:
+                flag = 'In Range'
+        else:
+            flag = 'Out of Range'
+
+        # Dilution factor & corrected conc
+        qc_level = _identify_qc_level(sname) if qc_dilution_factors else None
+        if qc_level and qc_level in (qc_dilution_factors or {}):
+            factor = qc_dilution_factors[qc_level]
+        else:
+            factor = plate_dilution_factors.get(plate, 1.0)
+        corrected = avg_conc * factor if np.isfinite(avg_conc) else np.nan
+
+        # Total protein & normalized (same in-order assignment as create_output)
+        animal, tissue = _extract_animal_tissue(sname)
+        tp_val = None
+        if total_protein_map and animal:
+            tp_key = (animal, tissue)
+            tp_list = total_protein_map.get(tp_key, [])
+            idx = tp_index[tp_key]
+            if idx < len(tp_list):
+                tp_val = tp_list[idx]
+                tp_index[tp_key] += 1
+        norm_val = (corrected / tp_val
+                    if tp_val is not None and np.isfinite(corrected) and tp_val != 0
+                    else None)
+
+        flag_class = ('status-good' if flag == 'In Range'
+                      else 'status-warn' if flag in ('> ULOQ', '< LLOQ') else '')
+        cv_class = 'cv-bad' if np.isfinite(cv) and cv > 25 else ''
+        avg_sig_str  = f"{avg_sig:,.1f}" if np.isfinite(avg_sig) else 'N/A'
+        avg_conc_str = f"{avg_conc:.4g}" if np.isfinite(avg_conc) else 'N/A'
+        cv_str       = f"{cv:.1f}" if np.isfinite(cv) else 'N/A'
+        corr_str     = f"{corrected:.4g}" if np.isfinite(corrected) else ''
+        factor_str   = str(factor) if factor and factor != 1.0 else ''
+        tp_str       = f"{tp_val:.4g}" if tp_val is not None else ''
+        norm_str     = f"{norm_val:.6g}" if norm_val is not None else ''
+        animal_str   = animal or ''
+        tissue_str   = tissue or ''
+        unk_rows_html.append(
+            f"<tr><td>{sname}</td><td>{animal_str}</td><td>{tissue_str}</td>"
+            f"<td>{plate}</td><td>{spot}</td><td>{group}</td>"
+            f"<td>{', '.join(data['wells'])}</td><td>{avg_sig_str}</td>"
+            f"<td>{avg_conc_str}</td><td class='{cv_class}'>{cv_str}</td>"
+            f"<td class='{flag_class}'>{flag}</td>"
+            f"<td>{factor_str}</td><td>{corr_str}</td>"
+            f"<td>{tp_str}</td><td>{norm_str}</td></tr>"
+        )
+
+    # ── Assemble curve cards HTML ─────────────────────────────────────────────
+    curves_section_html = '\n'.join(
+        f'<div class="curve-card"><h3>{label}</h3>{div_html}</div>'
+        for label, div_html in curve_divs
+    )
+
+    # ── Plotly JS bundle (self-contained) ─────────────────────────────────────
+    plotly_js = poff.get_plotlyjs()
+
+    msd_basename = os.path.basename(msd_path)
+    has_tp = bool(total_protein_map)
+    tp_headers = (
+        "<th onclick=\"sortTable(this)\">Total Protein</th>"
+        "<th onclick=\"sortTable(this)\">Normalized Conc.</th>"
+    ) if has_tp else ""
+    unk_hdr_row = (
+        "<tr>"
+        "<th onclick=\"sortTable(this)\">Sample Name</th>"
+        "<th onclick=\"sortTable(this)\">Animal</th>"
+        "<th onclick=\"sortTable(this)\">Tissue</th>"
+        "<th onclick=\"sortTable(this)\">Plate</th>"
+        "<th onclick=\"sortTable(this)\">Spot</th>"
+        "<th onclick=\"sortTable(this)\">Group</th>"
+        "<th onclick=\"sortTable(this)\">Wells</th>"
+        "<th onclick=\"sortTable(this)\">Avg Signal</th>"
+        f"<th onclick=\"sortTable(this)\">Avg Interp. Conc.{unit_suffix}</th>"
+        "<th onclick=\"sortTable(this)\">%CV</th>"
+        "<th onclick=\"sortTable(this)\">Flag</th>"
+        "<th onclick=\"sortTable(this)\">Dilution Factor</th>"
+        f"<th onclick=\"sortTable(this)\">Corrected Avg Conc.{unit_suffix}</th>"
+        + tp_headers +
+        "</tr>"
+    )
+
+    html = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>MSD 4PL Analysis Report</title>
+<script>{plotly_js}</script>
+<style>
+  * {{ box-sizing: border-box; margin: 0; padding: 0; }}
+  body {{ font-family: Arial, sans-serif; font-size: 13px; background: #f0f2f5; color: #222; }}
+  .header {{ background: #3a506b; color: white; padding: 18px 28px; }}
+  .header h1 {{ font-size: 22px; font-weight: bold; letter-spacing: 0.5px; }}
+  .header p {{ font-size: 12px; opacity: 0.8; margin-top: 4px; }}
+  .header .accent {{ height: 3px; background: #7ba7bc; margin-top: 10px; border-radius: 2px; }}
+  .tabs {{ display: flex; background: #2e3f52; padding: 0 20px; }}
+  .tab-btn {{ padding: 12px 22px; cursor: pointer; color: #c5d5e8; border: none;
+              background: none; font-size: 13px; font-weight: 500;
+              border-bottom: 3px solid transparent; }}
+  .tab-btn:hover {{ color: white; }}
+  .tab-btn.active {{ color: white; border-bottom-color: #7ba7bc; }}
+  .content {{ padding: 24px 28px; max-width: 1400px; margin: 0 auto; }}
+  .tab-pane {{ display: none; }}
+  .tab-pane.active {{ display: block; }}
+  .table-wrap {{ overflow-x: auto; margin-bottom: 24px; }}
+  .data-table {{ border-collapse: collapse; width: 100%; background: white;
+                  box-shadow: 0 1px 4px rgba(0,0,0,0.08); border-radius: 4px; }}
+  .data-table th {{ background: #2F5496; color: white; padding: 9px 12px;
+                    text-align: left; cursor: pointer; white-space: nowrap; user-select: none; }}
+  .data-table th:hover {{ background: #3a65b5; }}
+  .data-table th.sort-asc::after {{ content: ' ▲'; font-size: 10px; }}
+  .data-table th.sort-desc::after {{ content: ' ▼'; font-size: 10px; }}
+  .data-table td {{ padding: 7px 12px; border-bottom: 1px solid #e8edf3; vertical-align: middle; }}
+  .data-table tr:hover td {{ background: #f5f8ff; }}
+  .data-table tr:last-child td {{ border-bottom: none; }}
+  .status-good {{ color: #006100; font-weight: 500; }}
+  .status-warn {{ color: #9C5700; font-weight: 500; }}
+  .status-fail {{ color: #9C0006; font-weight: 500; }}
+  .cv-bad {{ background: #F8CBAD; }}
+  .curves-grid {{ display: grid; grid-template-columns: repeat(auto-fill, minmax(520px, 1fr)); gap: 20px; }}
+  .export-bar {{ display: flex; justify-content: flex-end; margin-bottom: 10px; }}
+  .export-btn {{ padding: 8px 18px; background: #3a506b; color: white; border: none;
+                 border-radius: 4px; font-size: 13px; cursor: pointer; font-weight: 500; }}
+  .export-btn:hover {{ background: #2e3f52; }}
+  @media print {{
+    .tabs, .export-bar {{ display: none !important; }}
+    .tab-pane {{ display: block !important; page-break-inside: avoid; }}
+    .tab-pane + .tab-pane {{ page-break-before: always; }}
+    body {{ background: white; font-size: 11px; }}
+    .content {{ max-width: 100%; padding: 10px; }}
+    .data-table th {{ background: #2F5496 !important; -webkit-print-color-adjust: exact; print-color-adjust: exact; }}
+    .curve-card {{ box-shadow: none; border: 1px solid #ccc; }}
+    .section {{ box-shadow: none; border: 1px solid #ccc; }}
+    .header {{ -webkit-print-color-adjust: exact; print-color-adjust: exact; }}
+  }}
+  .curve-card {{ background: white; border-radius: 6px; box-shadow: 0 1px 4px rgba(0,0,0,0.08);
+                  padding: 16px; }}
+  .curve-card h3 {{ font-size: 13px; color: #3a506b; margin-bottom: 10px; font-weight: 600; }}
+  h2 {{ font-size: 16px; color: #3a506b; margin: 20px 0 12px; font-weight: 700; }}
+  .section {{ background: white; border-radius: 6px; box-shadow: 0 1px 4px rgba(0,0,0,0.08);
+               padding: 20px; margin-bottom: 24px; }}
+</style>
+</head>
+<body>
+
+<div class="header">
+  <h1>MSD 4PL Analysis Report</h1>
+  <p>{msd_basename}</p>
+  <div class="accent"></div>
+</div>
+
+<div class="tabs">
+  <button class="tab-btn active" onclick="showTab('summary', this)">Summary</button>
+  <button class="tab-btn" onclick="showTab('curves', this)">Standard Curves</button>
+  <button class="tab-btn" onclick="showTab('unknowns', this)">All Unknowns</button>
+  <div style="margin-left:auto;display:flex;align-items:center;padding-right:12px;">
+    <button class="export-btn" onclick="window.print()">⬇ Export PDF</button>
+  </div>
+</div>
+
+<div class="content">
+
+  <div id="tab-summary" class="tab-pane active">
+    <h2>Curve Fit Summary</h2>
+    <div class="table-wrap">
+    <table id="summaryTable" class="data-table">
+      <thead><tr>
+        <th onclick="sortTable(this)">Plate</th>
+        <th onclick="sortTable(this)">Spot</th>
+        <th onclick="sortTable(this)">Group</th>
+        <th onclick="sortTable(this)">Min (a)</th>
+        <th onclick="sortTable(this)">Hill Slope (b)</th>
+        <th onclick="sortTable(this)">EC50 (c)</th>
+        <th onclick="sortTable(this)">Max (d)</th>
+        <th onclick="sortTable(this)">LLOQ Signal</th>
+        <th onclick="sortTable(this)">LLOQ Conc</th>
+        <th onclick="sortTable(this)">R²</th>
+        <th onclick="sortTable(this)">Flags</th>
+        <th onclick="sortTable(this)">Status</th>
+      </tr></thead>
+      <tbody>{''.join(summary_rows_html)}</tbody>
+    </table>
+    </div>
+    {qc_table_html}
+    <h2>Standard Curve Overlay</h2>
+    <div class="section">
+      {overlay_div}
+    </div>
+  </div>
+
+  <div id="tab-curves" class="tab-pane">
+    <h2>Standard Curves</h2>
+    <div class="curves-grid">
+      {curves_section_html}
+    </div>
+  </div>
+
+  <div id="tab-unknowns" class="tab-pane">
+    <h2>All Unknowns</h2>
+    <div class="table-wrap">
+    <table id="unkTable" class="data-table">
+      <thead>{unk_hdr_row}</thead>
+      <tbody>{''.join(unk_rows_html)}</tbody>
+    </table>
+    </div>
+  </div>
+
+</div>
+
+<script>
+function showTab(name, btn) {{
+  document.querySelectorAll('.tab-pane').forEach(p => p.classList.remove('active'));
+  document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+  const pane = document.getElementById('tab-' + name);
+  pane.classList.add('active');
+  btn.classList.add('active');
+  // Resize all Plotly charts now that their containers are visible
+  pane.querySelectorAll('.js-plotly-plot').forEach(el => Plotly.Plots.resize(el));
+}}
+
+function sortTable(th) {{
+  const table = th.closest('table');
+  const tbody = table.querySelector('tbody');
+  const col = Array.from(th.parentNode.children).indexOf(th);
+  const asc = th.classList.contains('sort-asc');
+  table.querySelectorAll('th').forEach(h => h.classList.remove('sort-asc', 'sort-desc'));
+  th.classList.add(asc ? 'sort-desc' : 'sort-asc');
+  const dir = asc ? -1 : 1;
+  const rows = Array.from(tbody.querySelectorAll('tr'));
+  rows.sort((a, b) => {{
+    const av = a.cells[col]?.textContent.trim() ?? '';
+    const bv = b.cells[col]?.textContent.trim() ?? '';
+    const an = parseFloat(av.replace(/[,%]/g, ''));
+    const bn = parseFloat(bv.replace(/[,%]/g, ''));
+    if (!isNaN(an) && !isNaN(bn)) return (an - bn) * dir;
+    return av.localeCompare(bv) * dir;
+  }});
+  rows.forEach(r => tbody.appendChild(r));
+}}
+
+function filterTable(query, tableId) {{
+  const q = query.toLowerCase().trim();
+  document.getElementById(tableId).querySelectorAll('tbody tr').forEach(row => {{
+    const match = !q || row.textContent.toLowerCase().includes(q);
+    row.style.display = match ? 'table-row' : 'none';
+  }});
+}}
+</script>
+</body>
+</html>"""
+
+    with open(html_path, 'w', encoding='utf-8') as f:
+        f.write(html)
+    print(f"Saved HTML report: {html_path}")
+
+
 def run_analysis(msd_path, platemap_path, output_path, spots_override=None, units=None, cv_threshold=25, dilution_factors=None, lloq_method='current', total_protein_path=None, qc_dilution_factors=None, qc_expected_concentrations=None):
     _ensure_deps()   # lazy-load numpy / scipy / matplotlib / openpyxl
     print("=" * 60)
@@ -1332,15 +1937,16 @@ def run_analysis(msd_path, platemap_path, output_path, spots_override=None, unit
     print(f"  Found {n_plate_maps} plate map(s)")
 
     if len(plates) != n_plate_maps:
-        print(f"Error: MSD file contains {len(plates)} plate(s), but plate map contains {n_plate_maps} plate map(s).\n" \
-              "MSD and plate map files must have the same number of plates.")
-        sys.exit(1)
+        msg = (f"MSD file contains {len(plates)} plate(s), but plate map contains "
+               f"{n_plate_maps} plate map(s). They must match.")
+        print(f"Error: {msg}")
+        raise RuntimeError(msg)
 
     try:
         plate_dilution_factors = parse_plate_dilution_factors(dilution_factors, len(plates))
     except ValueError as e:
         print(f"Error parsing dilution factors: {e}")
-        sys.exit(1)
+        raise
 
     # Build per-plate well lookups
     plate_well_maps = {}
@@ -1452,13 +2058,15 @@ def run_analysis(msd_path, platemap_path, output_path, spots_override=None, unit
 
     missing = [r for r in results if r.get('no_standards')]
     if missing:
-        print("Error: Standards are missing for one or more curves. Analysis cannot continue.")
+        labels = []
         for r in missing:
-            label = f"Plate {r['plate']}, Spot {r['spot']}"
+            lbl = f"Plate {r['plate']}, Spot {r['spot']}"
             if r.get('group'):
-                label += f", Group {r['group']}"
-            print(f"  - {label}")
-        sys.exit(1)
+                lbl += f", Group {r['group']}"
+            labels.append(lbl)
+        msg = "Standards are missing for: " + "; ".join(labels)
+        print(f"Error: {msg}")
+        raise RuntimeError(msg)
 
     # Parse total protein CSV if provided
     total_protein_map = None
@@ -1475,6 +2083,18 @@ def run_analysis(msd_path, platemap_path, output_path, spots_override=None, unit
     print("Done!")
     _open_file(output_path)
 
+    # Generate and open interactive HTML report
+    html_path = os.path.splitext(output_path)[0] + '.html'
+    try:
+        generate_html_report(results, html_path, msd_path, units,
+                             qc_dilution_factors, qc_expected_concentrations,
+                             plate_dilution_factors, lloq_method,
+                             total_protein_map)
+        if os.path.exists(html_path):
+            _open_file(html_path)
+    except Exception as e:
+        print(f"Warning: HTML report could not be generated: {e}")
+
     # Save last run parameters
     last_args = {
         'msd': msd_path,
@@ -1487,7 +2107,8 @@ def run_analysis(msd_path, platemap_path, output_path, spots_override=None, unit
         'lloq_method': lloq_method,
         'total_protein': total_protein_path,
         'qc_dilution_factors': qc_dilution_factors,
-        'qc_expected_concentrations': qc_expected_concentrations
+        'qc_expected_concentrations': qc_expected_concentrations,
+        'status': 'pass',
     }
     _save_run_to_history(last_args)
 
@@ -1582,7 +2203,8 @@ def run_interactive():
                 messagebox.showerror("Error", f"Invalid expected QC concentration: '{val_str}'")
                 return
 
-        root.destroy()
+        # Hide the window while analysis runs; restore it on failure.
+        root.withdraw()
 
         print(f"\nMSD file:   {msd_path}")
         print(f"Plate map:  {platemap_path}")
@@ -1603,7 +2225,31 @@ def run_interactive():
         if qc_expected_concentrations:
             print(f"QC expected concentrations: {qc_expected_concentrations}")
 
-        run_analysis(msd_path, platemap_path, output_path, spots_override, units, cv_threshold, dilution_factors, lloq_method, total_protein_path, qc_dilution_factors, qc_expected_concentrations)
+        try:
+            run_analysis(msd_path, platemap_path, output_path, spots_override, units, cv_threshold, dilution_factors, lloq_method, total_protein_path, qc_dilution_factors, qc_expected_concentrations)
+            root.destroy()
+        except Exception as e:
+            import traceback
+            err_msg = str(e) or type(e).__name__
+            print(f"\nAnalysis error: {err_msg}")
+            traceback.print_exc()
+            # Save failed run to history
+            fail_entry = {
+                'msd': msd_path, 'platemap': platemap_path,
+                'output': output_path, 'spots': spots_override,
+                'units': units, 'cv_threshold': cv_threshold,
+                'dilution_factors': dilution_factors,
+                'lloq_method': lloq_method,
+                'total_protein': total_protein_path,
+                'qc_dilution_factors': qc_dilution_factors,
+                'qc_expected_concentrations': qc_expected_concentrations,
+                'status': 'fail',
+                'error': err_msg,
+            }
+            _save_run_to_history(fail_entry)
+            messagebox.showerror("Analysis Error", err_msg, parent=root)
+            root.deiconify()
+            refresh_history()
 
     # ── Window setup ───────────────────────────────────────────────────
     root = tk.Tk()
@@ -1761,13 +2407,23 @@ def run_interactive():
     lb_scroll.grid(row=0, column=1, sticky=tk.NS)
     history_lb.configure(yscrollcommand=lb_scroll.set)
 
-    _history_data = _load_run_history()
-    for entry in _history_data:
-        history_lb.insert(tk.END, f'  {_run_label(entry)}')
-    if not _history_data:
-        history_lb.insert(tk.END, '  (no previous runs yet)')
-        history_lb.configure(state=tk.DISABLED)
+    def refresh_history():
+        history_lb.configure(state=tk.NORMAL)
+        history_lb.delete(0, tk.END)
+        _hdata = _load_run_history()
+        if _hdata:
+            for i, entry in enumerate(_hdata):
+                history_lb.insert(tk.END, f'  {_run_label(entry)}')
+                status = entry.get('status', '')
+                if status == 'pass':
+                    history_lb.itemconfig(i, foreground='#2a7a2a')
+                elif status == 'fail':
+                    history_lb.itemconfig(i, foreground='#c0392b')
+        else:
+            history_lb.insert(tk.END, '  (no previous runs yet)')
+            history_lb.configure(state=tk.DISABLED)
 
+    refresh_history()
     history_lb.bind('<Double-Button-1>', lambda _e: load_selected_run())
 
     hist_btn_row = ttk.Frame(hist_lf)

@@ -3,7 +3,9 @@ from PyInstaller.utils.hooks import collect_all
 
 datas = []
 binaries = []
-hiddenimports = ['scipy.optimize', 'scipy.special', 'scipy.linalg', 'openpyxl', 'matplotlib.backends.backend_agg']
+hiddenimports = ['scipy.optimize', 'scipy.special', 'scipy.linalg', 'openpyxl', 'matplotlib.backends.backend_agg',
+                 'plotly', 'plotly.graph_objects', 'plotly.offline', 'plotly.io',
+                 'plotly.validators', 'plotly.basedatatypes', 'plotly.colors']
 tmp_ret = collect_all('matplotlib')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 
@@ -19,8 +21,6 @@ a = Analysis(
     runtime_hooks=[],
     excludes=[
         # unused stdlib
-        'unittest', 'pydoc', 'doctest', 'xmlrpc', 'ftplib', 'imaplib',
-        'poplib', 'smtplib', 'telnetlib', 'nntplib', 'antigravity',
         'tkinter.test', 'lib2to3',
         # unused matplotlib backends (keep Agg only)
         'matplotlib.backends.backend_pdf',
@@ -31,10 +31,6 @@ a = Analysis(
         'matplotlib.backends.backend_wxagg',
         'matplotlib.backends.backend_qt5agg',
         'matplotlib.backends.backend_tkagg',
-        # unused scientific extras
-        'scipy.spatial', 'scipy.ndimage', 'scipy.signal',
-        'scipy.io', 'scipy.fft', 'scipy.interpolate',
-        'pandas.io.formats.style',
     ],
     noarchive=False,
     optimize=1,
