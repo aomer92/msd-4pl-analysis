@@ -1593,12 +1593,14 @@ def run_interactive():
 
         run_analysis(msd_path, platemap_path, output_path, spots_override, units, cv_threshold, dilution_factors, lloq_method, total_protein_path, qc_dilution_factors, qc_expected_concentrations)
 
+    # ── Window setup ───────────────────────────────────────────────────
     root = tk.Tk()
     root.title("MSD 4PL Analysis Tool")
-    root.geometry("820x780")
-    root.resizable(False, False)
+    root.geometry("860x720")
+    root.minsize(760, 620)
+    root.resizable(True, True)
 
-    # Variables
+    # ── Variables ──────────────────────────────────────────────────────
     msd_var = tk.StringVar()
     platemap_var = tk.StringVar()
     output_var = tk.StringVar(value="msd_4pl_results.xlsx")
@@ -1611,106 +1613,168 @@ def run_interactive():
     qc_df_vars = {level: tk.StringVar() for level in QC_LEVELS}
     qc_exp_var = tk.StringVar()
 
-    # Layout
-    frame = ttk.Frame(root, padding="10")
-    frame.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
+    # ── Header banner ──────────────────────────────────────────────────
+    SLATE  = '#3a506b'   # soft slate-blue — clean, not corporate-heavy
+    SLATE_LIGHT = '#c8d8e8'
+    header_canvas = tk.Canvas(root, height=58, bg=SLATE, highlightthickness=0)
+    header_canvas.pack(fill=tk.X, side=tk.TOP)
+    header_canvas.create_text(18, 20, anchor='w', text='MSD 4PL Analysis Tool',
+                              fill='white', font=('Helvetica', 16, 'bold'))
+    header_canvas.create_text(18, 42, anchor='w',
+                              text='4-Parameter Logistic Curve Fitting  ·  Quantitative Analysis',
+                              fill=SLATE_LIGHT, font=('Helvetica', 10))
 
-    # File selections
-    ttk.Label(frame, text="MSD Data File:").grid(row=0, column=0, sticky=tk.W, pady=2)
-    ttk.Entry(frame, textvariable=msd_var, width=50).grid(row=0, column=1, pady=2)
-    ttk.Button(frame, text="Browse", command=lambda: browse_file(msd_var, "Select MSD Data File", [("MSD Text Files", "*.txt"), ("All Files", "*.*")])).grid(row=0, column=2, pady=2)
+    # Thin accent rule below header
+    tk.Canvas(root, height=2, bg='#7ba7bc', highlightthickness=0).pack(fill=tk.X)
 
-    ttk.Label(frame, text="Plate Map CSV:").grid(row=1, column=0, sticky=tk.W, pady=2)
-    ttk.Entry(frame, textvariable=platemap_var, width=50).grid(row=1, column=1, pady=2)
-    ttk.Button(frame, text="Browse", command=lambda: browse_file(platemap_var, "Select Plate Map CSV", [("CSV Files", "*.csv"), ("All Files", "*.*")])).grid(row=1, column=2, pady=2)
+    # ── Main content area (expands with window) ────────────────────────
+    outer = ttk.Frame(root, padding='12 10 12 6')
+    outer.pack(fill=tk.BOTH, expand=True)
+    outer.columnconfigure(0, weight=1)
 
-    ttk.Label(frame, text="Output Excel:").grid(row=2, column=0, sticky=tk.W, pady=2)
-    ttk.Entry(frame, textvariable=output_var, width=50).grid(row=2, column=1, pady=2)
-    ttk.Button(frame, text="Browse", command=lambda: browse_save(output_var, "Save Results As", ".xlsx", [("Excel Files", "*.xlsx")], "msd_4pl_results.xlsx")).grid(row=2, column=2, pady=2)
+    # helper: consistent row padding inside LabelFrames
+    _rp = {'pady': 4, 'padx': 2}
 
-    # Options
-    ttk.Label(frame, text="Spots per Well (1,4,10 or blank for auto):").grid(row=3, column=0, sticky=tk.W, pady=2)
-    ttk.Entry(frame, textvariable=spots_var, width=20).grid(row=3, column=1, sticky=tk.W, pady=2)
+    # ── Input Files ────────────────────────────────────────────────────
+    files_lf = ttk.LabelFrame(outer, text='Input Files', padding='10 6')
+    files_lf.pack(fill=tk.X, pady=(0, 8))
+    files_lf.columnconfigure(1, weight=1)
 
-    ttk.Label(frame, text="Units (e.g. pg/mL):").grid(row=4, column=0, sticky=tk.W, pady=2)
-    ttk.Entry(frame, textvariable=units_var, width=20).grid(row=4, column=1, sticky=tk.W, pady=2)
+    def _file_row(parent, row, label, var, btn_cmd, btn2_cmd=None):
+        ttk.Label(parent, text=label).grid(row=row, column=0, sticky=tk.W,
+                                           padx=(0, 10), **_rp)
+        ttk.Entry(parent, textvariable=var, width=54).grid(row=row, column=1,
+                                                            sticky=tk.EW, **_rp)
+        ttk.Button(parent, text='Browse…', command=btn_cmd, width=8).grid(
+            row=row, column=2, padx=(6, 0), **_rp)
 
-    ttk.Label(frame, text="%CV Threshold:").grid(row=5, column=0, sticky=tk.W, pady=2)
-    ttk.Entry(frame, textvariable=cv_threshold_var, width=20).grid(row=5, column=1, sticky=tk.W, pady=2)
+    _file_row(files_lf, 0, 'MSD Data File:', msd_var,
+              lambda: browse_file(msd_var, 'Select MSD Data File',
+                                  [('MSD Text Files', '*.txt'), ('All Files', '*.*')]))
+    _file_row(files_lf, 1, 'Plate Map CSV:', platemap_var,
+              lambda: browse_file(platemap_var, 'Select Plate Map CSV',
+                                  [('CSV Files', '*.csv'), ('All Files', '*.*')]))
+    _file_row(files_lf, 2, 'Output Excel:', output_var,
+              lambda: browse_save(output_var, 'Save Results As', '.xlsx',
+                                  [('Excel Files', '*.xlsx')], 'msd_4pl_results.xlsx'))
 
-    ttk.Label(frame, text="LLOQ Method:").grid(row=6, column=0, sticky=tk.W, pady=2)
-    lloq_frame = ttk.Frame(frame)
-    lloq_frame.grid(row=6, column=1, sticky=tk.W, pady=2)
-    ttk.Radiobutton(lloq_frame, text="Current (mean + 10×SD)", variable=lloq_method_var, value="current").pack(side=tk.LEFT)
-    ttk.Radiobutton(lloq_frame, text="3× Blank Mean", variable=lloq_method_var, value="3xblank").pack(side=tk.LEFT)
+    # ── Analysis Options ───────────────────────────────────────────────
+    opts_lf = ttk.LabelFrame(outer, text='Analysis Options', padding='10 6')
+    opts_lf.pack(fill=tk.X, pady=(0, 8))
 
-    ttk.Label(frame, text="Dilution Factors (comma-separated):").grid(row=7, column=0, sticky=tk.W, pady=2)
-    ttk.Entry(frame, textvariable=dilution_factors_var, width=50).grid(row=7, column=1, pady=2)
+    # Row 0 — Spots | Units
+    ttk.Label(opts_lf, text='Spots per Well:').grid(row=0, column=0, sticky=tk.W, **_rp)
+    spots_e = ttk.Entry(opts_lf, textvariable=spots_var, width=8)
+    spots_e.grid(row=0, column=1, sticky=tk.W, padx=(0, 20), **_rp)
+    ttk.Label(opts_lf, text='1, 4, 10 or blank', foreground='grey').grid(
+        row=0, column=2, sticky=tk.W, padx=(0, 30), **_rp)
+    ttk.Label(opts_lf, text='Units:').grid(row=0, column=3, sticky=tk.W, **_rp)
+    ttk.Entry(opts_lf, textvariable=units_var, width=14).grid(
+        row=0, column=4, sticky=tk.W, **_rp)
+    ttk.Label(opts_lf, text='e.g. pg/mL', foreground='grey').grid(
+        row=0, column=5, sticky=tk.W, padx=(4, 0), **_rp)
 
-    ttk.Label(frame, text="Total Protein CSV (optional):").grid(row=8, column=0, sticky=tk.W, pady=2)
-    ttk.Entry(frame, textvariable=total_protein_var, width=50).grid(row=8, column=1, pady=2)
-    ttk.Button(frame, text="Browse", command=lambda: browse_file(total_protein_var, "Select Total Protein CSV", [("CSV Files", "*.csv"), ("All Files", "*.*")])).grid(row=8, column=2, pady=2)
+    # Row 1 — %CV | Dilution Factors
+    ttk.Label(opts_lf, text='%CV Threshold:').grid(row=1, column=0, sticky=tk.W, **_rp)
+    ttk.Entry(opts_lf, textvariable=cv_threshold_var, width=8).grid(
+        row=1, column=1, sticky=tk.W, padx=(0, 20), **_rp)
+    ttk.Label(opts_lf, text='Plate Dilution Factors:').grid(
+        row=1, column=3, sticky=tk.W, **_rp)
+    ttk.Entry(opts_lf, textvariable=dilution_factors_var, width=22).grid(
+        row=1, column=4, columnspan=2, sticky=tk.W, **_rp)
 
-    # QC Controls section (dilution factors + expected concentrations)
-    qc_lf = ttk.LabelFrame(frame, text="QC Controls (optional — for samples containing ULOQ/HQC/MQC/LQC/LLOQ)", padding="6")
-    qc_lf.grid(row=9, column=0, columnspan=3, sticky=(tk.W, tk.E), pady=(8, 4))
+    # Row 2 — LLOQ Method
+    ttk.Label(opts_lf, text='LLOQ Method:').grid(row=2, column=0, sticky=tk.W, **_rp)
+    lloq_inner = ttk.Frame(opts_lf)
+    lloq_inner.grid(row=2, column=1, columnspan=5, sticky=tk.W, **_rp)
+    ttk.Radiobutton(lloq_inner, text='Mean + 10×SD (current)',
+                    variable=lloq_method_var, value='current').pack(side=tk.LEFT)
+    ttk.Radiobutton(lloq_inner, text='3× Blank Mean',
+                    variable=lloq_method_var, value='3xblank').pack(side=tk.LEFT, padx=(16, 0))
 
-    # Column headers (level names)
-    for col_offset, level in enumerate(QC_LEVELS):
-        ttk.Label(qc_lf, text=level, font=('TkDefaultFont', 9, 'bold')).grid(
-            row=0, column=col_offset + 1, sticky=tk.EW, padx=6, pady=(0, 2))
+    # Row 3 — Total Protein (spans full width)
+    ttk.Label(opts_lf, text='Total Protein CSV:').grid(row=3, column=0, sticky=tk.W, **_rp)
+    ttk.Entry(opts_lf, textvariable=total_protein_var, width=46).grid(
+        row=3, column=1, columnspan=4, sticky=tk.W, **_rp)
+    ttk.Button(opts_lf, text='Browse…', width=8,
+               command=lambda: browse_file(
+                   total_protein_var, 'Select Total Protein CSV',
+                   [('CSV Files', '*.csv'), ('All Files', '*.*')])).grid(
+        row=3, column=5, padx=(6, 0), **_rp)
 
-    # Row 1: Dilution Factors
-    ttk.Label(qc_lf, text="Dilution Factor:").grid(row=1, column=0, sticky=tk.W, padx=(4, 8), pady=1)
-    for col_offset, level in enumerate(QC_LEVELS):
+    # ── QC Controls ────────────────────────────────────────────────────
+    qc_lf = ttk.LabelFrame(outer, text='QC Controls  (optional — samples containing ULOQ / HQC / MQC / LQC / LLOQ)',
+                            padding='10 6')
+    qc_lf.pack(fill=tk.X, pady=(0, 8))
+
+    # Level headers
+    for ci, level in enumerate(QC_LEVELS):
+        ttk.Label(qc_lf, text=level, font=('TkDefaultFont', 9, 'bold'),
+                  anchor='center').grid(row=0, column=ci + 1, padx=8, pady=(0, 2))
+
+    # Dilution factor row
+    ttk.Label(qc_lf, text='Dilution Factor:').grid(row=1, column=0, sticky=tk.W,
+                                                    padx=(0, 10), pady=2)
+    for ci, level in enumerate(QC_LEVELS):
         ttk.Entry(qc_lf, textvariable=qc_df_vars[level], width=9).grid(
-            row=1, column=col_offset + 1, padx=6, pady=1)
+            row=1, column=ci + 1, padx=8, pady=2)
 
-    # Row 2: Single expected concentration (shared across all QC levels)
-    exp_row = ttk.Frame(qc_lf)
-    exp_row.grid(row=2, column=0, columnspan=6, sticky=tk.W, pady=(4, 2))
-    ttk.Label(exp_row, text="Expected Conc. (all QC):").pack(side=tk.LEFT, padx=(4, 6))
-    ttk.Entry(exp_row, textvariable=qc_exp_var, width=12).pack(side=tk.LEFT)
-    ttk.Label(exp_row, text="  ← ±30% band plotted on overlay", foreground='grey').pack(side=tk.LEFT, padx=(6, 0))
+    # Expected concentration row
+    exp_inner = ttk.Frame(qc_lf)
+    exp_inner.grid(row=2, column=0, columnspan=6, sticky=tk.W, pady=(6, 2))
+    ttk.Label(exp_inner, text='Expected Conc. (all QC):').pack(side=tk.LEFT, padx=(0, 8))
+    ttk.Entry(exp_inner, textvariable=qc_exp_var, width=12).pack(side=tk.LEFT)
+    ttk.Label(exp_inner, text='  ·  ±30% acceptance band plotted on overlay chart',
+              foreground='grey').pack(side=tk.LEFT, padx=(6, 0))
 
-    # ── Previous Runs section ──────────────────────────────────────────
-    hist_lf = ttk.LabelFrame(frame, text="Previous Runs (click to select, then Load)", padding="6")
-    hist_lf.grid(row=10, column=0, columnspan=3, sticky=(tk.W, tk.E), pady=(8, 2))
+    # ── Previous Runs (expands vertically when window is resized) ──────
+    hist_lf = ttk.LabelFrame(outer, text='Previous Runs', padding='10 6')
+    hist_lf.pack(fill=tk.BOTH, expand=True, pady=(0, 8))
     hist_lf.columnconfigure(0, weight=1)
+    hist_lf.rowconfigure(0, weight=1)
 
-    # Listbox + scrollbar
-    lb_frame = ttk.Frame(hist_lf)
-    lb_frame.grid(row=0, column=0, sticky=(tk.W, tk.E))
-    lb_frame.columnconfigure(0, weight=1)
+    lb_outer = ttk.Frame(hist_lf)
+    lb_outer.grid(row=0, column=0, sticky=tk.NSEW)
+    lb_outer.columnconfigure(0, weight=1)
+    lb_outer.rowconfigure(0, weight=1)
 
-    history_lb = tk.Listbox(lb_frame, height=5, activestyle='dotbox',
+    history_lb = tk.Listbox(lb_outer, height=4, activestyle='none',
                             selectmode=tk.SINGLE, font=('TkFixedFont', 9),
-                            relief='flat', borderwidth=1, highlightthickness=1)
-    history_lb.grid(row=0, column=0, sticky=(tk.W, tk.E))
+                            relief='solid', borderwidth=1, highlightthickness=0,
+                            selectbackground='#7ba7bc', selectforeground='white',
+                            bg='white')
+    history_lb.grid(row=0, column=0, sticky=tk.NSEW)
 
-    lb_scroll = ttk.Scrollbar(lb_frame, orient=tk.VERTICAL, command=history_lb.yview)
-    lb_scroll.grid(row=0, column=1, sticky=(tk.N, tk.S))
+    lb_scroll = ttk.Scrollbar(lb_outer, orient=tk.VERTICAL, command=history_lb.yview)
+    lb_scroll.grid(row=0, column=1, sticky=tk.NS)
     history_lb.configure(yscrollcommand=lb_scroll.set)
 
-    # Populate listbox from saved history
     _history_data = _load_run_history()
     for entry in _history_data:
-        history_lb.insert(tk.END, _run_label(entry))
+        history_lb.insert(tk.END, f'  {_run_label(entry)}')
     if not _history_data:
-        history_lb.insert(tk.END, '  (no previous runs)')
+        history_lb.insert(tk.END, '  (no previous runs yet)')
         history_lb.configure(state=tk.DISABLED)
 
-    # Double-click also loads
     history_lb.bind('<Double-Button-1>', lambda _e: load_selected_run())
 
-    load_btn = ttk.Button(hist_lf, text="Load Selected Run", command=load_selected_run)
-    load_btn.grid(row=1, column=0, sticky=tk.E, pady=(4, 0))
+    hist_btn_row = ttk.Frame(hist_lf)
+    hist_btn_row.grid(row=1, column=0, sticky=tk.EW, pady=(6, 0))
+    ttk.Label(hist_btn_row, text='Double-click or select then click Load →',
+              foreground='grey').pack(side=tk.LEFT)
+    ttk.Button(hist_btn_row, text='Load Selected Run',
+               command=load_selected_run).pack(side=tk.RIGHT)
 
     # ── Action buttons ─────────────────────────────────────────────────
-    button_frame = ttk.Frame(frame)
-    button_frame.grid(row=11, column=0, columnspan=3, pady=10)
-    ttk.Button(button_frame, text="Run Analysis", command=run).pack(side=tk.LEFT, padx=5)
-    ttk.Button(button_frame, text="Cancel", command=root.destroy).pack(side=tk.LEFT, padx=5)
+    sep = ttk.Separator(outer, orient='horizontal')
+    sep.pack(fill=tk.X, pady=(2, 10))
+
+    btn_row = ttk.Frame(outer)
+    btn_row.pack(fill=tk.X)
+    ttk.Button(btn_row, text='Cancel',
+               command=root.destroy).pack(side=tk.RIGHT, padx=(6, 0))
+    ttk.Button(btn_row, text='▶  Run Analysis',
+               command=run, default='active').pack(side=tk.RIGHT)
 
     root.mainloop()
 
