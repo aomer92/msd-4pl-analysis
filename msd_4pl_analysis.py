@@ -1545,15 +1545,22 @@ def generate_html_report(results, html_path, msd_path, units=None,
         if d['concs']:
             avg_conc = float(np.mean(d['concs']))
             conc_str = f'{avg_conc:.4g}' + (f' {units}' if units else '')
-            ann = f'<b>{prefix}: {avg_sig:,.0f} (signal) | {conc_str} (conc)</b>'
+            ann = f'{prefix}: {avg_sig:,.0f} (signal) | {conc_str} (conc)'
         else:
-            ann = f'<b>{prefix}: {avg_sig:,.0f} (signal)</b>'
+            ann = f'{prefix}: {avg_sig:,.0f} (signal)'
+        # Draw the line without annotation, then place annotation explicitly
         overlay_fig.add_hline(
             y=avg_sig,
             line=dict(color=clr, dash='dash', width=2),
-            annotation_text=ann,
-            annotation_position='bottom right',
-            annotation_font=dict(color=clr, size=12)
+        )
+        overlay_fig.add_annotation(
+            xref='paper', x=1.01,
+            yref='y', y=avg_sig,
+            text=f'<b>{ann}</b>',
+            showarrow=False,
+            xanchor='left',
+            yanchor='middle',
+            font=dict(color=clr, size=11),
         )
 
     if qc_expected_concentrations and qc_expected_concentrations > 0:
@@ -1610,7 +1617,7 @@ def generate_html_report(results, html_path, msd_path, units=None,
         plot_bgcolor='white', paper_bgcolor='white',
         legend=dict(orientation='v', x=1.02, y=1,
                     itemclick='toggle', itemdoubleclick='toggleothers'),
-        margin=dict(l=60, r=200, t=60, b=60),
+        margin=dict(l=60, r=340, t=60, b=60),
         height=520
     )
     overlay_div = overlay_fig.to_html(full_html=False, include_plotlyjs=False,
