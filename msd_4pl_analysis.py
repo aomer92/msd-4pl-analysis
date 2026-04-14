@@ -1552,7 +1552,7 @@ def generate_html_report(results, html_path, msd_path, units=None,
             y=avg_sig,
             line=dict(color=clr, dash='dash', width=2),
             annotation_text=ann,
-            annotation_position='right',
+            annotation_position='bottom right',
             annotation_font=dict(color=clr, size=12)
         )
 
