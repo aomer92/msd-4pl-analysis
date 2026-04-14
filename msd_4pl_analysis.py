@@ -313,7 +313,7 @@ def generate_std_curve_chart(res, tmp_dir, lloq_method='current'):
     # Generate smooth fitted curve
     conc_min = np.min(std_concs) * 0.3
     conc_max = np.max(std_concs) * 3
-    x_smooth = np.logspace(np.log10(conc_min), np.log10(conc_max), 500)
+    x_smooth = np.logspace(np.log10(conc_min), np.log10(conc_max), 200)
     y_smooth = four_pl(x_smooth, *params)
 
     # ── Plot ──────────────────────────────────────────────────────────
@@ -397,7 +397,7 @@ def generate_std_curve_chart(res, tmp_dir, lloq_method='current'):
     # Save
     fname = f"chart_P{plate}_S{spot}{'_' + group if group else ''}.png"
     fpath = os.path.join(tmp_dir, fname)
-    fig.savefig(fpath, dpi=180, bbox_inches='tight', facecolor='white')
+    fig.savefig(fpath, dpi=96, bbox_inches='tight', facecolor='white')
     plt.close(fig)
     return fpath
 
@@ -445,7 +445,7 @@ def generate_overlay_chart(results, tmp_dir, qc_overlay_points=None, qc_expected
         global_conc_max = max(global_conc_max, cmax)
 
         # Smooth fitted curve
-        x_smooth = np.logspace(np.log10(cmin * 0.3), np.log10(cmax * 3), 400)
+        x_smooth = np.logspace(np.log10(cmin * 0.3), np.log10(cmax * 3), 200)
         y_smooth = four_pl(x_smooth, *params)
         ax.plot(x_smooth, y_smooth, '-', color=color, linewidth=1.5, label=label, zorder=3)
 
@@ -515,7 +515,7 @@ def generate_overlay_chart(results, tmp_dir, qc_overlay_points=None, qc_expected
     plt.tight_layout()
 
     fpath = os.path.join(tmp_dir, 'overlay_all_curves.png')
-    fig.savefig(fpath, dpi=180, bbox_inches='tight', facecolor='white')
+    fig.savefig(fpath, dpi=96, bbox_inches='tight', facecolor='white')
     plt.close(fig)
     return fpath
 
@@ -1319,7 +1319,7 @@ def _open_file(path):
 def generate_html_report(results, html_path, msd_path, units=None,
                           qc_dilution_factors=None, qc_expected_concentrations=None,
                           plate_dilution_factors=None, lloq_method='current',
-                          total_protein_map=None):
+                          total_protein_map=None, excel_path=None):
     """Generate a self-contained interactive HTML report alongside the Excel output."""
     try:
         import plotly.graph_objects as go
@@ -1359,16 +1359,13 @@ def generate_html_report(results, html_path, msd_path, units=None,
             if np.isfinite(corrected) and np.isfinite(avg_sig) and corrected > 0 and avg_sig > 0:
                 qc_overlay_points.append({**row_data, 'signal': avg_sig})
 
-    # ── Per-spot standard curve figures ──────────────────────────────────────
-    curve_divs = []
-    for res in results:
+    # ── Per-spot standard curve figures (built in parallel) ──────────────────
+    def _build_curve_div(res):
         plate, spot, group = res['plate'], res['spot'], res.get('group', '')
         label = f"Plate {plate}, Spot {spot}" + (f", Group {group}" if group else "")
         fig = go.Figure()
 
-        # Collect all positive values to compute explicit axis ranges
         all_concs_pos, all_sigs_pos = [], []
-        std_concs, std_means = [], []
 
         if res.get('standards'):
             std_groups_local = {}
@@ -1389,16 +1386,15 @@ def generate_html_report(results, html_path, msd_path, units=None,
             ))
 
         lloq_sig = res.get('lloq_sig')
-        x_fit, y_fit = [], []
         if res['params'] is not None:
             concs_for_fit = [s['conc'] for s in res.get('standards', []) if s['conc'] > 0]
             if concs_for_fit:
                 c_min, c_max = min(concs_for_fit), max(concs_for_fit)
-                x_fit = list(np.logspace(np.log10(c_min * 0.5), np.log10(c_max * 2), 300))
-                y_fit = [four_pl(x, *res['params']) for x in x_fit]
+                x_fit = np.logspace(np.log10(c_min * 0.5), np.log10(c_max * 2), 200)
+                y_fit = four_pl(x_fit, *res['params'])
                 all_sigs_pos += [v for v in y_fit if v > 0]
                 fig.add_trace(go.Scatter(
-                    x=x_fit, y=y_fit,
+                    x=list(x_fit), y=list(y_fit),
                     mode='lines', name='4PL Fit',
                     line=dict(color='#E06C4A', width=2),
                     hovertemplate='Conc: %{x:.4g}<br>Signal: %{y:,.0f}<extra>4PL Fit</extra>'
@@ -1406,21 +1402,25 @@ def generate_html_report(results, html_path, msd_path, units=None,
 
             if lloq_sig is not None and lloq_sig > 0:
                 fig.add_hline(y=lloq_sig, line=dict(color='#F4A522', dash='dash', width=1.5),
-                              annotation_text=f'LLOQ: {lloq_sig:,.0f}',
+                              annotation_text=f'LLOQ signal: {lloq_sig:,.0f}',
                               annotation_position='bottom right')
                 all_sigs_pos.append(lloq_sig)
+                # Vertical line at the interpolated LLOQ concentration
+                try:
+                    lloq_conc = inverse_4pl(lloq_sig, *res['params'])
+                    if np.isfinite(lloq_conc) and lloq_conc > 0:
+                        fig.add_vline(x=lloq_conc,
+                                      line=dict(color='#F4A522', dash='dot', width=1.5),
+                                      annotation_text=f'LLOQ: {lloq_conc:.4g}',
+                                      annotation_position='top right')
+                        all_concs_pos.append(lloq_conc)
+                except Exception:
+                    pass
 
-        # Compute explicit log10 axis ranges so data fills the chart properly
-        if all_concs_pos:
-            x_range = [np.log10(min(all_concs_pos)) - 0.25,
-                       np.log10(max(all_concs_pos)) + 0.25]
-        else:
-            x_range = None
-        if all_sigs_pos:
-            y_range = [np.log10(min(all_sigs_pos)) - 0.15,
-                       np.log10(max(all_sigs_pos)) + 0.15]
-        else:
-            y_range = None
+        x_range = ([np.log10(min(all_concs_pos)) - 0.25, np.log10(max(all_concs_pos)) + 0.25]
+                   if all_concs_pos else None)
+        y_range = ([np.log10(min(all_sigs_pos)) - 0.15, np.log10(max(all_sigs_pos)) + 0.15]
+                   if all_sigs_pos else None)
 
         r2_str = f"R² = {res['r2']:.6f}" if res.get('r2') is not None else "Fit Failed"
         fig.update_layout(
@@ -1439,8 +1439,12 @@ def generate_html_report(results, html_path, msd_path, units=None,
             autosize=True, height=400
         )
         div_id = f"curve_p{plate}_s{spot}_{group or 'default'}"
-        curve_divs.append((label, fig.to_html(full_html=False, include_plotlyjs=False,
-                                               div_id=div_id, config={'responsive': True})))
+        return (label, fig.to_html(full_html=False, include_plotlyjs=False,
+                                   div_id=div_id, config={'responsive': True}))
+
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor() as _pool:
+        curve_divs = list(_pool.map(_build_curve_div, results))
 
     # ── Overlay figure ────────────────────────────────────────────────────────
     overlay_fig = go.Figure()
@@ -1453,17 +1457,45 @@ def generate_html_report(results, html_path, msd_path, units=None,
         if not concs_for_fit:
             continue
         c_min, c_max = min(concs_for_fit), max(concs_for_fit)
-        x_fit = list(np.logspace(np.log10(c_min * 0.5), np.log10(c_max * 2), 200))
-        y_fit = [four_pl(x, *res['params']) for x in x_fit]
+        x_fit = np.logspace(np.log10(c_min * 0.5), np.log10(c_max * 2), 200)
+        y_fit = four_pl(x_fit, *res['params'])
+        x_fit = list(x_fit)
+        y_fit = list(y_fit)
         plate, spot, group = res['plate'], res['spot'], res.get('group', '')
         trace_label = f"P{plate} S{spot}" + (f" {group}" if group else "")
         color = colors[i % len(colors)]
         overlay_fig.add_trace(go.Scatter(
             x=x_fit, y=y_fit,
             mode='lines', name=trace_label,
+            legendgroup=trace_label,
             line=dict(color=color, width=1.5),
             hovertemplate=f'%{{x:.4g}} → %{{y:,.0f}}<extra>{trace_label}</extra>'
         ))
+
+        # Sample (unknown) scatter points for this curve, color-matched
+        _factor = (plate_dilution_factors or {}).get(plate, 1.0)
+        _unk_xs, _unk_ys, _unk_names = [], [], []
+        for u in res.get('unknowns', []):
+            sname = u['sample_name']
+            if _identify_qc_level(sname):
+                continue
+            sig = u['signal']
+            conc = u.get('interp_conc', np.nan)
+            if np.isfinite(sig) and sig > 0 and np.isfinite(conc) and conc > 0:
+                _unk_xs.append(conc * _factor)
+                _unk_ys.append(sig)
+                _unk_names.append(sname)
+        if _unk_xs:
+            overlay_fig.add_trace(go.Scatter(
+                x=_unk_xs, y=_unk_ys,
+                mode='markers', name=f'{trace_label} samples',
+                legendgroup=trace_label,
+                showlegend=False,
+                marker=dict(color=color, size=7, symbol='circle-open',
+                            line=dict(width=1.5, color=color)),
+                text=_unk_names,
+                hovertemplate='%{text}<br>Conc: %{x:.4g}<br>Signal: %{y:,.0f}<extra>' + trace_label + '</extra>'
+            ))
 
     if qc_overlay_points:
         qc_level_colors = {'ULOQ': '#e41a1c', 'HQC': '#ff7f00', 'MQC': '#4daf4a',
@@ -1482,6 +1514,21 @@ def generate_html_report(results, html_path, msd_path, units=None,
                 customdata=names,
                 hovertemplate='Conc: %{x:.4g}<br>Signal: %{y:,.0f}<br>%{customdata}<extra>QC ' + level + '</extra>'
             ))
+
+    # Average LLOQ horizontal line across all results
+    lloq_sigs_all = [res['lloq_sig'] for res in results
+                     if res.get('lloq_sig') is not None and res['lloq_sig'] > 0]
+    if lloq_sigs_all:
+        avg_lloq_sig = float(np.mean(lloq_sigs_all))
+        overlay_fig.add_hline(
+            y=avg_lloq_sig,
+            line=dict(color='#F4A522', dash='dash', width=1.5),
+            annotation_text=f'Avg LLOQ: {avg_lloq_sig:,.0f}',
+            annotation_position='bottom right'
+        )
+        _overlay_all_sigs = [avg_lloq_sig]
+    else:
+        _overlay_all_sigs = []
 
     if qc_expected_concentrations and qc_expected_concentrations > 0:
         lo = qc_expected_concentrations * 0.7
@@ -1508,6 +1555,18 @@ def generate_html_report(results, html_path, msd_path, units=None,
         for _qp in qc_overlay_points:
             if np.isfinite(_qp['corrected_conc']) and _qp['corrected_conc'] > 0:
                 _overlay_x_vals.append(_qp['corrected_conc'])
+    # Include sample points so axis range covers them
+    _factor_map = plate_dilution_factors or {}
+    for res in results:
+        if res['params'] is None:
+            continue
+        _f = _factor_map.get(res['plate'], 1.0)
+        for u in res.get('unknowns', []):
+            if _identify_qc_level(u['sample_name']):
+                continue
+            conc = u.get('interp_conc', np.nan)
+            if np.isfinite(conc) and conc > 0:
+                _overlay_x_vals.append(conc * _f)
     overlay_x_range = None
     if _overlay_x_vals:
         overlay_x_range = [np.log10(min(_overlay_x_vals)) - 0.2,
@@ -1719,6 +1778,12 @@ def generate_html_report(results, html_path, msd_path, units=None,
     plotly_js = poff.get_plotlyjs()
 
     msd_basename = os.path.basename(msd_path)
+    excel_basename = os.path.basename(excel_path) if excel_path else None
+    excel_abs = ('file://' + os.path.abspath(excel_path).replace('\\', '/')) if excel_path else None
+    excel_btn_html = (
+        f'<a class="excel-btn" href="{excel_abs}">⬇ Open Excel</a>'
+        if excel_abs else ''
+    )
     has_tp = bool(total_protein_map)
     tp_headers = (
         "<th onclick=\"sortTable(this)\">Total Protein</th>"
@@ -1786,6 +1851,10 @@ def generate_html_report(results, html_path, msd_path, units=None,
   .export-btn {{ padding: 8px 18px; background: #3a506b; color: white; border: none;
                  border-radius: 4px; font-size: 13px; cursor: pointer; font-weight: 500; }}
   .export-btn:hover {{ background: #2e3f52; }}
+  .excel-btn {{ padding: 8px 18px; background: #1e6b3c; color: white; border: none;
+                border-radius: 4px; font-size: 13px; cursor: pointer; font-weight: 500;
+                text-decoration: none; display: inline-block; }}
+  .excel-btn:hover {{ background: #155230; }}
   @media print {{
     .tabs, .export-bar {{ display: none !important; }}
     .tab-pane {{ display: block !important; page-break-inside: avoid; }}
@@ -1817,7 +1886,8 @@ def generate_html_report(results, html_path, msd_path, units=None,
   <button class="tab-btn active" onclick="showTab('summary', this)">Summary</button>
   <button class="tab-btn" onclick="showTab('curves', this)">Standard Curves</button>
   <button class="tab-btn" onclick="showTab('unknowns', this)">All Unknowns</button>
-  <div style="margin-left:auto;display:flex;align-items:center;padding-right:12px;">
+  <div style="margin-left:auto;display:flex;align-items:center;gap:8px;padding-right:12px;">
+    {excel_btn_html}
     <button class="export-btn" onclick="window.print()">⬇ Export PDF</button>
   </div>
 </div>
@@ -2081,15 +2151,14 @@ def run_analysis(msd_path, platemap_path, output_path, spots_override=None, unit
     print(f"Generating Excel: {output_path}")
     create_output(results, output_path, msd_path, raw_plate_blocks, units, cv_threshold, plate_dilution_factors, lloq_method, total_protein_map, qc_dilution_factors, qc_expected_concentrations)
     print("Done!")
-    _open_file(output_path)
 
-    # Generate and open interactive HTML report
+    # Generate and open interactive HTML report (Excel is opened from within HTML)
     html_path = os.path.splitext(output_path)[0] + '.html'
     try:
         generate_html_report(results, html_path, msd_path, units,
                              qc_dilution_factors, qc_expected_concentrations,
                              plate_dilution_factors, lloq_method,
-                             total_protein_map)
+                             total_protein_map, output_path)
         if os.path.exists(html_path):
             _open_file(html_path)
     except Exception as e:
