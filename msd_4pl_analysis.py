@@ -1533,13 +1533,6 @@ def generate_html_report(results, html_path, msd_path, units=None,
             except Exception:
                 pass
 
-    # Max x from curve data — used to anchor LLOQ text labels at the right edge
-    _lloq_text_x = max(
-        (max(s['conc'] for s in res.get('standards', []) if s['conc'] > 0) * 2.0
-         for res in results if res['params'] is not None and res.get('standards')),
-        default=1e4
-    )
-
     _overlay_all_sigs = []
     for gi, (g_label, d) in enumerate(sorted(_lloq_by_group.items())):
         if not d['sigs']:
@@ -1555,21 +1548,19 @@ def generate_html_report(results, html_path, msd_path, units=None,
             ann = f'{prefix}: {avg_sig:,.0f} (signal) | {conc_str} (conc)'
         else:
             ann = f'{prefix}: {avg_sig:,.0f} (signal)'
-        # Draw horizontal line
+        # Dashed horizontal line
         overlay_fig.add_hline(
             y=avg_sig,
             line=dict(color=clr, dash='dash', width=2),
         )
-        # Label as a scatter text trace — always renders, never clipped
+        # Legend-only dummy trace — shows the LLOQ label + line style in the legend
+        # x=[None]/y=[None] means no data points, so axes are unaffected
         overlay_fig.add_trace(go.Scatter(
-            x=[_lloq_text_x],
-            y=[avg_sig],
-            mode='text',
-            text=[f'  {ann}'],
-            textposition='middle right',
-            textfont=dict(color=clr, size=10, family='Arial'),
-            showlegend=False,
-            hoverinfo='skip',
+            x=[None], y=[None],
+            mode='lines',
+            name=ann,
+            line=dict(color=clr, dash='dash', width=2),
+            showlegend=True,
         ))
 
     if qc_expected_concentrations and qc_expected_concentrations > 0:
