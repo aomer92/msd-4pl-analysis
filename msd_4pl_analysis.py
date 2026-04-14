@@ -1515,40 +1515,46 @@ def generate_html_report(results, html_path, msd_path, units=None,
                 hovertemplate='Conc: %{x:.4g}<br>Signal: %{y:,.0f}<br>%{customdata}<extra>QC ' + level + '</extra>'
             ))
 
-    # Average LLOQ horizontal line across all results
-    lloq_sigs_all = [res['lloq_sig'] for res in results
-                     if res.get('lloq_sig') is not None and res['lloq_sig'] > 0]
-    if lloq_sigs_all:
-        avg_lloq_sig = float(np.mean(lloq_sigs_all))
-        # Compute interpolated LLOQ concentration for each fitted result and average
-        lloq_concs_all = []
-        for res in results:
-            if res.get('lloq_sig') is None or res['params'] is None:
-                continue
+    # One LLOQ line per group label — averaged across all plates/spots sharing that label
+    _lloq_group_palette = ['#E07B00', '#C0392B', '#1A7ABF', '#27AE60', '#8E44AD',
+                           '#2C3E50', '#D35400', '#16A085', '#7F8C8D', '#F39C12']
+    _lloq_by_group = defaultdict(lambda: {'sigs': [], 'concs': []})
+    for res in results:
+        if res.get('lloq_sig') is None or res['lloq_sig'] <= 0:
+            continue
+        g = res.get('group') or '_ungrouped'
+        _lloq_by_group[g]['sigs'].append(res['lloq_sig'])
+        if res['params'] is not None:
             try:
                 lc = inverse_4pl(res['lloq_sig'], *res['params'])
                 if np.isfinite(lc) and lc > 0:
-                    lloq_concs_all.append(lc * (plate_dilution_factors or {}).get(res['plate'], 1.0))
+                    _lloq_by_group[g]['concs'].append(
+                        lc * (plate_dilution_factors or {}).get(res['plate'], 1.0))
             except Exception:
                 pass
-        if lloq_concs_all:
-            avg_lloq_conc = float(np.mean(lloq_concs_all))
-            conc_str = f'{avg_lloq_conc:.4g}'
-            if units:
-                conc_str += f' {units}'
-            annotation_label = f'<b>Avg LLOQ: {avg_lloq_sig:,.0f} (signal) | {conc_str} (conc)</b>'
+
+    _overlay_all_sigs = []
+    for gi, (g_label, d) in enumerate(sorted(_lloq_by_group.items())):
+        if not d['sigs']:
+            continue
+        avg_sig = float(np.mean(d['sigs']))
+        _overlay_all_sigs.append(avg_sig)
+        clr = _lloq_group_palette[gi % len(_lloq_group_palette)]
+        display_name = g_label if g_label != '_ungrouped' else ''
+        prefix = f'LLOQ ({display_name})' if display_name else 'LLOQ'
+        if d['concs']:
+            avg_conc = float(np.mean(d['concs']))
+            conc_str = f'{avg_conc:.4g}' + (f' {units}' if units else '')
+            ann = f'<b>{prefix}: {avg_sig:,.0f} (signal) | {conc_str} (conc)</b>'
         else:
-            annotation_label = f'<b>Avg LLOQ: {avg_lloq_sig:,.0f} (signal)</b>'
+            ann = f'<b>{prefix}: {avg_sig:,.0f} (signal)</b>'
         overlay_fig.add_hline(
-            y=avg_lloq_sig,
-            line=dict(color='#F4A522', dash='dash', width=2),
-            annotation_text=annotation_label,
+            y=avg_sig,
+            line=dict(color=clr, dash='dash', width=2),
+            annotation_text=ann,
             annotation_position='right',
-            annotation_font=dict(color='#E07B00', size=13)
+            annotation_font=dict(color=clr, size=12)
         )
-        _overlay_all_sigs = [avg_lloq_sig]
-    else:
-        _overlay_all_sigs = []
 
     if qc_expected_concentrations and qc_expected_concentrations > 0:
         lo = qc_expected_concentrations * 0.7
