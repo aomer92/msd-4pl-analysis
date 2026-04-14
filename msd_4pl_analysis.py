@@ -1522,9 +1522,10 @@ def generate_html_report(results, html_path, msd_path, units=None,
         avg_lloq_sig = float(np.mean(lloq_sigs_all))
         overlay_fig.add_hline(
             y=avg_lloq_sig,
-            line=dict(color='#F4A522', dash='dash', width=1.5),
-            annotation_text=f'Avg LLOQ: {avg_lloq_sig:,.0f}',
-            annotation_position='bottom right'
+            line=dict(color='#F4A522', dash='dash', width=2),
+            annotation_text=f'<b>Avg LLOQ: {avg_lloq_sig:,.0f}</b>',
+            annotation_position='right',
+            annotation_font=dict(color='#E07B00', size=13)
         )
         _overlay_all_sigs = [avg_lloq_sig]
     else:
