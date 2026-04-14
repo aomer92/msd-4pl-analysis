@@ -1605,6 +1605,25 @@ def generate_html_report(results, html_path, msd_path, units=None,
         overlay_x_range = [np.log10(min(_overlay_x_vals)) - 0.2,
                            np.log10(max(_overlay_x_vals)) + 0.2]
 
+    # Estimate paper-y coordinate for the LLOQ legend so it sits next to the lines.
+    # Collect all visible signal values to infer the auto y-axis log range.
+    _all_visible_sigs = []
+    for res in results:
+        for s in res.get('standards', []):
+            if s.get('signal', 0) > 0:
+                _all_visible_sigs.append(s['signal'])
+        if res.get('lloq_sig') and res['lloq_sig'] > 0:
+            _all_visible_sigs.append(res['lloq_sig'])
+    if _all_visible_sigs and _overlay_all_sigs:
+        _log_min = np.log10(min(_all_visible_sigs))
+        _log_max = np.log10(max(_all_visible_sigs))
+        _avg_lloq = float(np.mean(_overlay_all_sigs))
+        _lloq_paper = ((np.log10(_avg_lloq) - _log_min) / (_log_max - _log_min)
+                       if _log_max > _log_min else 0.15)
+        _lloq_legend_y = float(np.clip(_lloq_paper, 0.05, 0.6))
+    else:
+        _lloq_legend_y = 0.15
+
     overlay_fig.update_layout(
         title=dict(text='Standard Curve Overlay', x=0.5),
         xaxis=dict(title=f'Concentration{unit_suffix}', type='log',
@@ -1619,13 +1638,11 @@ def generate_html_report(results, html_path, msd_path, units=None,
                     itemclick='toggle', itemdoubleclick='toggleothers'),
         legend2=dict(
             orientation='v',
-            x=1.02, y=0,
-            yanchor='bottom',
-            bgcolor='rgba(255,255,255,0.9)',
-            bordercolor='#cccccc',
-            borderwidth=1,
+            x=1.02, y=_lloq_legend_y,
+            yanchor='middle',
+            bgcolor='rgba(0,0,0,0)',
+            borderwidth=0,
             font=dict(size=10),
-            title=dict(text='<b>LLOQ</b>', font=dict(size=10)),
         ),
         margin=dict(l=60, r=340, t=60, b=60),
         height=520
