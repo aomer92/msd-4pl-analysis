@@ -1554,15 +1554,14 @@ def generate_html_report(results, html_path, msd_path, units=None,
             line=dict(color=clr, dash='dash', width=2),
         )
         overlay_fig.add_annotation(
-            xref='paper', x=1.01,
+            xref='paper', x=0.99,
             yref='y', y=avg_sig,
             text=f'<b>{ann}</b>',
             showarrow=False,
-            xanchor='left',
-            yanchor='middle',
+            xanchor='right',
+            yanchor='bottom',
             font=dict(color=clr, size=11),
-            cliponaxis=False,
-            bgcolor='rgba(255,255,255,0.75)',
+            bgcolor='rgba(255,255,255,0.8)',
             bordercolor=clr,
             borderwidth=1,
             borderpad=3,
@@ -2200,7 +2199,11 @@ def run_analysis(msd_path, platemap_path, output_path, spots_override=None, unit
         if os.path.exists(html_path):
             _open_file(html_path)
     except Exception as e:
-        print(f"Warning: HTML report could not be generated: {e}")
+        import traceback
+        log_path = os.path.join(os.path.dirname(output_path), 'msd_html_error.log')
+        with open(log_path, 'w') as _lf:
+            traceback.print_exc(file=_lf)
+        print(f"Warning: HTML report could not be generated: {e} — see {log_path}")
 
     # Save last run parameters
     last_args = {
