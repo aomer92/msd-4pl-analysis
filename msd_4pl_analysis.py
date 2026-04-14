@@ -1553,14 +1553,14 @@ def generate_html_report(results, html_path, msd_path, units=None,
             y=avg_sig,
             line=dict(color=clr, dash='dash', width=2),
         )
-        # Legend-only dummy trace — shows the LLOQ label + line style in the legend
-        # x=[None]/y=[None] means no data points, so axes are unaffected
+        # Dummy trace in legend2 — positioned near the LLOQ lines (bottom of chart)
         overlay_fig.add_trace(go.Scatter(
             x=[None], y=[None],
             mode='lines',
             name=ann,
             line=dict(color=clr, dash='dash', width=2),
             showlegend=True,
+            legend='legend2',
         ))
 
     if qc_expected_concentrations and qc_expected_concentrations > 0:
@@ -1617,6 +1617,16 @@ def generate_html_report(results, html_path, msd_path, units=None,
         plot_bgcolor='white', paper_bgcolor='white',
         legend=dict(orientation='v', x=1.02, y=1,
                     itemclick='toggle', itemdoubleclick='toggleothers'),
+        legend2=dict(
+            orientation='v',
+            x=1.02, y=0,
+            yanchor='bottom',
+            bgcolor='rgba(255,255,255,0.9)',
+            bordercolor='#cccccc',
+            borderwidth=1,
+            font=dict(size=10),
+            title=dict(text='<b>LLOQ</b>', font=dict(size=10)),
+        ),
         margin=dict(l=60, r=340, t=60, b=60),
         height=520
     )
