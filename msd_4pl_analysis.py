@@ -1520,10 +1520,29 @@ def generate_html_report(results, html_path, msd_path, units=None,
                      if res.get('lloq_sig') is not None and res['lloq_sig'] > 0]
     if lloq_sigs_all:
         avg_lloq_sig = float(np.mean(lloq_sigs_all))
+        # Compute interpolated LLOQ concentration for each fitted result and average
+        lloq_concs_all = []
+        for res in results:
+            if res.get('lloq_sig') is None or res['params'] is None:
+                continue
+            try:
+                lc = inverse_4pl(res['lloq_sig'], *res['params'])
+                if np.isfinite(lc) and lc > 0:
+                    lloq_concs_all.append(lc * (plate_dilution_factors or {}).get(res['plate'], 1.0))
+            except Exception:
+                pass
+        if lloq_concs_all:
+            avg_lloq_conc = float(np.mean(lloq_concs_all))
+            conc_str = f'{avg_lloq_conc:.4g}'
+            if units:
+                conc_str += f' {units}'
+            annotation_label = f'<b>Avg LLOQ: {avg_lloq_sig:,.0f} (signal) | {conc_str} (conc)</b>'
+        else:
+            annotation_label = f'<b>Avg LLOQ: {avg_lloq_sig:,.0f} (signal)</b>'
         overlay_fig.add_hline(
             y=avg_lloq_sig,
             line=dict(color='#F4A522', dash='dash', width=2),
-            annotation_text=f'<b>Avg LLOQ: {avg_lloq_sig:,.0f}</b>',
+            annotation_text=annotation_label,
             annotation_position='right',
             annotation_font=dict(color='#E07B00', size=13)
         )
