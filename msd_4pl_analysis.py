@@ -1561,6 +1561,11 @@ def generate_html_report(results, html_path, msd_path, units=None,
             xanchor='left',
             yanchor='middle',
             font=dict(color=clr, size=11),
+            cliponaxis=False,
+            bgcolor='rgba(255,255,255,0.75)',
+            bordercolor=clr,
+            borderwidth=1,
+            borderpad=3,
         )
 
     if qc_expected_concentrations and qc_expected_concentrations > 0:
