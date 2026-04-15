@@ -2377,10 +2377,10 @@ def run_interactive():
                 if s < len(_dot_ids):
                     canvas.itemconfig(_dot_ids[s], state='normal')
                     _st['step'] += 1
-                    _st['after_id'] = win.after(70, _animate)
+                    _st['after_id'] = win.after(91, _animate)
                 else:
                     _st['phase'], _st['step'] = 1, 0
-                    _st['after_id'] = win.after(120, _animate)
+                    _st['after_id'] = win.after(156, _animate)
             elif p == 1:                        # curve draws left → right
                 if s < len(_curve_pts) - 2:
                     x1, y1 = _curve_pts[s]
@@ -2388,21 +2388,21 @@ def run_interactive():
                     canvas.create_line(x1, y1, x2, y2,
                                        fill='#E06C4A', width=2, tags='crv')
                     _st['step'] += 2
-                    _st['after_id'] = win.after(20, _animate)
+                    _st['after_id'] = win.after(26, _animate)
                 else:
                     _st['phase'], _st['step'] = 2, 0
-                    _st['after_id'] = win.after(20, _animate)
+                    _st['after_id'] = win.after(26, _animate)
             elif p == 2:                        # hold
                 _st['step'] += 1
                 if _st['step'] > 35:
                     _st['phase'], _st['step'] = 3, 0
-                _st['after_id'] = win.after(40, _animate)
+                _st['after_id'] = win.after(52, _animate)
             else:                               # reset
                 canvas.delete('crv')
                 for did in _dot_ids:
                     canvas.itemconfig(did, state='hidden')
                 _st['phase'], _st['step'] = 0, 0
-                _st['after_id'] = win.after(80, _animate)
+                _st['after_id'] = win.after(104, _animate)
 
         _animate()
 
