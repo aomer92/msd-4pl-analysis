@@ -2293,7 +2293,149 @@ def run_interactive():
             return
         _apply_run_entry(history[idx])
 
+    def _show_loading_screen():
+        """Animated loading window with a 4PL sigmoid being drawn in real time."""
+        import math, random, threading as _threading
+        win = tk.Toplevel(root)
+        win.title("MSD 4PL Analysis")
+        win.resizable(False, False)
+        win.configure(bg='white')
+        win.protocol("WM_DELETE_WINDOW", lambda: None)   # prevent accidental close
+
+        sw, sh = win.winfo_screenwidth(), win.winfo_screenheight()
+        ww, wh = 460, 310
+        win.geometry(f"{ww}x{wh}+{(sw-ww)//2}+{(sh-wh)//2}")
+        win.grab_set()
+
+        tk.Label(win, text="Running Analysis…", font=('Arial', 15, 'bold'),
+                 bg='white', fg='#2c3e50').pack(pady=(20, 2))
+
+        # ── Canvas ──────────────────────────────────────────────────────
+        cw, ch = 420, 170
+        canvas = tk.Canvas(win, width=cw, height=ch, bg='white', highlightthickness=0)
+        canvas.pack(padx=20)
+
+        # ── Status label & progress bar ─────────────────────────────────
+        status_var = tk.StringVar(value="Parsing MSD data…")
+        tk.Label(win, textvariable=status_var, font=('Arial', 10),
+                 bg='white', fg='#555555').pack(pady=(6, 2))
+        pb = ttk.Progressbar(win, mode='indeterminate', length=420)
+        pb.pack(padx=20, pady=(0, 20))
+        pb.start(12)
+
+        # ── 4PL model for animation ──────────────────────────────────────
+        def _4pl_anim(x):
+            return 90000 + (200 - 90000) / (1 + (x / 10) ** 1.5)
+
+        ml, mr, mt, mb = 48, 12, 14, 32          # margins
+        pw, ph = cw - ml - mr, ch - mt - mb      # plot area
+        xl, xh = math.log10(0.04), math.log10(600)
+        yl, yh = math.log10(140),  math.log10(110000)
+
+        def _px(x, y):
+            px = ml + (math.log10(max(x, 1e-9)) - xl) / (xh - xl) * pw
+            py = mt + ph - (math.log10(max(y, 1e-9)) - yl) / (yh - yl) * ph
+            return px, py
+
+        # Static axes
+        canvas.create_line(ml, mt, ml, mt + ph, fill='#aaaaaa', width=1.5)
+        canvas.create_line(ml, mt + ph, ml + pw, mt + ph, fill='#aaaaaa', width=1.5)
+        canvas.create_text(ml + pw // 2, ch - 6, text='Concentration (log scale)',
+                           font=('Arial', 7), fill='#888888')
+        canvas.create_text(10, mt + ph // 2, text='Signal', angle=90,
+                           font=('Arial', 7), fill='#888888')
+        for lx in [math.log10(v) for v in [0.1, 1, 10, 100]]:
+            px = ml + (lx - xl) / (xh - xl) * pw
+            canvas.create_line(px, mt, px, mt + ph, fill='#eeeeee', width=1)
+
+        # Curve smooth points
+        _xs = [0.04 * (600 / 0.04) ** (i / 119) for i in range(120)]
+        _curve_pts = [_px(x, _4pl_anim(x)) for x in _xs]
+
+        # Scatter data (2 reps per conc, slight noise)
+        random.seed(7)
+        _concs = [0.1, 0.3, 1, 3, 10, 30, 100, 300]
+        _scatter = []
+        for c in _concs:
+            for _ in range(2):
+                _scatter.append(_px(c, _4pl_anim(c) * random.uniform(0.91, 1.09)))
+
+        # Pre-create dot items (hidden)
+        _dot_ids = []
+        for px, py in _scatter:
+            did = canvas.create_oval(px - 4, py - 4, px + 4, py + 4,
+                                     fill='#2F5496', outline='#1a2f6e',
+                                     width=1.2, state='hidden')
+            _dot_ids.append(did)
+
+        # Animation state
+        _st = {'phase': 0, 'step': 0, 'after_id': None}
+
+        def _animate():
+            p, s = _st['phase'], _st['step']
+            if p == 0:                          # dots pop in one by one
+                if s < len(_dot_ids):
+                    canvas.itemconfig(_dot_ids[s], state='normal')
+                    _st['step'] += 1
+                    _st['after_id'] = win.after(70, _animate)
+                else:
+                    _st['phase'], _st['step'] = 1, 0
+                    _st['after_id'] = win.after(120, _animate)
+            elif p == 1:                        # curve draws left → right
+                if s < len(_curve_pts) - 2:
+                    x1, y1 = _curve_pts[s]
+                    x2, y2 = _curve_pts[s + 2]
+                    canvas.create_line(x1, y1, x2, y2,
+                                       fill='#E06C4A', width=2, tags='crv')
+                    _st['step'] += 2
+                    _st['after_id'] = win.after(20, _animate)
+                else:
+                    _st['phase'], _st['step'] = 2, 0
+                    _st['after_id'] = win.after(20, _animate)
+            elif p == 2:                        # hold
+                _st['step'] += 1
+                if _st['step'] > 35:
+                    _st['phase'], _st['step'] = 3, 0
+                _st['after_id'] = win.after(40, _animate)
+            else:                               # reset
+                canvas.delete('crv')
+                for did in _dot_ids:
+                    canvas.itemconfig(did, state='hidden')
+                _st['phase'], _st['step'] = 0, 0
+                _st['after_id'] = win.after(80, _animate)
+
+        _animate()
+
+        # Status message cycling
+        _msgs = ["Parsing MSD data…", "Building plate maps…",
+                 "Fitting 4PL curves…", "Calculating LLOQ values…",
+                 "Writing Excel report…", "Generating HTML charts…"]
+        _mi = [0]
+        def _cycle():
+            _mi[0] = (_mi[0] + 1) % len(_msgs)
+            status_var.set(_msgs[_mi[0]])
+            win._msg_id = win.after(2200, _cycle)
+        win._msg_id = win.after(2200, _cycle)
+
+        def _close():
+            if _st['after_id']:
+                win.after_cancel(_st['after_id'])
+            if hasattr(win, '_msg_id'):
+                win.after_cancel(win._msg_id)
+            pb.stop()
+            try:
+                win.grab_release()
+                win.destroy()
+            except Exception:
+                pass
+
+        win.close_loading = _close
+        return win
+
     def run():
+        import threading as _threading
+        import traceback as _traceback
+
         msd_path = msd_var.get().strip()
         platemap_path = platemap_var.get().strip()
         output_path = output_var.get().strip()
@@ -2336,9 +2478,6 @@ def run_interactive():
                 messagebox.showerror("Error", f"Invalid expected QC concentration: '{val_str}'")
                 return
 
-        # Hide the window while analysis runs; restore it on failure.
-        root.withdraw()
-
         print(f"\nMSD file:   {msd_path}")
         print(f"Plate map:  {platemap_path}")
         print(f"Output:     {output_path}")
@@ -2353,36 +2492,52 @@ def run_interactive():
         if dilution_factors:
             print(f"Dilution factors: {dilution_factors}")
         print(f"LLOQ method: {lloq_method}")
-        if qc_dilution_factors:
-            print(f"QC dilution factors: {qc_dilution_factors}")
-        if qc_expected_concentrations:
-            print(f"QC expected concentrations: {qc_expected_concentrations}")
 
-        try:
-            run_analysis(msd_path, platemap_path, output_path, spots_override, units, cv_threshold, dilution_factors, lloq_method, total_protein_path, qc_dilution_factors, qc_expected_concentrations)
-            root.destroy()
-        except Exception as e:
-            import traceback
-            err_msg = str(e) or type(e).__name__
-            print(f"\nAnalysis error: {err_msg}")
-            traceback.print_exc()
-            # Save failed run to history
-            fail_entry = {
-                'msd': msd_path, 'platemap': platemap_path,
-                'output': output_path, 'spots': spots_override,
-                'units': units, 'cv_threshold': cv_threshold,
-                'dilution_factors': dilution_factors,
-                'lloq_method': lloq_method,
-                'total_protein': total_protein_path,
-                'qc_dilution_factors': qc_dilution_factors,
-                'qc_expected_concentrations': qc_expected_concentrations,
-                'status': 'fail',
-                'error': err_msg,
-            }
-            _save_run_to_history(fail_entry)
-            messagebox.showerror("Analysis Error", err_msg, parent=root)
-            root.deiconify()
-            refresh_history()
+        # Thread result container
+        _result = {'error': None, 'done': False}
+
+        def _worker():
+            try:
+                run_analysis(msd_path, platemap_path, output_path, spots_override,
+                             units, cv_threshold, dilution_factors, lloq_method,
+                             total_protein_path, qc_dilution_factors, qc_expected_concentrations)
+            except Exception as exc:
+                _result['error'] = exc
+                print(f"\nAnalysis error: {exc}")
+                _traceback.print_exc()
+            finally:
+                _result['done'] = True
+
+        loading = _show_loading_screen()
+        _threading.Thread(target=_worker, daemon=True).start()
+
+        def _poll():
+            if not _result['done']:
+                root.after(200, _poll)
+                return
+            loading.close_loading()
+            if _result['error'] is not None:
+                err_msg = str(_result['error']) or type(_result['error']).__name__
+                fail_entry = {
+                    'msd': msd_path, 'platemap': platemap_path,
+                    'output': output_path, 'spots': spots_override,
+                    'units': units, 'cv_threshold': cv_threshold,
+                    'dilution_factors': dilution_factors,
+                    'lloq_method': lloq_method,
+                    'total_protein': total_protein_path,
+                    'qc_dilution_factors': qc_dilution_factors,
+                    'qc_expected_concentrations': qc_expected_concentrations,
+                    'status': 'fail', 'error': err_msg,
+                }
+                _save_run_to_history(fail_entry)
+                messagebox.showerror("Analysis Error", err_msg, parent=root)
+                root.deiconify()
+                refresh_history()
+            else:
+                root.destroy()
+
+        root.withdraw()
+        root.after(200, _poll)
 
     # ── Window setup ───────────────────────────────────────────────────
     root = tk.Tk()
