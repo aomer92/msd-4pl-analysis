@@ -907,13 +907,17 @@ def create_output(results, output_path, msd_path, raw_plate_blocks, units=None, 
     cv_threshold = float(cv_threshold) if cv_threshold is not None else 25.0
     plate_dilution_factors = plate_dilution_factors or {}
     lloq_method = lloq_method or 'current'
+    lloq_method_label = "3× Blank Mean" if lloq_method == '3xblank' else "Blank Mean + 10×SD"
 
     # ── Summary Sheet ─────────────────────────────────────────────────
     ws = wb.create_sheet("Summary")
+    # Row 1: LLOQ method metadata
+    ws.cell(row=1, column=1, value="LLOQ Method:").font = SECTION_FONT
+    ws.cell(row=1, column=2, value=lloq_method_label)
     headers = ["Plate", "Spot", "Group", "Min (a)", "Hill Slope (b)", "EC50 (c)", "Max (d)", "LLOQ Signal", "LLOQ Conc", "R²", "Flags", "Status"]
-    _header_row(ws, 1, headers)
+    _header_row(ws, 2, headers)
 
-    for ri, res in enumerate(results, 2):
+    for ri, res in enumerate(results, 3):
         vals = [res['plate'], res['spot'], res.get('group', '')]
         if res['params'] is not None:
             a, b, c, d = res['params']
@@ -1330,6 +1334,7 @@ def generate_html_report(results, html_path, msd_path, units=None,
 
     plate_dilution_factors = plate_dilution_factors or {}
     unit_suffix = f" ({units})" if units else ""
+    lloq_method_label = "3× Blank Mean" if lloq_method == '3xblank' else "Blank Mean + 10×SD"
 
     # ── Recompute QC summary rows ─────────────────────────────────────────────
     qc_summary_rows = []
@@ -1957,6 +1962,7 @@ def generate_html_report(results, html_path, msd_path, units=None,
 
   <div id="tab-summary" class="tab-pane active">
     <h2>Curve Fit Summary</h2>
+    <p style="font-size:12px;color:#555;margin:-8px 0 12px;"><strong>LLOQ Method:</strong> {lloq_method_label}</p>
     <div class="table-wrap">
     <table id="summaryTable" class="data-table">
       <thead><tr>
