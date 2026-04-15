@@ -1534,7 +1534,8 @@ def generate_html_report(results, html_path, msd_path, units=None,
                 pass
 
     _overlay_all_sigs = []
-    for gi, (g_label, d) in enumerate(sorted(_lloq_by_group.items())):
+    for gi, (g_label, d) in enumerate(sorted(_lloq_by_group.items(),
+                                              key=lambda kv: -np.mean(kv[1]['sigs']) if kv[1]['sigs'] else 0)):
         if not d['sigs']:
             continue
         avg_sig = float(np.mean(d['sigs']))
