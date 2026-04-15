@@ -2213,7 +2213,12 @@ def run_analysis(msd_path, platemap_path, output_path, spots_override=None, unit
     print("Done!")
 
     # Generate and open interactive HTML report (Excel is opened from within HTML)
-    html_path = os.path.splitext(output_path)[0] + '.html'
+    # Write to system temp dir to avoid macOS Desktop-folder TCC permission prompt.
+    # The "Open Excel" link inside the HTML still uses the full Desktop path,
+    # which the browser can follow without involving this app.
+    import tempfile
+    html_basename = os.path.splitext(os.path.basename(output_path))[0] + '.html'
+    html_path = os.path.join(tempfile.gettempdir(), html_basename)
     try:
         generate_html_report(results, html_path, msd_path, units,
                              qc_dilution_factors, qc_expected_concentrations,
@@ -2222,11 +2227,9 @@ def run_analysis(msd_path, platemap_path, output_path, spots_override=None, unit
         if os.path.exists(html_path):
             _open_file(html_path)
     except Exception as e:
-        import traceback
-        log_path = os.path.join(os.path.dirname(output_path), 'msd_html_error.log')
-        with open(log_path, 'w') as _lf:
-            traceback.print_exc(file=_lf)
-        print(f"Warning: HTML report could not be generated: {e} — see {log_path}")
+        import traceback as _tb
+        print(f"Warning: HTML report could not be generated: {e}")
+        _tb.print_exc()
 
     # Save last run parameters
     last_args = {
