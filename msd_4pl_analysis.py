@@ -1210,14 +1210,19 @@ def create_output(results, output_path, msd_path, raw_plate_blocks, units=None, 
         avg_conc = np.mean(concs) if concs else np.nan
         wells = ', '.join(sorted(g['well'] for g in group))
 
-        # Determine dilution factor: QC-specific factor takes priority over plate factor
+        # Determine dilution factor: QC > group > plate
         qc_level = _identify_qc_level(sample_name) if qc_dilution_factors else None
         if qc_level and qc_level in (qc_dilution_factors or {}):
             factor = qc_dilution_factors[qc_level]
             is_qc_factor = True
         else:
-            factor = plate_dilution_factors.get(plate, 1.0)
-            is_qc_factor = plate in plate_dilution_factors
+            _grp = curve_group if curve_group and curve_group != '_default' else ''
+            if _grp and group_dilution_factors and _grp in group_dilution_factors:
+                factor = group_dilution_factors[_grp]
+                is_qc_factor = True
+            else:
+                factor = plate_dilution_factors.get(plate, 1.0)
+                is_qc_factor = plate in plate_dilution_factors
 
         corrected_conc = avg_conc * factor if np.isfinite(avg_conc) else np.nan
 
@@ -1323,7 +1328,8 @@ def _open_file(path):
 def generate_html_report(results, html_path, msd_path, units=None,
                           qc_dilution_factors=None, qc_expected_concentrations=None,
                           plate_dilution_factors=None, lloq_method='current',
-                          total_protein_map=None, excel_path=None):
+                          total_protein_map=None, excel_path=None,
+                          group_dilution_factors=None):
     """Generate a self-contained interactive HTML report alongside the Excel output."""
     try:
         import plotly.graph_objects as go
@@ -1478,7 +1484,11 @@ def generate_html_report(results, html_path, msd_path, units=None,
         ))
 
         # Sample (unknown) scatter points for this curve, color-matched
-        _factor = (plate_dilution_factors or {}).get(plate, 1.0)
+        _grp_key = group if group and group != '_default' else ''
+        if _grp_key and group_dilution_factors and _grp_key in group_dilution_factors:
+            _factor = group_dilution_factors[_grp_key]
+        else:
+            _factor = (plate_dilution_factors or {}).get(plate, 1.0)
         _unk_xs, _unk_ys, _unk_names = [], [], []
         for u in res.get('unknowns', []):
             sname = u['sample_name']
@@ -1599,7 +1609,12 @@ def generate_html_report(results, html_path, msd_path, units=None,
     for res in results:
         if res['params'] is None:
             continue
-        _f = _factor_map.get(res['plate'], 1.0)
+        _rg = res.get('group', '')
+        _rg = _rg if _rg and _rg != '_default' else ''
+        if _rg and group_dilution_factors and _rg in group_dilution_factors:
+            _f = group_dilution_factors[_rg]
+        else:
+            _f = _factor_map.get(res['plate'], 1.0)
         for u in res.get('unknowns', []):
             if _identify_qc_level(u['sample_name']):
                 continue
@@ -1790,12 +1805,16 @@ def generate_html_report(results, html_path, msd_path, units=None,
         else:
             flag = 'Out of Range'
 
-        # Dilution factor & corrected conc
+        # Dilution factor & corrected conc (QC > group > plate)
         qc_level = _identify_qc_level(sname) if qc_dilution_factors else None
         if qc_level and qc_level in (qc_dilution_factors or {}):
             factor = qc_dilution_factors[qc_level]
         else:
-            factor = plate_dilution_factors.get(plate, 1.0)
+            _hg = group if group and group != '_default' else ''
+            if _hg and group_dilution_factors and _hg in group_dilution_factors:
+                factor = group_dilution_factors[_hg]
+            else:
+                factor = plate_dilution_factors.get(plate, 1.0)
         corrected = avg_conc * factor if np.isfinite(avg_conc) else np.nan
 
         # Total protein & normalized (same in-order assignment as create_output)
@@ -2055,7 +2074,7 @@ function filterTable(query, tableId) {{
     print(f"Saved HTML report: {html_path}")
 
 
-def run_analysis(msd_path, platemap_path, output_path, spots_override=None, units=None, cv_threshold=25, dilution_factors=None, lloq_method='current', total_protein_path=None, qc_dilution_factors=None, qc_expected_concentrations=None):
+def run_analysis(msd_path, platemap_path, output_path, spots_override=None, units=None, cv_threshold=25, dilution_factors=None, lloq_method='current', total_protein_path=None, qc_dilution_factors=None, qc_expected_concentrations=None, group_dilution_factors=None):
     _ensure_deps()   # lazy-load numpy / scipy / matplotlib / openpyxl
     print("=" * 60)
     print("MSD 4PL ANALYSIS")
@@ -2216,7 +2235,7 @@ def run_analysis(msd_path, platemap_path, output_path, spots_override=None, unit
 
     print(f"\n{'=' * 60}")
     print(f"Generating Excel: {output_path}")
-    create_output(results, output_path, msd_path, raw_plate_blocks, units, cv_threshold, plate_dilution_factors, lloq_method, total_protein_map, qc_dilution_factors, qc_expected_concentrations)
+    create_output(results, output_path, msd_path, raw_plate_blocks, units, cv_threshold, plate_dilution_factors, lloq_method, total_protein_map, qc_dilution_factors, qc_expected_concentrations, group_dilution_factors=group_dilution_factors)
     print("Done!")
 
     # Generate and open interactive HTML report (Excel is opened from within HTML)
@@ -2230,7 +2249,8 @@ def run_analysis(msd_path, platemap_path, output_path, spots_override=None, unit
         generate_html_report(results, html_path, msd_path, units,
                              qc_dilution_factors, qc_expected_concentrations,
                              plate_dilution_factors, lloq_method,
-                             total_protein_map, output_path)
+                             total_protein_map, output_path,
+                             group_dilution_factors=group_dilution_factors)
         if os.path.exists(html_path):
             _open_file(html_path)
     except Exception as e:
@@ -2251,6 +2271,7 @@ def run_analysis(msd_path, platemap_path, output_path, spots_override=None, unit
         'total_protein': total_protein_path,
         'qc_dilution_factors': qc_dilution_factors,
         'qc_expected_concentrations': qc_expected_concentrations,
+        'group_dilution_factors': group_dilution_factors,
         'status': 'pass',
     }
     _save_run_to_history(last_args)
@@ -2291,6 +2312,25 @@ def run_interactive():
             qc_df_vars[level].set(str(saved_qc[level]) if saved_qc.get(level) is not None else '')
         saved_exp = entry.get('qc_expected_concentrations')
         qc_exp_var.set(str(saved_exp) if saved_exp is not None else '')
+        # Restore group dilution factors if any were saved
+        saved_grp = entry.get('group_dilution_factors') or {}
+        if saved_grp:
+            # Rebuild group rows for the saved groups
+            for w in grp_rows_frame.winfo_children():
+                w.destroy()
+            group_df_vars.clear()
+            ttk.Label(grp_rows_frame, text='Group', font=('TkDefaultFont', 9, 'bold')).grid(
+                row=0, column=0, sticky=tk.W, padx=(0, 16), pady=(0, 2))
+            ttk.Label(grp_rows_frame, text='Dilution Factor', font=('TkDefaultFont', 9, 'bold')).grid(
+                row=0, column=1, sticky=tk.W, pady=(0, 2))
+            for ri, (gname, gval) in enumerate(sorted(saved_grp.items()), 1):
+                var = tk.StringVar(value=str(gval))
+                group_df_vars[gname] = var
+                ttk.Label(grp_rows_frame, text=gname).grid(
+                    row=ri, column=0, sticky=tk.W, padx=(0, 16), pady=2)
+                ttk.Entry(grp_rows_frame, textvariable=var, width=10).grid(
+                    row=ri, column=1, sticky=tk.W, pady=2)
+            grp_hint.config(text=f'Restored {len(saved_grp)} group(s) from history.')
 
     def load_selected_run():
         sel = history_lb.curselection()
@@ -2466,6 +2506,18 @@ def run_interactive():
         dilution_factors = dilution_factors if dilution_factors else None
         total_protein_path = total_protein_path if total_protein_path else None
 
+        # Collect group dilution factors
+        group_dilution_factors = {}
+        for gname, gvar in group_df_vars.items():
+            val_str = gvar.get().strip()
+            if val_str:
+                try:
+                    group_dilution_factors[gname] = float(val_str)
+                except ValueError:
+                    messagebox.showerror("Error", f"Invalid group dilution factor for '{gname}': '{val_str}'")
+                    return
+        group_dilution_factors = group_dilution_factors if group_dilution_factors else None
+
         # Collect QC dilution factors
         qc_dilution_factors = {}
         for level in QC_LEVELS:
@@ -2501,6 +2553,8 @@ def run_interactive():
             print(f"CV threshold: {cv_threshold}")
         if dilution_factors:
             print(f"Dilution factors: {dilution_factors}")
+        if group_dilution_factors:
+            print(f"Group dilution factors: {group_dilution_factors}")
         print(f"LLOQ method: {lloq_method}")
 
         # Thread result container
@@ -2510,7 +2564,8 @@ def run_interactive():
             try:
                 run_analysis(msd_path, platemap_path, output_path, spots_override,
                              units, cv_threshold, dilution_factors, lloq_method,
-                             total_protein_path, qc_dilution_factors, qc_expected_concentrations)
+                             total_protein_path, qc_dilution_factors, qc_expected_concentrations,
+                             group_dilution_factors=group_dilution_factors)
             except Exception as exc:
                 _result['error'] = exc
                 print(f"\nAnalysis error: {exc}")
@@ -2537,6 +2592,7 @@ def run_interactive():
                     'total_protein': total_protein_path,
                     'qc_dilution_factors': qc_dilution_factors,
                     'qc_expected_concentrations': qc_expected_concentrations,
+                    'group_dilution_factors': group_dilution_factors,
                     'status': 'fail', 'error': err_msg,
                 }
                 _save_run_to_history(fail_entry)
@@ -2568,6 +2624,7 @@ def run_interactive():
     total_protein_var = tk.StringVar()
     qc_df_vars = {level: tk.StringVar() for level in QC_LEVELS}
     qc_exp_var = tk.StringVar()
+    group_df_vars = {}  # populated after "Detect Groups" is pressed
 
     # ── Header banner ──────────────────────────────────────────────────
     SLATE  = '#3a506b'   # soft slate-blue — clean, not corporate-heavy
@@ -2657,6 +2714,78 @@ def run_interactive():
                    total_protein_var, 'Select Total Protein CSV',
                    [('CSV Files', '*.csv'), ('All Files', '*.*')])).grid(
         row=3, column=5, padx=(6, 0), **_rp)
+
+    # ── Group Dilution Factors ─────────────────────────────────────────
+    grp_lf = ttk.LabelFrame(outer, text='Group Dilution Factors  (optional — applied per group detected in plate map)',
+                             padding='10 6')
+    grp_lf.pack(fill=tk.X, pady=(0, 8))
+
+    grp_hint = ttk.Label(grp_lf,
+                         text='Load a plate map, then click Detect Groups to set per-group dilution factors.',
+                         foreground='grey')
+    grp_hint.grid(row=0, column=0, columnspan=6, sticky=tk.W, pady=(0, 4))
+
+    grp_btn_frame = ttk.Frame(grp_lf)
+    grp_btn_frame.grid(row=1, column=0, columnspan=6, sticky=tk.W, pady=(0, 4))
+
+    # Inner frame that holds the dynamically created group rows
+    grp_rows_frame = ttk.Frame(grp_lf)
+    grp_rows_frame.grid(row=2, column=0, columnspan=6, sticky=tk.EW)
+
+    def _detect_groups():
+        """Parse the platemap and create one dilution-factor row per group."""
+        pm_path = platemap_var.get().strip()
+        if not pm_path or not os.path.exists(pm_path):
+            messagebox.showwarning("No Plate Map", "Please select a valid plate map CSV first.")
+            return
+        try:
+            plate_maps, _ = parse_plate_map_grid(pm_path)
+        except Exception as exc:
+            messagebox.showerror("Parse Error", f"Could not read plate map:\n{exc}")
+            return
+
+        # Collect all unique non-default groups across all plate maps
+        found = set()
+        for entries in plate_maps.values():
+            for e in entries:
+                g = e.get('group', '_default')
+                if g and g != '_default':
+                    found.add(g)
+
+        # Destroy old rows
+        for w in grp_rows_frame.winfo_children():
+            w.destroy()
+
+        if not found:
+            ttk.Label(grp_rows_frame,
+                      text='No named groups found in plate map (group prefix syntax: GroupName:value).',
+                      foreground='grey').grid(row=0, column=0, columnspan=6, sticky=tk.W)
+            group_df_vars.clear()
+            return
+
+        # Preserve any existing values when re-detecting
+        prev = {g: group_df_vars[g].get() for g in group_df_vars if g in found}
+        group_df_vars.clear()
+
+        ttk.Label(grp_rows_frame, text='Group', font=('TkDefaultFont', 9, 'bold')).grid(
+            row=0, column=0, sticky=tk.W, padx=(0, 16), pady=(0, 2))
+        ttk.Label(grp_rows_frame, text='Dilution Factor', font=('TkDefaultFont', 9, 'bold')).grid(
+            row=0, column=1, sticky=tk.W, pady=(0, 2))
+
+        for ri, gname in enumerate(sorted(found), 1):
+            var = tk.StringVar(value=prev.get(gname, ''))
+            group_df_vars[gname] = var
+            ttk.Label(grp_rows_frame, text=gname).grid(
+                row=ri, column=0, sticky=tk.W, padx=(0, 16), pady=2)
+            ttk.Entry(grp_rows_frame, textvariable=var, width=10).grid(
+                row=ri, column=1, sticky=tk.W, pady=2)
+
+        grp_hint.config(text=f'Found {len(found)} group(s). Enter a dilution factor for any group below (leave blank = 1×).')
+
+    ttk.Button(grp_btn_frame, text='Detect Groups from Plate Map',
+               command=_detect_groups).pack(side=tk.LEFT)
+    ttk.Label(grp_btn_frame, text='  Priority: group factor > plate factor',
+              foreground='grey').pack(side=tk.LEFT)
 
     # ── QC Controls ────────────────────────────────────────────────────
     qc_lf = ttk.LabelFrame(outer, text='QC Controls  (optional — samples containing ULOQ / HQC / MQC / LQC / LLOQ)',
