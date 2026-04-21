@@ -2739,6 +2739,7 @@ def run_interactive():
             messagebox.showwarning("No Plate Map", "Please select a valid plate map CSV first.")
             return
         try:
+            _ensure_deps()   # pandas / numpy needed by the parser
             plate_maps, _ = parse_plate_map_grid(pm_path)
         except Exception as exc:
             messagebox.showerror("Parse Error", f"Could not read plate map:\n{exc}")
