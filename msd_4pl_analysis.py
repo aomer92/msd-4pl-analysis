@@ -689,34 +689,39 @@ def parse_plate_map_grid(filepath):
                     continue
 
                 # Extract group prefix if present (e.g. "A:800000" → group="A", val="800000")
-                group = '_default'
+                # Supports multi-group for standards: "HTT1&HTT2:800000" → groups ["HTT1","HTT2"]
+                groups_for_well = ['_default']
                 if ':' in val:
                     parts = val.split(':', 1)
                     candidate_group = parts[0].strip()
                     candidate_val = parts[1].strip()
                     # Accept prefix if it looks like a short tag (not a full path or URL)
-                    if len(candidate_group) <= 20 and candidate_val:
-                        group = candidate_group
+                    if len(candidate_group) <= 40 and candidate_val:
+                        # Split on & to allow shared standards across multiple groups
+                        sub_groups = [g.strip() for g in candidate_group.split('&') if g.strip()]
+                        if sub_groups:
+                            groups_for_well = sub_groups
                         val = candidate_val
 
-                if val.lower() in ('buffer only', 'blank', 'buffer', 'bg', 'background', '0'):
-                    entries.append({'well': well, 'sample_type': 'Blank',
-                                    'concentration': 0, 'sample_name': val,
-                                    'group': group})
-                    continue
+                for group in groups_for_well:
+                    if val.lower() in ('buffer only', 'blank', 'buffer', 'bg', 'background', '0'):
+                        entries.append({'well': well, 'sample_type': 'Blank',
+                                        'concentration': 0, 'sample_name': val,
+                                        'group': group})
+                        continue
 
-                try:
-                    conc = float(val.replace(',', ''))
-                    entries.append({'well': well, 'sample_type': 'Standard',
-                                    'concentration': conc, 'sample_name': f'STD ({conc})',
-                                    'group': group})
-                    continue
-                except ValueError:
-                    pass
+                    try:
+                        conc = float(val.replace(',', ''))
+                        entries.append({'well': well, 'sample_type': 'Standard',
+                                        'concentration': conc, 'sample_name': f'STD ({conc})',
+                                        'group': group})
+                        continue
+                    except ValueError:
+                        pass
 
-                entries.append({'well': well, 'sample_type': 'Unknown',
-                                'concentration': np.nan, 'sample_name': val,
-                                'group': group})
+                    entries.append({'well': well, 'sample_type': 'Unknown',
+                                    'concentration': np.nan, 'sample_name': val,
+                                    'group': group})
 
         all_plates[plate_num] = entries
         raw_blocks[plate_num] = block_lines
@@ -2104,10 +2109,13 @@ def run_analysis(msd_path, platemap_path, output_path, spots_override=None, unit
         print(f"Error parsing dilution factors: {e}")
         raise
 
-    # Build per-plate well lookups
+    # Build per-plate well lookups (well → list of entries; a well can serve multiple groups)
     plate_well_maps = {}
     for pm_num, entries in plate_maps.items():
-        plate_well_maps[pm_num] = {normalize_well(e['well']): e for e in entries}
+        wm = {}
+        for e in entries:
+            wm.setdefault(normalize_well(e['well']), []).append(e)
+        plate_well_maps[pm_num] = wm
 
     results = []
     for plate_data in plates:
@@ -2128,23 +2136,25 @@ def run_analysis(msd_path, platemap_path, output_path, spots_override=None, unit
         for spot_idx in range(n_spots):
             spot_num = spot_idx + 1
 
-            # Collect all well data for this spot, tagged with group
+            # Collect all well data for this spot, tagged with group.
+            # A single well can produce multiple entries (multi-group & standard syntax).
             spot_wells = []
             for well_id, spot_signals in wd.items():
                 nw = normalize_well(well_id)
                 if spot_idx >= len(spot_signals):
                     continue
                 signal = spot_signals[spot_idx]
-                info = well_map.get(nw)
-                if info is None:
+                info_list = well_map.get(nw)
+                if not info_list:
                     continue
-                spot_wells.append({
-                    'well': nw, 'signal': signal,
-                    'sample_type': info['sample_type'],
-                    'concentration': info.get('concentration', np.nan),
-                    'sample_name': info.get('sample_name', ''),
-                    'group': info.get('group', '_default')
-                })
+                for info in info_list:
+                    spot_wells.append({
+                        'well': nw, 'signal': signal,
+                        'sample_type': info['sample_type'],
+                        'concentration': info.get('concentration', np.nan),
+                        'sample_name': info.get('sample_name', ''),
+                        'group': info.get('group', '_default')
+                    })
 
             # Determine unique groups on this plate
             groups = sorted(set(w['group'] for w in spot_wells if w['group'] != '_default'))
