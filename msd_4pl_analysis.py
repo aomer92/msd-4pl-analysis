@@ -2650,9 +2650,43 @@ def run_interactive():
     # Thin accent rule below header
     tk.Canvas(root, height=2, bg='#7ba7bc', highlightthickness=0).pack(fill=tk.X)
 
-    # ── Main content area (expands with window) ────────────────────────
-    outer = ttk.Frame(root, padding='12 10 12 6')
-    outer.pack(fill=tk.BOTH, expand=True)
+    # ── Fixed bottom action bar (always visible, packed before scroll area) ──
+    _bottom = ttk.Frame(root, padding='6 4 12 8')
+    _bottom.pack(side=tk.BOTTOM, fill=tk.X)
+    ttk.Separator(_bottom, orient='horizontal').pack(fill=tk.X, pady=(0, 8))
+    _btn_row = ttk.Frame(_bottom)
+    _btn_row.pack(fill=tk.X)
+    # Buttons are added to _btn_row after `run` is defined (see bottom of this function)
+
+    # ── Scrollable content area ────────────────────────────────────────
+    _sc_host = ttk.Frame(root)
+    _sc_host.pack(fill=tk.BOTH, expand=True)
+
+    _vscroll = ttk.Scrollbar(_sc_host, orient=tk.VERTICAL)
+    _vscroll.pack(side=tk.RIGHT, fill=tk.Y)
+
+    _scroll_canvas = tk.Canvas(_sc_host, highlightthickness=0,
+                                yscrollcommand=_vscroll.set)
+    _scroll_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+    _vscroll.configure(command=_scroll_canvas.yview)
+
+    outer = ttk.Frame(_scroll_canvas, padding='12 10 12 6')
+    _cw = _scroll_canvas.create_window((0, 0), window=outer, anchor='nw')
+
+    def _update_scrollregion(event=None):
+        _scroll_canvas.configure(scrollregion=_scroll_canvas.bbox('all'))
+
+    def _fit_canvas_width(event):
+        _scroll_canvas.itemconfig(_cw, width=event.width)
+
+    outer.bind('<Configure>', _update_scrollregion)
+    _scroll_canvas.bind('<Configure>', _fit_canvas_width)
+
+    def _on_mousewheel(event):
+        if event.delta:
+            _scroll_canvas.yview_scroll(int(-1 * event.delta / 120), 'units')
+    _scroll_canvas.bind_all('<MouseWheel>', _on_mousewheel)
+
     outer.columnconfigure(0, weight=1)
 
     # helper: consistent row padding inside LabelFrames
@@ -2823,11 +2857,10 @@ def run_interactive():
     ttk.Label(exp_inner, text='  ·  ±30% acceptance band plotted on overlay chart',
               foreground='grey').pack(side=tk.LEFT, padx=(6, 0))
 
-    # ── Previous Runs (expands vertically when window is resized) ──────
+    # ── Previous Runs ──────────────────────────────────────────────────
     hist_lf = ttk.LabelFrame(outer, text='Previous Runs', padding='10 6')
-    hist_lf.pack(fill=tk.BOTH, expand=True, pady=(0, 8))
+    hist_lf.pack(fill=tk.X, pady=(0, 8))
     hist_lf.columnconfigure(0, weight=1)
-    hist_lf.rowconfigure(0, weight=1)
 
     lb_outer = ttk.Frame(hist_lf)
     lb_outer.grid(row=0, column=0, sticky=tk.NSEW)
@@ -2871,15 +2904,10 @@ def run_interactive():
     ttk.Button(hist_btn_row, text='Load Selected Run',
                command=load_selected_run).pack(side=tk.RIGHT)
 
-    # ── Action buttons ─────────────────────────────────────────────────
-    sep = ttk.Separator(outer, orient='horizontal')
-    sep.pack(fill=tk.X, pady=(2, 10))
-
-    btn_row = ttk.Frame(outer)
-    btn_row.pack(fill=tk.X)
-    ttk.Button(btn_row, text='Cancel',
+    # ── Action buttons (placed in the fixed bottom bar) ───────────────
+    ttk.Button(_btn_row, text='Cancel',
                command=root.destroy).pack(side=tk.RIGHT, padx=(6, 0))
-    ttk.Button(btn_row, text='▶  Run Analysis',
+    ttk.Button(_btn_row, text='▶  Run Analysis',
                command=run, default='active').pack(side=tk.RIGHT)
 
     root.mainloop()
