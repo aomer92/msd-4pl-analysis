@@ -878,30 +878,40 @@ def create_output(results, output_path, msd_path, raw_plate_blocks, units=None, 
             for unk in res.get('unknowns', []):
                 sname = unk.get('sample_name', '')
                 level = _identify_qc_level(sname)
-                if level and level in qc_dilution_factors:
-                    key = (sname, res.get('group', ''), res['plate'])
+                grp = res.get('group', '') or ''
+                group_qc = qc_dilution_factors.get(grp, {})
+                if level and level in group_qc:
+                    key = (sname, grp, res['plate'])
                     qc_groups[key].append({'signal': unk['signal'], 'interp_conc': unk['interp_conc'], 'level': level})
         for (sname, grp, plate), entries in sorted(qc_groups.items()):
             sigs = [e['signal'] for e in entries if np.isfinite(e['signal'])]
             concs = [e['interp_conc'] for e in entries if np.isfinite(e['interp_conc'])]
             level = entries[0]['level']
-            qc_factor = qc_dilution_factors[level]
+            qc_factor = qc_dilution_factors.get(grp, {}).get(level, 1.0)
             avg_sig = np.mean(sigs) if sigs else np.nan
             avg_conc = np.mean(concs) if concs else np.nan
             corrected = avg_conc * qc_factor if np.isfinite(avg_conc) else np.nan
-            recovery = (corrected / qc_expected_concentrations * 100
-                        if qc_expected_concentrations and np.isfinite(corrected) else np.nan)
+            exp_conc = (qc_expected_concentrations or {}).get(grp) if isinstance(qc_expected_concentrations, dict) else qc_expected_concentrations
+            recovery = (corrected / exp_conc * 100 if exp_conc and np.isfinite(corrected) else np.nan)
             row = {'sample_name': sname, 'level': level, 'plate': plate, 'group': grp,
                    'avg_signal': avg_sig, 'corrected_conc': corrected, 'recovery': recovery}
             qc_summary_rows.append(row)
             if np.isfinite(corrected) and np.isfinite(avg_sig) and corrected > 0 and avg_sig > 0:
                 qc_overlay_points.append({**row, 'signal': avg_sig})
 
+    # Compute representative single expected concentration for overlay chart
+    _qc_exp_single = None
+    if isinstance(qc_expected_concentrations, dict):
+        vals = [v for v in qc_expected_concentrations.values() if v and np.isfinite(v)]
+        _qc_exp_single = float(np.mean(vals)) if vals else None
+    else:
+        _qc_exp_single = qc_expected_concentrations
+
     # Pre-generate all charts before Excel writing (sequential — matplotlib mathtext is not thread-safe)
     overlay_path = generate_overlay_chart(
         results, tmp_dir,
         qc_overlay_points if qc_overlay_points else None,
-        qc_expected_concentrations if qc_expected_concentrations else None
+        _qc_exp_single if _qc_exp_single else None
     )
     chart_map = {id(res): generate_std_curve_chart(res, tmp_dir, lloq_method) for res in results}
 
@@ -983,9 +993,9 @@ def create_output(results, output_path, msd_path, raw_plate_blocks, units=None, 
             corr_cell = ws.cell(row=next_row, column=6,
                                 value=round(qr['corrected_conc'], 4) if np.isfinite(qr['corrected_conc']) else "N/A")
             corr_cell.number_format = '#,##0.0000'
-            exp_cell = ws.cell(row=next_row, column=7,
-                               value=qc_expected_concentrations if qc_expected_concentrations else "")
-            if qc_expected_concentrations:
+            exp_conc_val = (qc_expected_concentrations or {}).get(qr['group']) if isinstance(qc_expected_concentrations, dict) else qc_expected_concentrations
+            exp_cell = ws.cell(row=next_row, column=7, value=exp_conc_val if exp_conc_val else "")
+            if exp_conc_val:
                 exp_cell.number_format = '#,##0.0###'
             rec_cell = ws.cell(row=next_row, column=8)
             if np.isfinite(qr['recovery']):
@@ -1217,10 +1227,16 @@ def create_output(results, output_path, msd_path, raw_plate_blocks, units=None, 
 
         # Determine dilution factor: QC > group > plate
         qc_level = _identify_qc_level(sample_name) if qc_dilution_factors else None
-        if qc_level and qc_level in (qc_dilution_factors or {}):
-            factor = qc_dilution_factors[qc_level]
-            is_qc_factor = True
-        else:
+        if qc_level:
+            _grp_key = curve_group if curve_group and curve_group != '_default' else ''
+            _group_qc = (qc_dilution_factors or {}).get(_grp_key, {})
+            if qc_level in _group_qc:
+                factor = _group_qc[qc_level]
+                is_qc_factor = True
+            else:
+                # fall through to group/plate factor below
+                qc_level = None
+        if not qc_level:
             _grp = curve_group if curve_group and curve_group != '_default' else ''
             if _grp and group_dilution_factors and _grp in group_dilution_factors:
                 factor = group_dilution_factors[_grp]
@@ -1356,19 +1372,21 @@ def generate_html_report(results, html_path, msd_path, units=None,
             for unk in res.get('unknowns', []):
                 sname = unk.get('sample_name', '')
                 level = _identify_qc_level(sname)
-                if level and level in qc_dilution_factors:
-                    key = (sname, res.get('group', ''), res['plate'])
+                grp = res.get('group', '') or ''
+                group_qc = qc_dilution_factors.get(grp, {})
+                if level and level in group_qc:
+                    key = (sname, grp, res['plate'])
                     qc_groups[key].append({'signal': unk['signal'], 'interp_conc': unk['interp_conc'], 'level': level})
         for (sname, grp, plate), entries in sorted(qc_groups.items()):
             sigs = [e['signal'] for e in entries if np.isfinite(e['signal'])]
             concs = [e['interp_conc'] for e in entries if np.isfinite(e['interp_conc'])]
             level = entries[0]['level']
-            qc_factor = qc_dilution_factors[level]
+            qc_factor = qc_dilution_factors.get(grp, {}).get(level, 1.0)
             avg_sig = np.mean(sigs) if sigs else np.nan
             avg_conc = np.mean(concs) if concs else np.nan
             corrected = avg_conc * qc_factor if np.isfinite(avg_conc) else np.nan
-            recovery = (corrected / qc_expected_concentrations * 100
-                        if qc_expected_concentrations and np.isfinite(corrected) else np.nan)
+            exp_conc = (qc_expected_concentrations or {}).get(grp) if isinstance(qc_expected_concentrations, dict) else qc_expected_concentrations
+            recovery = (corrected / exp_conc * 100 if exp_conc and np.isfinite(corrected) else np.nan)
             row_data = {'sample_name': sname, 'level': level, 'plate': plate, 'group': grp,
                         'avg_signal': avg_sig, 'corrected_conc': corrected, 'recovery': recovery}
             qc_summary_rows.append(row_data)
@@ -1584,9 +1602,15 @@ def generate_html_report(results, html_path, msd_path, units=None,
             legend='legend2',
         ))
 
-    if qc_expected_concentrations and qc_expected_concentrations > 0:
-        lo = qc_expected_concentrations * 0.7
-        hi = qc_expected_concentrations * 1.3
+    _qc_exp_single = None
+    if isinstance(qc_expected_concentrations, dict):
+        _exp_vals = [v for v in qc_expected_concentrations.values() if v and np.isfinite(v)]
+        _qc_exp_single = float(np.mean(_exp_vals)) if _exp_vals else None
+    else:
+        _qc_exp_single = qc_expected_concentrations
+    if _qc_exp_single and _qc_exp_single > 0:
+        lo = _qc_exp_single * 0.7
+        hi = _qc_exp_single * 1.3
         overlay_fig.add_vrect(
             x0=lo, x1=hi,
             fillcolor='steelblue', opacity=0.15,
@@ -1724,7 +1748,8 @@ def generate_html_report(results, html_path, msd_path, units=None,
                 rec_str = 'N/A'
             avg_sig_str = f"{qr['avg_signal']:,.1f}" if np.isfinite(qr['avg_signal']) else 'N/A'
             corr_str = f"{qr['corrected_conc']:.4g}" if np.isfinite(qr['corrected_conc']) else 'N/A'
-            exp_str = f"{qc_expected_concentrations:.4g}" if qc_expected_concentrations else ''
+            exp_str_val = (qc_expected_concentrations or {}).get(qr['group']) if isinstance(qc_expected_concentrations, dict) else qc_expected_concentrations
+            exp_str = f"{exp_str_val:.4g}" if exp_str_val else ''
             qc_rows_html.append(
                 f"<tr><td>{qr['sample_name']}</td><td>{qr['level']}</td>"
                 f"<td>{qr['plate']}</td><td>{qr['group'] or ''}</td>"
@@ -1812,9 +1837,14 @@ def generate_html_report(results, html_path, msd_path, units=None,
 
         # Dilution factor & corrected conc (QC > group > plate)
         qc_level = _identify_qc_level(sname) if qc_dilution_factors else None
-        if qc_level and qc_level in (qc_dilution_factors or {}):
-            factor = qc_dilution_factors[qc_level]
-        else:
+        if qc_level:
+            _hgrp = group if group and group != '_default' else ''
+            _hgroup_qc = (qc_dilution_factors or {}).get(_hgrp, {})
+            if qc_level in _hgroup_qc:
+                factor = _hgroup_qc[qc_level]
+            else:
+                qc_level = None
+        if not qc_level:
             _hg = group if group and group != '_default' else ''
             if _hg and group_dilution_factors and _hg in group_dilution_factors:
                 factor = group_dilution_factors[_hg]
@@ -2317,29 +2347,65 @@ def run_interactive():
             ','.join(str(x) for x in entry['dilution_factors'])
             if entry.get('dilution_factors') else '')
         total_protein_var.set(entry.get('total_protein') or '')
-        saved_qc = entry.get('qc_dilution_factors') or {}
-        for level in QC_LEVELS:
-            qc_df_vars[level].set(str(saved_qc[level]) if saved_qc.get(level) is not None else '')
-        saved_exp = entry.get('qc_expected_concentrations')
-        qc_exp_var.set(str(saved_exp) if saved_exp is not None else '')
-        # Restore group dilution factors if any were saved
+        # Restore group dilution factors and per-group QC values if any were saved
         saved_grp = entry.get('group_dilution_factors') or {}
+        saved_qc = entry.get('qc_dilution_factors') or {}
+        saved_exp = entry.get('qc_expected_concentrations') or {}
+        # Normalize old flat qc_dilution_factors format (skip silently)
+        if saved_qc and not isinstance(next(iter(saved_qc.values()), {}), dict):
+            saved_qc = {}
+        if saved_exp and not isinstance(saved_exp, dict):
+            saved_exp = {}
         if saved_grp:
             # Rebuild group rows for the saved groups
             for w in grp_rows_frame.winfo_children():
                 w.destroy()
             group_df_vars.clear()
+            grp_qc_vars.clear()
+            grp_exp_vars.clear()
+            # Collect all QC levels that appear in saved_qc across all groups
+            all_saved_qc_cols = [lvl for lvl in QC_LEVELS
+                                 if any(lvl in (saved_qc.get(g) or {}) for g in saved_grp)]
+            col = 0
             ttk.Label(grp_rows_frame, text='Group', font=('TkDefaultFont', 9, 'bold')).grid(
-                row=0, column=0, sticky=tk.W, padx=(0, 16), pady=(0, 2))
-            ttk.Label(grp_rows_frame, text='Dilution Factor', font=('TkDefaultFont', 9, 'bold')).grid(
-                row=0, column=1, sticky=tk.W, pady=(0, 2))
+                row=0, column=col, sticky=tk.W, padx=(0, 8), pady=(0, 2))
+            col += 1
+            ttk.Label(grp_rows_frame, text='Dil. Factor', font=('TkDefaultFont', 9, 'bold')).grid(
+                row=0, column=col, sticky=tk.W, padx=(0, 8), pady=(0, 2))
+            col += 1
+            for lvl in all_saved_qc_cols:
+                ttk.Label(grp_rows_frame, text=lvl, font=('TkDefaultFont', 9, 'bold')).grid(
+                    row=0, column=col, sticky=tk.W, padx=(0, 8), pady=(0, 2))
+                col += 1
+            ttk.Label(grp_rows_frame, text='Expected Conc.', font=('TkDefaultFont', 9, 'bold')).grid(
+                row=0, column=col, sticky=tk.W, padx=(0, 8), pady=(0, 2))
             for ri, (gname, gval) in enumerate(sorted(saved_grp.items()), 1):
-                var = tk.StringVar(value=str(gval))
-                group_df_vars[gname] = var
+                col = 0
                 ttk.Label(grp_rows_frame, text=gname).grid(
-                    row=ri, column=0, sticky=tk.W, padx=(0, 16), pady=2)
-                ttk.Entry(grp_rows_frame, textvariable=var, width=10).grid(
-                    row=ri, column=1, sticky=tk.W, pady=2)
+                    row=ri, column=col, sticky=tk.W, padx=(0, 8), pady=2)
+                col += 1
+                df_var = tk.StringVar(value=str(gval))
+                group_df_vars[gname] = df_var
+                ttk.Entry(grp_rows_frame, textvariable=df_var, width=9).grid(
+                    row=ri, column=col, sticky=tk.W, padx=(0, 8), pady=2)
+                col += 1
+                grp_qc_vars[gname] = {}
+                g_qc = saved_qc.get(gname) or {}
+                for lvl in all_saved_qc_cols:
+                    if lvl in g_qc:
+                        qc_var = tk.StringVar(value=str(g_qc[lvl]))
+                        grp_qc_vars[gname][lvl] = qc_var
+                        ttk.Entry(grp_rows_frame, textvariable=qc_var, width=8).grid(
+                            row=ri, column=col, sticky=tk.W, padx=(0, 8), pady=2)
+                    else:
+                        ttk.Label(grp_rows_frame, text='—', foreground='grey').grid(
+                            row=ri, column=col, sticky=tk.W, padx=(0, 8), pady=2)
+                    col += 1
+                exp_val = saved_exp.get(gname, '')
+                exp_var = tk.StringVar(value=str(exp_val) if exp_val else '')
+                grp_exp_vars[gname] = exp_var
+                ttk.Entry(grp_rows_frame, textvariable=exp_var, width=10).grid(
+                    row=ri, column=col, sticky=tk.W, padx=(0, 8), pady=2)
             grp_hint.config(text=f'Restored {len(saved_grp)} group(s) from history.')
 
     def load_selected_run():
@@ -2528,27 +2594,30 @@ def run_interactive():
                     return
         group_dilution_factors = group_dilution_factors if group_dilution_factors else None
 
-        # Collect QC dilution factors
+        # Collect per-group QC dilution factors
         qc_dilution_factors = {}
-        for level in QC_LEVELS:
-            val_str = qc_df_vars[level].get().strip()
-            if val_str:
-                try:
-                    qc_dilution_factors[level] = float(val_str)
-                except ValueError:
-                    messagebox.showerror("Error", f"Invalid QC dilution factor for {level}: '{val_str}'")
-                    return
+        for gname, level_vars in grp_qc_vars.items():
+            for level, var in level_vars.items():
+                val_str = var.get().strip()
+                if val_str:
+                    try:
+                        qc_dilution_factors.setdefault(gname, {})[level] = float(val_str)
+                    except ValueError:
+                        messagebox.showerror("Error", f"Invalid QC dilution factor for {gname}/{level}: '{val_str}'")
+                        return
         qc_dilution_factors = qc_dilution_factors if qc_dilution_factors else None
 
-        # Collect single expected QC concentration
-        qc_expected_concentrations = None
-        val_str = qc_exp_var.get().strip()
-        if val_str:
-            try:
-                qc_expected_concentrations = float(val_str)
-            except ValueError:
-                messagebox.showerror("Error", f"Invalid expected QC concentration: '{val_str}'")
-                return
+        # Collect per-group expected concentrations
+        qc_expected_concentrations = {}
+        for gname, var in grp_exp_vars.items():
+            val_str = var.get().strip()
+            if val_str:
+                try:
+                    qc_expected_concentrations[gname] = float(val_str)
+                except ValueError:
+                    messagebox.showerror("Error", f"Invalid expected concentration for {gname}: '{val_str}'")
+                    return
+        qc_expected_concentrations = qc_expected_concentrations if qc_expected_concentrations else None
 
         print(f"\nMSD file:   {msd_path}")
         print(f"Plate map:  {platemap_path}")
@@ -2632,9 +2701,9 @@ def run_interactive():
     lloq_method_var = tk.StringVar(value="current")
     dilution_factors_var = tk.StringVar()
     total_protein_var = tk.StringVar()
-    qc_df_vars = {level: tk.StringVar() for level in QC_LEVELS}
-    qc_exp_var = tk.StringVar()
-    group_df_vars = {}  # populated after "Detect Groups" is pressed
+    group_df_vars = {}   # {group: StringVar} — populated by _detect_groups
+    grp_qc_vars = {}     # {group: {level: StringVar}} — populated by _detect_groups
+    grp_exp_vars = {}    # {group: StringVar} — populated by _detect_groups
 
     # ── Header banner ──────────────────────────────────────────────────
     SLATE  = '#3a506b'   # soft slate-blue — clean, not corporate-heavy
@@ -2808,54 +2877,76 @@ def run_interactive():
             group_df_vars.clear()
             return
 
+        # Find QC levels per group
+        grp_qc_levels = {g: set() for g in found}
+        for entries in plate_maps.values():
+            for e in entries:
+                g = e.get('group', '_default')
+                if g not in grp_qc_levels:
+                    continue
+                level = _identify_qc_level(e.get('sample_name', ''))
+                if level:
+                    grp_qc_levels[g].add(level)
+
+        # All QC levels seen across all groups (for column headers)
+        all_qc_cols = [lvl for lvl in QC_LEVELS if any(lvl in grp_qc_levels[g] for g in found)]
+
         # Preserve any existing values when re-detecting
         prev = {g: group_df_vars[g].get() for g in group_df_vars if g in found}
+        prev_qc = {g: {lvl: grp_qc_vars[g][lvl].get() for lvl in grp_qc_vars[g]}
+                   for g in grp_qc_vars if g in found}
+        prev_exp = {g: grp_exp_vars[g].get() for g in grp_exp_vars if g in found}
         group_df_vars.clear()
+        grp_qc_vars.clear()
+        grp_exp_vars.clear()
 
+        # Column headers: Group | Dil. Factor | [QC levels...] | Expected Conc.
+        col = 0
         ttk.Label(grp_rows_frame, text='Group', font=('TkDefaultFont', 9, 'bold')).grid(
-            row=0, column=0, sticky=tk.W, padx=(0, 16), pady=(0, 2))
-        ttk.Label(grp_rows_frame, text='Dilution Factor', font=('TkDefaultFont', 9, 'bold')).grid(
-            row=0, column=1, sticky=tk.W, pady=(0, 2))
+            row=0, column=col, sticky=tk.W, padx=(0, 8), pady=(0, 2))
+        col += 1
+        ttk.Label(grp_rows_frame, text='Dil. Factor', font=('TkDefaultFont', 9, 'bold')).grid(
+            row=0, column=col, sticky=tk.W, padx=(0, 8), pady=(0, 2))
+        col += 1
+        for lvl in all_qc_cols:
+            ttk.Label(grp_rows_frame, text=lvl, font=('TkDefaultFont', 9, 'bold')).grid(
+                row=0, column=col, sticky=tk.W, padx=(0, 8), pady=(0, 2))
+            col += 1
+        ttk.Label(grp_rows_frame, text='Expected Conc.', font=('TkDefaultFont', 9, 'bold')).grid(
+            row=0, column=col, sticky=tk.W, padx=(0, 8), pady=(0, 2))
 
         for ri, gname in enumerate(sorted(found), 1):
-            var = tk.StringVar(value=prev.get(gname, ''))
-            group_df_vars[gname] = var
+            col = 0
             ttk.Label(grp_rows_frame, text=gname).grid(
-                row=ri, column=0, sticky=tk.W, padx=(0, 16), pady=2)
-            ttk.Entry(grp_rows_frame, textvariable=var, width=10).grid(
-                row=ri, column=1, sticky=tk.W, pady=2)
+                row=ri, column=col, sticky=tk.W, padx=(0, 8), pady=2)
+            col += 1
+            df_var = tk.StringVar(value=prev.get(gname, ''))
+            group_df_vars[gname] = df_var
+            ttk.Entry(grp_rows_frame, textvariable=df_var, width=9).grid(
+                row=ri, column=col, sticky=tk.W, padx=(0, 8), pady=2)
+            col += 1
+            grp_qc_vars[gname] = {}
+            for lvl in all_qc_cols:
+                if lvl in grp_qc_levels[gname]:
+                    qc_var = tk.StringVar(value=prev_qc.get(gname, {}).get(lvl, ''))
+                    grp_qc_vars[gname][lvl] = qc_var
+                    ttk.Entry(grp_rows_frame, textvariable=qc_var, width=8).grid(
+                        row=ri, column=col, sticky=tk.W, padx=(0, 8), pady=2)
+                else:
+                    ttk.Label(grp_rows_frame, text='—', foreground='grey').grid(
+                        row=ri, column=col, sticky=tk.W, padx=(0, 8), pady=2)
+                col += 1
+            exp_var = tk.StringVar(value=prev_exp.get(gname, ''))
+            grp_exp_vars[gname] = exp_var
+            ttk.Entry(grp_rows_frame, textvariable=exp_var, width=10).grid(
+                row=ri, column=col, sticky=tk.W, padx=(0, 8), pady=2)
 
-        grp_hint.config(text=f'Found {len(found)} group(s). Enter a dilution factor for any group below (leave blank = 1×).')
+        grp_hint.config(text=f'Found {len(found)} group(s). Enter dilution factors and QC values per group (leave blank = 1× / no QC).')
 
     ttk.Button(grp_btn_frame, text='Detect Groups from Plate Map',
                command=_detect_groups).pack(side=tk.LEFT)
     ttk.Label(grp_btn_frame, text='  Priority: group factor > plate factor',
               foreground='grey').pack(side=tk.LEFT)
-
-    # ── QC Controls ────────────────────────────────────────────────────
-    qc_lf = ttk.LabelFrame(outer, text='QC Controls  (optional — samples containing ULOQ / HQC / MQC / LQC / LLOQ)',
-                            padding='10 6')
-    qc_lf.pack(fill=tk.X, pady=(0, 8))
-
-    # Level headers
-    for ci, level in enumerate(QC_LEVELS):
-        ttk.Label(qc_lf, text=level, font=('TkDefaultFont', 9, 'bold'),
-                  anchor='center').grid(row=0, column=ci + 1, padx=8, pady=(0, 2))
-
-    # Dilution factor row
-    ttk.Label(qc_lf, text='Dilution Factor:').grid(row=1, column=0, sticky=tk.W,
-                                                    padx=(0, 10), pady=2)
-    for ci, level in enumerate(QC_LEVELS):
-        ttk.Entry(qc_lf, textvariable=qc_df_vars[level], width=9).grid(
-            row=1, column=ci + 1, padx=8, pady=2)
-
-    # Expected concentration row
-    exp_inner = ttk.Frame(qc_lf)
-    exp_inner.grid(row=2, column=0, columnspan=6, sticky=tk.W, pady=(6, 2))
-    ttk.Label(exp_inner, text='Expected Conc. (all QC):').pack(side=tk.LEFT, padx=(0, 8))
-    ttk.Entry(exp_inner, textvariable=qc_exp_var, width=12).pack(side=tk.LEFT)
-    ttk.Label(exp_inner, text='  ·  ±30% acceptance band plotted on overlay chart',
-              foreground='grey').pack(side=tk.LEFT, padx=(6, 0))
 
     # ── Previous Runs ──────────────────────────────────────────────────
     hist_lf = ttk.LabelFrame(outer, text='Previous Runs', padding='10 6')
