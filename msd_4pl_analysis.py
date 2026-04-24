@@ -1494,9 +1494,11 @@ def generate_html_report(results, html_path, msd_path, units=None,
         curve_divs = list(_pool.map(_build_curve_div, results))
 
     # ── Overlay figure ────────────────────────────────────────────────────────
+    import json as _json
     overlay_fig = go.Figure()
     colors = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd',
               '#8c564b', '#e377c2', '#7f7f7f', '#bcbd22', '#17becf']
+    _group_trace_indices = defaultdict(list)  # group → [trace indices] for toggle buttons
 
     # Build a stable group→color map (one color per unique group, first-seen order)
     # so that curve traces and expected-concentration bands share the same color.
@@ -1524,6 +1526,7 @@ def generate_html_report(results, html_path, msd_path, units=None,
         plate, spot, group = res['plate'], res['spot'], res.get('group', '')
         trace_label = f"P{plate} S{spot}" + (f" {group}" if group else "")
         color = _group_color_map.get(group, colors[i % len(colors)])
+        _group_trace_indices[group or ''].append(len(overlay_fig.data))
         overlay_fig.add_trace(go.Scatter(
             x=x_fit, y=y_fit,
             mode='lines', name=trace_label,
@@ -1550,6 +1553,7 @@ def generate_html_report(results, html_path, msd_path, units=None,
                 _unk_ys.append(sig)
                 _unk_names.append(sname)
         if _unk_xs:
+            _group_trace_indices[group or ''].append(len(overlay_fig.data))
             overlay_fig.add_trace(go.Scatter(
                 x=_unk_xs, y=_unk_ys,
                 mode='markers', name=f'{trace_label} samples',
@@ -1736,6 +1740,33 @@ def generate_html_report(results, html_path, msd_path, units=None,
     )
     overlay_div = overlay_fig.to_html(full_html=False, include_plotlyjs=False,
                                        div_id='overlay_chart', config={'responsive': True})
+
+    # ── Group toggle button bar (shown above the overlay chart) ──────────────
+    _all_grp_indices = [idx for idxs in _group_trace_indices.values() for idx in idxs]
+    _overlay_btns = ''
+    if len(_group_trace_indices) > 1:
+        _bs = ("padding:5px 14px;border:none;border-radius:4px;cursor:pointer;"
+               "font-size:12px;font-weight:500;transition:opacity 0.15s;")
+        _btn_parts = [
+            '<div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:10px;align-items:center;">',
+            '<span style="font-size:12px;color:#555;font-weight:600;margin-right:4px;">Groups:</span>',
+            f'<button style="{_bs}background:#3a506b;color:white;" '
+            f'onclick="msdOverlayAll(true)">Show All</button>',
+            f'<button style="{_bs}background:#888;color:white;" '
+            f'onclick="msdOverlayAll(false)">Hide All</button>',
+        ]
+        for _grp in sorted(_group_trace_indices.keys()):
+            _idxs = _group_trace_indices[_grp]
+            _display = _grp if _grp and _grp != '_default' else 'Default'
+            _clr = _group_color_map.get(_grp, '#3a506b')
+            _btn_parts.append(
+                f'<button data-active="1" '
+                f'style="{_bs}background:{_clr};color:white;" '
+                f'onclick="msdToggleGrp(this,{_json.dumps(_idxs)})">'
+                f'{_display}</button>'
+            )
+        _btn_parts.append('</div>')
+        _overlay_btns = ''.join(_btn_parts)
 
     # ── Summary table rows ────────────────────────────────────────────────────
     summary_rows_html = []
@@ -2076,6 +2107,7 @@ def generate_html_report(results, html_path, msd_path, units=None,
     {qc_table_html}
     <h2>Standard Curve Overlay</h2>
     <div class="section">
+      {_overlay_btns}
       {overlay_div}
     </div>
   </div>
@@ -2135,6 +2167,23 @@ function filterTable(query, tableId) {{
   document.getElementById(tableId).querySelectorAll('tbody tr').forEach(row => {{
     const match = !q || row.textContent.toLowerCase().includes(q);
     row.style.display = match ? 'table-row' : 'none';
+  }});
+}}
+
+function msdToggleGrp(btn, indices) {{
+  var gd = document.getElementById('overlay_chart');
+  var active = btn.getAttribute('data-active') === '1';
+  Plotly.restyle(gd, {{visible: active ? 'legendonly' : true}}, indices);
+  btn.setAttribute('data-active', active ? '0' : '1');
+  btn.style.opacity = active ? '0.4' : '1.0';
+}}
+function msdOverlayAll(show) {{
+  var gd = document.getElementById('overlay_chart');
+  var allIdx = {_json.dumps(_all_grp_indices)};
+  Plotly.restyle(gd, {{visible: show ? true : 'legendonly'}}, allIdx);
+  document.querySelectorAll('[data-active]').forEach(function(b) {{
+    b.setAttribute('data-active', show ? '1' : '0');
+    b.style.opacity = show ? '1.0' : '0.4';
   }});
 }}
 </script>
