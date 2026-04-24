@@ -2187,7 +2187,7 @@ function msdToggleGrp(btn, traceIndices, shapeIndices) {{
   var gd = document.getElementById('overlay_chart');
   var active = btn.getAttribute('data-active') === '1';
   if (traceIndices && traceIndices.length) {{
-    Plotly.restyle(gd, {{visible: active ? 'legendonly' : true}}, traceIndices);
+    Plotly.restyle(gd, {{visible: active ? false : true}}, traceIndices);
   }}
   if (shapeIndices && shapeIndices.length) {{
     var shapeUpd = {{}};
@@ -2202,7 +2202,7 @@ function msdOverlayAll(show) {{
   var allTraceIdx = {_json.dumps(_all_grp_indices)};
   var allShapeIdx = {_json.dumps(_all_shape_indices)};
   if (allTraceIdx.length) {{
-    Plotly.restyle(gd, {{visible: show ? true : 'legendonly'}}, allTraceIdx);
+    Plotly.restyle(gd, {{visible: show ? true : false}}, allTraceIdx);
   }}
   if (allShapeIdx.length) {{
     var shapeUpd = {{}};
