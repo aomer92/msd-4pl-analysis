@@ -1568,22 +1568,27 @@ def generate_html_report(results, html_path, msd_path, units=None,
     if qc_overlay_points:
         qc_level_colors = {'ULOQ': '#e41a1c', 'HQC': '#ff7f00', 'MQC': '#4daf4a',
                            'LQC': '#377eb8', 'LLOQ': '#984ea3'}
-        qc_by_level = defaultdict(list)
+        # Group by (group, level) so each group's QC stars can be toggled independently
+        qc_by_grp_level = defaultdict(list)
         for qp in qc_overlay_points:
-            qc_by_level[qp['level']].append(qp)
-        for level, pts in qc_by_level.items():
+            _qgrp = qp.get('group', '') or ''
+            qc_by_grp_level[(_qgrp, qp['level'])].append(qp)
+        for (_qgrp, level), pts in sorted(qc_by_grp_level.items()):
             xs = [p['corrected_conc'] for p in pts]
             ys = [p['signal'] for p in pts]
             names = [f"{p['sample_name']} (P{p['plate']})" for p in pts]
+            _qgrp_label = f'{_qgrp} ' if _qgrp and _qgrp != '_default' else ''
+            _group_trace_indices[_qgrp].append(len(overlay_fig.data))
             overlay_fig.add_trace(go.Scatter(
                 x=xs, y=ys,
-                mode='markers', name=f'QC {level}',
+                mode='markers', name=f'QC {_qgrp_label}{level}',
                 marker=dict(color=qc_level_colors.get(level, 'black'), size=12, symbol='star'),
                 customdata=names,
-                hovertemplate='Conc: %{x:.4g}<br>Signal: %{y:,.0f}<br>%{customdata}<extra>QC ' + level + '</extra>'
+                hovertemplate='Conc: %{x:.4g}<br>Signal: %{y:,.0f}<br>%{customdata}<extra>QC ' + _qgrp_label + level + '</extra>'
             ))
 
     # One LLOQ line per group label — averaged across all plates/spots sharing that label
+    _group_shape_indices = defaultdict(list)   # group key → [layout.shapes indices]
     _lloq_group_palette = ['#E07B00', '#C0392B', '#1A7ABF', '#27AE60', '#8E44AD',
                            '#2C3E50', '#D35400', '#16A085', '#7F8C8D', '#F39C12']
     _lloq_by_group = defaultdict(lambda: {'sigs': [], 'concs': []})
@@ -1617,12 +1622,16 @@ def generate_html_report(results, html_path, msd_path, units=None,
             ann = f'{prefix}: {avg_sig:,.0f} (signal) | {conc_str} (conc)'
         else:
             ann = f'{prefix}: {avg_sig:,.0f} (signal)'
-        # Dashed horizontal line
+        # Dashed horizontal line — track layout shape index for toggle
+        _curve_grp_key = '' if g_label == '_ungrouped' else g_label
+        _lloq_shape_idx = len(overlay_fig.layout.shapes)
         overlay_fig.add_hline(
             y=avg_sig,
             line=dict(color=clr, dash='dash', width=2),
         )
+        _group_shape_indices[_curve_grp_key].append(_lloq_shape_idx)
         # Dummy trace in legend2 — positioned near the LLOQ lines (bottom of chart)
+        _group_trace_indices[_curve_grp_key].append(len(overlay_fig.data))
         overlay_fig.add_trace(go.Scatter(
             x=[None], y=[None],
             mode='lines',
@@ -1641,6 +1650,7 @@ def generate_html_report(results, html_path, msd_path, units=None,
             _band_color = _group_color_map.get(_grp, 'steelblue')
             _lo, _hi = _exp_conc * 0.7, _exp_conc * 1.3
             _grp_label = f'{_grp} ' if _grp and _grp != '_default' else ''
+            _vrect_shape_idx = len(overlay_fig.layout.shapes)
             overlay_fig.add_vrect(
                 x0=_lo, x1=_hi,
                 fillcolor=_band_color, opacity=0.15,
@@ -1648,6 +1658,7 @@ def generate_html_report(results, html_path, msd_path, units=None,
                 annotation_text=f'{_grp_label}±30% ({_lo:.4g}–{_hi:.4g})',
                 annotation_position='top right',
             )
+            _group_shape_indices[_grp].append(_vrect_shape_idx)
     elif qc_expected_concentrations and float(qc_expected_concentrations) > 0:
         # Legacy single-value fallback
         _exp_conc = float(qc_expected_concentrations)
@@ -1743,6 +1754,7 @@ def generate_html_report(results, html_path, msd_path, units=None,
 
     # ── Group toggle button bar (shown above the overlay chart) ──────────────
     _all_grp_indices = [idx for idxs in _group_trace_indices.values() for idx in idxs]
+    _all_shape_indices = [idx for idxs in _group_shape_indices.values() for idx in idxs]
     _overlay_btns = ''
     if len(_group_trace_indices) > 1:
         _bs = ("padding:5px 14px;border:none;border-radius:4px;cursor:pointer;"
@@ -1756,13 +1768,14 @@ def generate_html_report(results, html_path, msd_path, units=None,
             f'onclick="msdOverlayAll(false)">Hide All</button>',
         ]
         for _grp in sorted(_group_trace_indices.keys()):
-            _idxs = _group_trace_indices[_grp]
+            _tidxs = _group_trace_indices[_grp]
+            _sidxs = _group_shape_indices.get(_grp, [])
             _display = _grp if _grp and _grp != '_default' else 'Default'
             _clr = _group_color_map.get(_grp, '#3a506b')
             _btn_parts.append(
                 f'<button data-active="1" '
                 f'style="{_bs}background:{_clr};color:white;" '
-                f'onclick="msdToggleGrp(this,{_json.dumps(_idxs)})">'
+                f'onclick="msdToggleGrp(this,{_json.dumps(_tidxs)},{_json.dumps(_sidxs)})">'
                 f'{_display}</button>'
             )
         _btn_parts.append('</div>')
@@ -2170,17 +2183,32 @@ function filterTable(query, tableId) {{
   }});
 }}
 
-function msdToggleGrp(btn, indices) {{
+function msdToggleGrp(btn, traceIndices, shapeIndices) {{
   var gd = document.getElementById('overlay_chart');
   var active = btn.getAttribute('data-active') === '1';
-  Plotly.restyle(gd, {{visible: active ? 'legendonly' : true}}, indices);
+  if (traceIndices && traceIndices.length) {{
+    Plotly.restyle(gd, {{visible: active ? 'legendonly' : true}}, traceIndices);
+  }}
+  if (shapeIndices && shapeIndices.length) {{
+    var shapeUpd = {{}};
+    shapeIndices.forEach(function(i) {{ shapeUpd['shapes[' + i + '].visible'] = !active; }});
+    Plotly.relayout(gd, shapeUpd);
+  }}
   btn.setAttribute('data-active', active ? '0' : '1');
   btn.style.opacity = active ? '0.4' : '1.0';
 }}
 function msdOverlayAll(show) {{
   var gd = document.getElementById('overlay_chart');
-  var allIdx = {_json.dumps(_all_grp_indices)};
-  Plotly.restyle(gd, {{visible: show ? true : 'legendonly'}}, allIdx);
+  var allTraceIdx = {_json.dumps(_all_grp_indices)};
+  var allShapeIdx = {_json.dumps(_all_shape_indices)};
+  if (allTraceIdx.length) {{
+    Plotly.restyle(gd, {{visible: show ? true : 'legendonly'}}, allTraceIdx);
+  }}
+  if (allShapeIdx.length) {{
+    var shapeUpd = {{}};
+    allShapeIdx.forEach(function(i) {{ shapeUpd['shapes[' + i + '].visible'] = show; }});
+    Plotly.relayout(gd, shapeUpd);
+  }}
   document.querySelectorAll('[data-active]').forEach(function(b) {{
     b.setAttribute('data-active', show ? '1' : '0');
     b.style.opacity = show ? '1.0' : '0.4';
