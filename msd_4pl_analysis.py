@@ -417,7 +417,17 @@ def generate_overlay_chart(results, tmp_dir, qc_overlay_points=None, qc_expected
     fig, ax = plt.subplots(figsize=(12, 7.5))
 
     cmap = plt.cm.get_cmap('tab10')
-    colors = [cmap(i % 10) for i in range(len(fitted))]
+
+    # Build stable group→color map (first-seen order) so bands match curves
+    _grp_color_map = {}
+    _ci = 0
+    for res in fitted:
+        g = res.get('group', '') or ''
+        if g not in _grp_color_map:
+            _grp_color_map[g] = cmap(_ci % 10)
+            _ci += 1
+    colors = [_grp_color_map.get(res.get('group', '') or '', cmap(i % 10))
+              for i, res in enumerate(fitted)]
 
     global_conc_min = np.inf
     global_conc_max = 0
@@ -457,16 +467,22 @@ def generate_overlay_chart(results, tmp_dir, qc_overlay_points=None, qc_expected
     qc_cmap = plt.cm.get_cmap('Set1')
     qc_level_colors = {level: qc_cmap(i % 9) for i, level in enumerate(QC_LEVELS)}
 
-    # ±30% expected concentration band (single value, drawn before QC points)
-    if qc_expected_concentrations is not None and np.isfinite(qc_expected_concentrations) and qc_expected_concentrations > 0:
-        exp_conc = qc_expected_concentrations
-        lo, hi = exp_conc * 0.70, exp_conc * 1.30
-        ax.axvspan(lo, hi, alpha=0.15, color='steelblue', zorder=1,
-                   label=f"QC ±30% ({exp_conc:.3g})")
-        ax.axvline(exp_conc, color='steelblue', linewidth=1.0, linestyle='--', zorder=2)
-        # Expand axis range to include band
-        global_conc_min = min(global_conc_min, lo)
-        global_conc_max = max(global_conc_max, hi)
+    # Per-group ±30% expected concentration bands, color-matched to each group's curve
+    _exp_dict = qc_expected_concentrations if isinstance(qc_expected_concentrations, dict) else (
+        {} if qc_expected_concentrations is None else {'': qc_expected_concentrations})
+    _n_qc_bands = 0
+    for _grp, _exp_conc in _exp_dict.items():
+        if _exp_conc is None or not np.isfinite(float(_exp_conc)) or float(_exp_conc) <= 0:
+            continue
+        _exp_conc = float(_exp_conc)
+        _band_clr = _grp_color_map.get(_grp, 'steelblue')
+        _lo, _hi = _exp_conc * 0.70, _exp_conc * 1.30
+        _lbl = f"{_grp} ±30% ({_exp_conc:.3g})" if _grp and _grp != '_default' else f"QC ±30% ({_exp_conc:.3g})"
+        ax.axvspan(_lo, _hi, alpha=0.15, color=_band_clr, zorder=1, label=_lbl)
+        ax.axvline(_exp_conc, color=_band_clr, linewidth=1.0, linestyle='--', zorder=2)
+        global_conc_min = min(global_conc_min, _lo)
+        global_conc_max = max(global_conc_max, _hi)
+        _n_qc_bands += 1
 
     # QC overlay points (corrected conc vs original signal)
     if qc_overlay_points:
@@ -502,9 +518,8 @@ def generate_overlay_chart(results, tmp_dir, qc_overlay_points=None, qc_expected
     ax.tick_params(which='both', direction='in', top=True, right=True)
     ax.grid(True, which='major', alpha=0.15, linewidth=0.5)
 
-    n_qc_bands = 1 if (qc_expected_concentrations is not None) else 0
     n_qc_pts  = len(set(pt['level'] for pt in (qc_overlay_points or []))) if qc_overlay_points else 0
-    n_series = len(fitted) + n_qc_bands + n_qc_pts
+    n_series = len(fitted) + _n_qc_bands + n_qc_pts
     if n_series <= 6:
         ax.legend(loc='lower right', fontsize=8, framealpha=0.9)
     else:
@@ -899,19 +914,11 @@ def create_output(results, output_path, msd_path, raw_plate_blocks, units=None, 
             if np.isfinite(corrected) and np.isfinite(avg_sig) and corrected > 0 and avg_sig > 0:
                 qc_overlay_points.append({**row, 'signal': avg_sig})
 
-    # Compute representative single expected concentration for overlay chart
-    _qc_exp_single = None
-    if isinstance(qc_expected_concentrations, dict):
-        vals = [v for v in qc_expected_concentrations.values() if v and np.isfinite(v)]
-        _qc_exp_single = float(np.mean(vals)) if vals else None
-    else:
-        _qc_exp_single = qc_expected_concentrations
-
     # Pre-generate all charts before Excel writing (sequential — matplotlib mathtext is not thread-safe)
     overlay_path = generate_overlay_chart(
         results, tmp_dir,
         qc_overlay_points if qc_overlay_points else None,
-        _qc_exp_single if _qc_exp_single else None
+        qc_expected_concentrations if qc_expected_concentrations else None
     )
     chart_map = {id(res): generate_std_curve_chart(res, tmp_dir, lloq_method) for res in results}
 
@@ -1484,6 +1491,19 @@ def generate_html_report(results, html_path, msd_path, units=None,
     overlay_fig = go.Figure()
     colors = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd',
               '#8c564b', '#e377c2', '#7f7f7f', '#bcbd22', '#17becf']
+
+    # Build a stable group→color map (one color per unique group, first-seen order)
+    # so that curve traces and expected-concentration bands share the same color.
+    _group_color_map = {}
+    _col_idx = 0
+    for res in results:
+        if res['params'] is None:
+            continue
+        g = res.get('group', '') or ''
+        if g not in _group_color_map:
+            _group_color_map[g] = colors[_col_idx % len(colors)]
+            _col_idx += 1
+
     for i, res in enumerate(results):
         if res['params'] is None:
             continue
@@ -1497,7 +1517,7 @@ def generate_html_report(results, html_path, msd_path, units=None,
         y_fit = list(y_fit)
         plate, spot, group = res['plate'], res['spot'], res.get('group', '')
         trace_label = f"P{plate} S{spot}" + (f" {group}" if group else "")
-        color = colors[i % len(colors)]
+        color = _group_color_map.get(group, colors[i % len(colors)])
         overlay_fig.add_trace(go.Scatter(
             x=x_fit, y=y_fit,
             mode='lines', name=trace_label,
@@ -1602,20 +1622,31 @@ def generate_html_report(results, html_path, msd_path, units=None,
             legend='legend2',
         ))
 
-    _qc_exp_single = None
+    # Per-group ±30% expected concentration bands, color-matched to each group's curve
     if isinstance(qc_expected_concentrations, dict):
-        _exp_vals = [v for v in qc_expected_concentrations.values() if v and np.isfinite(v)]
-        _qc_exp_single = float(np.mean(_exp_vals)) if _exp_vals else None
-    else:
-        _qc_exp_single = qc_expected_concentrations
-    if _qc_exp_single and _qc_exp_single > 0:
-        lo = _qc_exp_single * 0.7
-        hi = _qc_exp_single * 1.3
+        for _grp, _exp_conc in qc_expected_concentrations.items():
+            if not _exp_conc or not np.isfinite(float(_exp_conc)) or float(_exp_conc) <= 0:
+                continue
+            _exp_conc = float(_exp_conc)
+            _band_color = _group_color_map.get(_grp, 'steelblue')
+            _lo, _hi = _exp_conc * 0.7, _exp_conc * 1.3
+            _grp_label = f'{_grp} ' if _grp and _grp != '_default' else ''
+            overlay_fig.add_vrect(
+                x0=_lo, x1=_hi,
+                fillcolor=_band_color, opacity=0.15,
+                layer='below', line_width=0,
+                annotation_text=f'{_grp_label}±30% ({_lo:.4g}–{_hi:.4g})',
+                annotation_position='top right',
+            )
+    elif qc_expected_concentrations and float(qc_expected_concentrations) > 0:
+        # Legacy single-value fallback
+        _exp_conc = float(qc_expected_concentrations)
+        _lo, _hi = _exp_conc * 0.7, _exp_conc * 1.3
         overlay_fig.add_vrect(
-            x0=lo, x1=hi,
+            x0=_lo, x1=_hi,
             fillcolor='steelblue', opacity=0.15,
             layer='below', line_width=0,
-            annotation_text=f'±30% ({lo:,.1f}–{hi:,.1f})',
+            annotation_text=f'±30% ({_lo:,.1f}–{_hi:,.1f})',
             annotation_position='top right'
         )
 
