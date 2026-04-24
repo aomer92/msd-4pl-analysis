@@ -143,10 +143,16 @@ def _load_run_history():
         return []
 
 def _save_run_to_history(entry):
-    """Prepend entry to the run history list and trim to MAX_RUN_HISTORY."""
+    """Prepend entry to the run history list and trim to MAX_RUN_HISTORY.
+    If an entry with the same (msd, platemap, output) already exists it is
+    replaced rather than duplicated — re-runs update in place."""
     from datetime import datetime
     entry.setdefault('timestamp', datetime.now().strftime('%Y-%m-%d %H:%M'))
     history = _load_run_history()
+    # Remove any existing entry for the same experiment
+    key = (entry.get('msd'), entry.get('platemap'), entry.get('output'))
+    history = [h for h in history
+               if (h.get('msd'), h.get('platemap'), h.get('output')) != key]
     history.insert(0, entry)
     history = history[:MAX_RUN_HISTORY]
     with open(LAST_RUN_PATH, 'w') as f:
