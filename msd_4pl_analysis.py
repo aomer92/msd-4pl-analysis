@@ -248,24 +248,80 @@ def inverse_4pl(y, a, b, c, d):
     return c * (ratio ** (1.0 / b))
 
 def fit_4pl(conc, signal):
-    """Fit 4PL to standards and blanks. Returns (popt, r2) or (None, None)."""
-    conc, signal = np.asarray(conc, float), np.asarray(signal, float)
-    mask = (conc >= 0) & np.isfinite(signal)
-    conc, signal = conc[mask], signal[mask]
-    if len(conc) < 4:
+    """
+    Fit 4PL model with 1/y² weighted least-squares.
+
+    Weighting: σ_i = y_i so the optimiser minimises Σ[(y_i − f(x_i)) / y_i]²,
+    i.e. it minimises relative (percentage) residuals — the correct criterion for
+    assay signals that span orders of magnitude with roughly constant CV.
+    absolute_sigma=False means σ values define relative importance only and are not
+    assumed to be true measurement standard deviations.
+
+    Blanks (conc=0) are included; they anchor the lower asymptote (a parameter).
+    At x=0 the model returns a, so including blanks constrains a ≈ blank signal.
+
+    R² is computed on the same 1/y² weighted scale as the fit.
+    Falls back to unweighted fit if the weighted optimisation fails.
+
+    Returns (popt, weighted_r2) or (None, None).
+    """
+    conc  = np.asarray(conc,   float)
+    signal = np.asarray(signal, float)
+
+    # Require: non-negative concentration, finite & strictly positive signal
+    # (signal > 0 required for 1/y² weights; MSD blanks always have positive signal)
+    mask = (conc >= 0) & np.isfinite(signal) & (signal > 0)
+    c_fit = conc[mask]
+    s_fit = signal[mask]
+
+    if len(c_fit) < 4:
         return None, None
-    a0, d0 = np.min(signal), np.max(signal)
-    c0, b0 = np.median(conc), 1.0
+
+    # Initial parameter guesses
+    a0 = float(np.min(s_fit))                          # lower asymptote
+    d0 = float(np.max(s_fit))                          # upper asymptote
+    pos = c_fit[c_fit > 0]
+    # Geometric mean of positive concentrations → midpoint on log scale (better than median)
+    c0 = float(np.exp(np.mean(np.log(pos)))) if len(pos) > 0 else 1.0
+    b0 = 1.0                                           # Hill slope
+
+    # Hill slope bounded to physically meaningful range; c bounded > 0
+    bounds = ([-np.inf, 0.01, 1e-15, -np.inf],
+              [ np.inf, 20.0,  np.inf,  np.inf])
+
+    def _weighted_r2(params):
+        """1/y² weighted R²: consistent with the fitting criterion."""
+        y_pred  = four_pl(c_fit, *params)
+        w       = 1.0 / s_fit ** 2
+        y_wmean = np.average(s_fit, weights=w)
+        ss_res  = np.sum(w * (s_fit - y_pred)  ** 2)
+        ss_tot  = np.sum(w * (s_fit - y_wmean) ** 2)
+        return float(1.0 - ss_res / ss_tot) if ss_tot > 0 else 0.0
+
+    # ── Primary: 1/y² weighted fit ──────────────────────────────────────────
+    # σ_i = y_i → minimises Σ(relative_residual²)
     try:
-        popt, _ = curve_fit(four_pl, conc, signal, p0=[a0, b0, c0, d0],
-                            sigma=np.clip(signal, 1e-3, None), absolute_sigma=True,
-                            maxfev=1000,
-                            bounds=([-np.inf, -np.inf, 1e-15, -np.inf],
-                                    [np.inf, np.inf, np.inf, np.inf]))
-        ss_res = np.sum((signal - four_pl(conc, *popt)) ** 2)
-        ss_tot = np.sum((signal - np.mean(signal)) ** 2)
-        r2 = 1 - ss_res / ss_tot if ss_tot > 0 else 0
-        return popt, r2
+        popt, _ = curve_fit(
+            four_pl, c_fit, s_fit,
+            p0=[a0, b0, c0, d0],
+            sigma=s_fit,            # 1/y² weighting
+            absolute_sigma=False,   # σ defines relative weights, not true std-devs
+            maxfev=5000,
+            bounds=bounds,
+        )
+        return popt, _weighted_r2(popt)
+    except Exception:
+        pass
+
+    # ── Fallback: unweighted fit ─────────────────────────────────────────────
+    try:
+        popt, _ = curve_fit(
+            four_pl, c_fit, s_fit,
+            p0=[a0, b0, c0, d0],
+            maxfev=5000,
+            bounds=bounds,
+        )
+        return popt, _weighted_r2(popt)
     except Exception:
         return None, None
 
