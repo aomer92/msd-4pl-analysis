@@ -2947,11 +2947,13 @@ def run_interactive():
         root.after(200, _poll)
 
     # ── Window setup ───────────────────────────────────────────────────
-    # Use TkinterDnD root if available (required for drag-and-drop)
+    # Use TkinterDnD root if available (required for drag-and-drop).
+    # The native tkdnd library can fail to load even after a successful
+    # import, so catch both ImportError and RuntimeError.
     try:
         from tkinterdnd2 import TkinterDnD as _TkDnD
         root = _TkDnD.Tk()
-    except ImportError:
+    except (ImportError, RuntimeError, Exception):
         root = tk.Tk()
     root.title("MSD 4PL Analysis Tool")
     root.geometry("860x720")
@@ -3055,8 +3057,10 @@ def run_interactive():
     # ── Drag-and-drop setup ────────────────────────────────────────────
     try:
         from tkinterdnd2 import DND_FILES as _DND_FILES
+        # Verify the root actually supports DnD (it may have fallen back to plain Tk)
+        root.drop_target_register  # AttributeError if DnD root init failed
         _has_dnd = True
-    except ImportError:
+    except (ImportError, AttributeError, Exception):
         _has_dnd = False
 
     def _parse_dnd_path(raw):
