@@ -2679,7 +2679,13 @@ def run_interactive():
         history = _load_run_history()
         if idx >= len(history):
             return
-        _apply_run_entry(history[idx])
+        try:
+            _apply_run_entry(history[idx])
+        except Exception as _exc:
+            import traceback as _tb
+            messagebox.showerror("Load Error",
+                                 f"Failed to restore run:\n\n{_tb.format_exc()}",
+                                 parent=root)
 
     def _show_loading_screen():
         """Animated loading window with a 4PL sigmoid being drawn in real time."""
@@ -3475,6 +3481,18 @@ def run_interactive():
                command=root.destroy).pack(side=tk.RIGHT, padx=(6, 0))
     ttk.Button(_btn_row, text='▶  Run Analysis',
                command=run, default='active').pack(side=tk.RIGHT)
+
+    # Surface any unhandled Tkinter callback exceptions visibly instead of
+    # swallowing them silently to stderr.
+    def _report_callback_exception(exc_type, exc_val, exc_tb):
+        import traceback as _tb
+        msg = ''.join(_tb.format_exception(exc_type, exc_val, exc_tb))
+        print(msg)   # always print to console
+        try:
+            messagebox.showerror("Unexpected Error", msg[:2000], parent=root)
+        except Exception:
+            pass
+    root.report_callback_exception = _report_callback_exception
 
     root.mainloop()
 
