@@ -3,15 +3,10 @@ from PyInstaller.utils.hooks import collect_all
 
 datas = []
 binaries = []
-hiddenimports = ['scipy.optimize', 'scipy.special', 'scipy.linalg', 'openpyxl',
-                 'matplotlib.backends.backend_agg',
-                 'matplotlib.backends.backend_tkagg',
+hiddenimports = ['scipy.optimize', 'scipy.special', 'scipy.linalg', 'openpyxl', 'matplotlib.backends.backend_agg',
                  'plotly', 'plotly.graph_objects', 'plotly.offline', 'plotly.io',
-                 'plotly.validators', 'plotly.basedatatypes', 'plotly.colors',
-                 'tkinterdnd2']
+                 'plotly.validators', 'plotly.basedatatypes', 'plotly.colors']
 tmp_ret = collect_all('matplotlib')
-datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
-tmp_ret = collect_all('tkinterdnd2')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 
 
@@ -35,6 +30,7 @@ a = Analysis(
         'matplotlib.backends.backend_gtk4agg',
         'matplotlib.backends.backend_wxagg',
         'matplotlib.backends.backend_qt5agg',
+        'matplotlib.backends.backend_tkagg',
     ],
     noarchive=False,
     optimize=1,

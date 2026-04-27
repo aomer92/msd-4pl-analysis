@@ -2487,98 +2487,6 @@ def run_analysis(msd_path, platemap_path, output_path, spots_override=None, unit
     _save_run_to_history(last_args)
 
 
-def _compute_preview_results(msd_path, platemap_path):
-    """
-    Parse MSD + plate map and fit 4PL curves for the GUI live preview.
-    Reuses the same parsing + fitting pipeline as run_analysis but writes
-    no output files. Returns a list of result dicts with keys:
-      group, plate, spot, params, r2, standards
-    or an empty list on any error (caller shows the error string separately).
-    """
-    _ensure_deps()
-    try:
-        plates = parse_msd_file(msd_path)
-    except Exception as exc:
-        raise RuntimeError(f"Cannot read MSD file: {exc}") from exc
-    try:
-        plate_maps, _ = parse_plate_map_grid(platemap_path)
-    except Exception as exc:
-        raise RuntimeError(f"Cannot read plate map: {exc}") from exc
-
-    # Build per-plate well lookups
-    plate_well_maps = {}
-    for pm_num, entries in plate_maps.items():
-        wm = {}
-        for e in entries:
-            wm.setdefault(normalize_well(e['well']), []).append(e)
-        plate_well_maps[pm_num] = wm
-
-    n_plate_maps = len(plate_maps)
-    results = []
-    for plate_data in plates:
-        pnum      = plate_data['plate_num']
-        n_spots   = plate_data['spots_per_well']
-        wd        = plate_data['data']
-
-        if pnum in plate_well_maps:
-            well_map = plate_well_maps[pnum]
-        elif n_plate_maps == 1:
-            well_map = list(plate_well_maps.values())[0]
-        else:
-            continue
-
-        for spot_idx in range(n_spots):
-            spot_num  = spot_idx + 1
-            spot_wells = []
-            for well_id, spot_signals in wd.items():
-                nw = normalize_well(well_id)
-                if spot_idx >= len(spot_signals):
-                    continue
-                signal    = spot_signals[spot_idx]
-                info_list = well_map.get(nw)
-                if not info_list:
-                    continue
-                for info in info_list:
-                    spot_wells.append({
-                        'signal':      signal,
-                        'sample_type': info['sample_type'],
-                        'concentration': info.get('concentration', np.nan),
-                        'group':       info.get('group', '_default'),
-                    })
-
-            groups = sorted(set(w['group'] for w in spot_wells if w['group'] != '_default'))
-            if not groups:
-                groups = ['_default']
-
-            for group in groups:
-                standards, blanks = [], []
-                for w in spot_wells:
-                    wg, stype = w['group'], w['sample_type']
-                    if stype == 'Blank' and (wg == group or wg == '_default'):
-                        blanks.append(w['signal'])
-                    elif wg != group:
-                        continue
-                    elif stype == 'Standard':
-                        conc = w['concentration']
-                        if pd.notna(conc) and conc > 0:
-                            standards.append({'conc': float(conc), 'signal': w['signal']})
-
-                if len(standards) < 4:
-                    continue
-                conc_list   = [s['conc'] for s in standards] + [0] * len(blanks)
-                signal_list = [s['signal'] for s in standards] + list(blanks)
-                params, r2  = fit_4pl(conc_list, signal_list)
-                results.append({
-                    'group':     group if group != '_default' else '',
-                    'plate':     pnum,
-                    'spot':      spot_num,
-                    'params':    params,
-                    'r2':        r2 or 0.0,
-                    'standards': sorted(standards, key=lambda s: s['conc']),
-                })
-    return results
-
-
 def run_interactive():
     """Launch a single-page GUI for configuring all analysis options."""
     import tkinter as tk
@@ -2679,13 +2587,7 @@ def run_interactive():
         history = _load_run_history()
         if idx >= len(history):
             return
-        try:
-            _apply_run_entry(history[idx])
-        except Exception as _exc:
-            import traceback as _tb
-            messagebox.showerror("Load Error",
-                                 f"Failed to restore run:\n\n{_tb.format_exc()}",
-                                 parent=root)
+        _apply_run_entry(history[idx])
 
     def _show_loading_screen():
         """Animated loading window with a 4PL sigmoid being drawn in real time."""
@@ -2953,14 +2855,7 @@ def run_interactive():
         root.after(200, _poll)
 
     # ── Window setup ───────────────────────────────────────────────────
-    # Use TkinterDnD root if available (required for drag-and-drop).
-    # The native tkdnd library can fail to load even after a successful
-    # import, so catch both ImportError and RuntimeError.
-    try:
-        from tkinterdnd2 import TkinterDnD as _TkDnD
-        root = _TkDnD.Tk()
-    except (ImportError, RuntimeError, Exception):
-        root = tk.Tk()
+    root = tk.Tk()
     root.title("MSD 4PL Analysis Tool")
     root.geometry("860x720")
     root.minsize(760, 620)
@@ -3041,229 +2936,23 @@ def run_interactive():
     files_lf.pack(fill=tk.X, pady=(0, 8))
     files_lf.columnconfigure(1, weight=1)
 
-    def _file_row(parent, row, label, var, btn_cmd):
+    def _file_row(parent, row, label, var, btn_cmd, btn2_cmd=None):
         ttk.Label(parent, text=label).grid(row=row, column=0, sticky=tk.W,
                                            padx=(0, 10), **_rp)
-        ent = ttk.Entry(parent, textvariable=var, width=54)
-        ent.grid(row=row, column=1, sticky=tk.EW, **_rp)
+        ttk.Entry(parent, textvariable=var, width=54).grid(row=row, column=1,
+                                                            sticky=tk.EW, **_rp)
         ttk.Button(parent, text='Browse…', command=btn_cmd, width=8).grid(
             row=row, column=2, padx=(6, 0), **_rp)
-        return ent
 
-    msd_entry = _file_row(files_lf, 0, 'MSD Data File:', msd_var,
-                          lambda: browse_file(msd_var, 'Select MSD Data File',
-                                              [('MSD Text Files', '*.txt'), ('All Files', '*.*')]))
-    pm_entry  = _file_row(files_lf, 1, 'Plate Map CSV:', platemap_var,
-                          lambda: browse_file(platemap_var, 'Select Plate Map CSV',
-                                              [('CSV Files', '*.csv'), ('All Files', '*.*')]))
+    _file_row(files_lf, 0, 'MSD Data File:', msd_var,
+              lambda: browse_file(msd_var, 'Select MSD Data File',
+                                  [('MSD Text Files', '*.txt'), ('All Files', '*.*')]))
+    _file_row(files_lf, 1, 'Plate Map CSV:', platemap_var,
+              lambda: browse_file(platemap_var, 'Select Plate Map CSV',
+                                  [('CSV Files', '*.csv'), ('All Files', '*.*')]))
     _file_row(files_lf, 2, 'Output Excel:', output_var,
               lambda: browse_save(output_var, 'Save Results As', '.xlsx',
                                   [('Excel Files', '*.xlsx')], 'msd_4pl_results.xlsx'))
-
-    # ── Drag-and-drop setup ────────────────────────────────────────────
-    try:
-        from tkinterdnd2 import DND_FILES as _DND_FILES
-        # Verify the root actually supports DnD (it may have fallen back to plain Tk)
-        root.drop_target_register  # AttributeError if DnD root init failed
-        _has_dnd = True
-    except (ImportError, AttributeError, Exception):
-        _has_dnd = False
-
-    def _parse_dnd_path(raw):
-        """Extract single file path from TkinterDnD drop data."""
-        raw = raw.strip()
-        if raw.startswith('{'):
-            end = raw.find('}')
-            return raw[1:end] if end > 0 else raw.lstrip('{')
-        return raw.split()[0]
-
-    def _highlight_entry(ent, on):
-        ent.configure(style='Drop.TEntry' if on else 'TEntry')
-
-    if _has_dnd:
-        # Create a highlighted entry style for drag-hover feedback
-        _style = ttk.Style()
-        _style.configure('Drop.TEntry', fieldbackground='#deeeff')
-
-        def _register_drop(widget, var, exts):
-            """Make widget a drop target; only accept files with given extensions."""
-            widget.drop_target_register(_DND_FILES)
-
-            def _on_enter(e):
-                _highlight_entry(widget, True)
-                return e.action
-
-            def _on_leave(e):
-                _highlight_entry(widget, False)
-
-            def _on_drop(e):
-                _highlight_entry(widget, False)
-                path = _parse_dnd_path(e.data)
-                if exts and not any(path.lower().endswith(x) for x in exts):
-                    return
-                var.set(path)
-
-            widget.dnd_bind('<<DropEnter>>', _on_enter)
-            widget.dnd_bind('<<DropLeave>>', _on_leave)
-            widget.dnd_bind('<<Drop>>', _on_drop)
-
-        _register_drop(msd_entry, msd_var, ('.txt',))
-        _register_drop(pm_entry,  platemap_var, ('.csv',))
-
-        # Also allow dropping either file type onto the whole LabelFrame header
-        def _on_frame_drop(e):
-            path = _parse_dnd_path(e.data)
-            if path.lower().endswith('.txt'):
-                msd_var.set(path)
-            elif path.lower().endswith('.csv'):
-                platemap_var.set(path)
-        files_lf.drop_target_register(_DND_FILES)
-        files_lf.dnd_bind('<<Drop>>', _on_frame_drop)
-
-    # ── Live curve preview ─────────────────────────────────────────────
-    preview_lf = ttk.LabelFrame(outer, text='Curve Preview', padding='10 6')
-    preview_lf.pack(fill=tk.X, pady=(0, 8))
-
-    _prev_status_var = tk.StringVar(
-        value='Select an MSD data file and plate map above to see a live curve preview.')
-    ttk.Label(preview_lf, textvariable=_prev_status_var,
-              foreground='#555').pack(anchor=tk.W, pady=(0, 4))
-
-    # Placeholder canvas shown before any preview is computed
-    _preview_fig_frame = ttk.Frame(preview_lf)
-    _preview_fig_frame.pack(fill=tk.X)
-    _preview_canvas_widget = [None]   # mutable container so inner closures can replace it
-
-    _prev_state = {'after_id': None, 'busy': False, 'canvas': None}
-
-    def _clear_preview():
-        if _preview_canvas_widget[0] is not None:
-            try:
-                _preview_canvas_widget[0].get_tk_widget().destroy()
-            except Exception:
-                pass
-            _preview_canvas_widget[0] = None
-
-    def _draw_preview(results):
-        """Render fitted curves into an embedded matplotlib figure."""
-        _clear_preview()
-        try:
-            import matplotlib
-            matplotlib.use('Agg')
-            import matplotlib.pyplot as _plt
-            from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
-        except ImportError:
-            _prev_status_var.set('Install matplotlib to enable curve preview.')
-            return
-
-        colors = ['#2E86AB', '#E84855', '#3BB273', '#F18F01',
-                  '#7B2D8B', '#C73E1D', '#3D405B', '#69B578']
-
-        fig = _plt.Figure(figsize=(7.0, 2.6), dpi=88)
-        fig.patch.set_facecolor('white')
-        ax = fig.add_subplot(111)
-        ax.set_facecolor('white')
-
-        any_curve = False
-        for i, res in enumerate(results):
-            if res['params'] is None:
-                continue
-            stds = res['standards']
-            if not stds:
-                continue
-            concs = [s['conc'] for s in stds]
-            sigs  = [s['signal'] for s in stds]
-            color = colors[i % len(colors)]
-
-            # Fitted curve
-            x_min = min(c for c in concs if c > 0) * 0.5
-            x_max = max(concs) * 2.0
-            xs = np.logspace(np.log10(x_min), np.log10(x_max), 200)
-            ys = four_pl(xs, *res['params'])
-
-            label = res['group'] or f"Spot {res['spot']}"
-            if len(results) > 1:
-                label += f" (P{res['plate']})"
-            ax.plot(xs, ys, color=color, linewidth=1.6, label=f"{label}  R²={res['r2']:.4f}")
-
-            # Standard points
-            ax.scatter(concs, sigs, color=color, s=22, zorder=5, edgecolors='none', alpha=0.8)
-            any_curve = True
-
-        if not any_curve:
-            ax.text(0.5, 0.5, 'No fitted curves', transform=ax.transAxes,
-                    ha='center', va='center', color='#888', fontsize=10)
-        else:
-            ax.set_xscale('log')
-            ax.set_yscale('log')
-            ax.set_xlabel('Concentration', fontsize=8)
-            ax.set_ylabel('Signal', fontsize=8)
-            ax.tick_params(labelsize=7)
-            ax.grid(True, which='major', alpha=0.2, linewidth=0.5)
-            if len(results) <= 8:
-                ax.legend(fontsize=7, loc='lower right', framealpha=0.85,
-                          handlelength=1.5, labelspacing=0.3)
-
-        fig.tight_layout(pad=0.5)
-        canvas = FigureCanvasTkAgg(fig, master=_preview_fig_frame)
-        canvas.draw()
-        canvas.get_tk_widget().pack(fill=tk.X)
-        _preview_canvas_widget[0] = canvas
-        _plt.close(fig)
-
-    def _run_preview():
-        msd_p = msd_var.get().strip()
-        pm_p  = platemap_var.get().strip()
-        if not msd_p or not pm_p:
-            _prev_status_var.set('Select both an MSD data file and a plate map to see a live preview.')
-            _clear_preview()
-            return
-        if not os.path.exists(msd_p):
-            _prev_status_var.set(f'MSD file not found: {os.path.basename(msd_p)}')
-            _clear_preview()
-            return
-        if not os.path.exists(pm_p):
-            _prev_status_var.set(f'Plate map not found: {os.path.basename(pm_p)}')
-            _clear_preview()
-            return
-        if _prev_state['busy']:
-            # Re-schedule so the in-flight thread finishes first
-            _prev_state['after_id'] = root.after(400, _run_preview)
-            return
-
-        _prev_state['busy'] = True
-        _prev_status_var.set('Computing preview…')
-
-        import threading as _th
-
-        def _worker():
-            try:
-                res = _compute_preview_results(msd_p, pm_p)
-                def _done():
-                    n_curves  = sum(1 for r in res if r['params'] is not None)
-                    n_groups  = len(set(r['group'] for r in res if r['group']))
-                    n_plates  = len(set(r['plate'] for r in res))
-                    r2_vals   = [r['r2'] for r in res if r['params'] is not None]
-                    r2_str    = f"  ·  min R²={min(r2_vals):.4f}" if r2_vals else ''
-                    grp_str   = f"{n_groups} group{'s' if n_groups!=1 else ''}" if n_groups else f"{n_curves} curve{'s' if n_curves!=1 else ''}"
-                    pl_str    = f"{n_plates} plate{'s' if n_plates!=1 else ''}"
-                    _prev_status_var.set(f"Preview  ·  {grp_str}  ·  {pl_str}{r2_str}")
-                    _draw_preview(res)
-                root.after(0, _done)
-            except Exception as exc:
-                root.after(0, lambda: _prev_status_var.set(f'Preview error: {exc}'))
-            finally:
-                _prev_state['busy'] = False
-
-        _th.Thread(target=_worker, daemon=True).start()
-
-    def _schedule_preview(*_args):
-        if _prev_state['after_id']:
-            root.after_cancel(_prev_state['after_id'])
-        _prev_state['after_id'] = root.after(700, _run_preview)
-
-    msd_var.trace_add('write', _schedule_preview)
-    platemap_var.trace_add('write', _schedule_preview)
 
     # ── Analysis Options ───────────────────────────────────────────────
     opts_lf = ttk.LabelFrame(outer, text='Analysis Options', padding='10 6')
@@ -3481,18 +3170,6 @@ def run_interactive():
                command=root.destroy).pack(side=tk.RIGHT, padx=(6, 0))
     ttk.Button(_btn_row, text='▶  Run Analysis',
                command=run, default='active').pack(side=tk.RIGHT)
-
-    # Surface any unhandled Tkinter callback exceptions visibly instead of
-    # swallowing them silently to stderr.
-    def _report_callback_exception(exc_type, exc_val, exc_tb):
-        import traceback as _tb
-        msg = ''.join(_tb.format_exception(exc_type, exc_val, exc_tb))
-        print(msg)   # always print to console
-        try:
-            messagebox.showerror("Unexpected Error", msg[:2000], parent=root)
-        except Exception:
-            pass
-    root.report_callback_exception = _report_callback_exception
 
     root.mainloop()
 
