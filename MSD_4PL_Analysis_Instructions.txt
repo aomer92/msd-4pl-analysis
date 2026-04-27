@@ -11,20 +11,45 @@ SYSTEM REQUIREMENTS
 
 GETTING THE APP
 ───────────────
-  1. Go to the following link and sign in with your GitHub account
-     (free — no subscription needed):
+  You will need a free GitHub account to download the file.
+  If you don't have one, sign up at https://github.com/signup
 
+  Once logged in, follow these steps exactly:
+
+  1. Open this link in your browser:
        https://github.com/aomer92/msd-4pl-analysis/actions
 
-  2. Click the most recent workflow run listed (it will be named
-     "Build Windows Executable" with a green checkmark ✓).
+  2. Under "All workflows" on the left, click
+     "Build Windows Executable".
 
-  3. Scroll to the bottom of the page to the "Artifacts" section.
+  3. You will see a list of runs. Click the top one that has
+     a green checkmark ✓ next to it.
 
-  4. Click "MSD_4PL_Analysis_Windows" to download a ZIP file.
+  4. This opens the run summary page. The page has several
+     sections — you need to scroll ALL THE WAY TO THE BOTTOM.
 
-  5. Open the ZIP and extract "MSD_4PL_Analysis.exe" to your
-     Desktop or a folder of your choice.
+  5. At the very bottom you will see a section titled
+     "Artifacts" with a box icon (📦). It looks like this:
+
+       ┌─────────────────────────────────────────┐
+       │  Artifacts                    Produced   │
+       │                               during     │
+       │  📦 MSD_4PL_Analysis_Windows  runtime    │
+       └─────────────────────────────────────────┘
+
+  6. Click "MSD_4PL_Analysis_Windows" — this downloads a
+     file called MSD_4PL_Analysis_Windows.zip
+
+  7. Open your Downloads folder, right-click the ZIP file,
+     and select "Extract All…" → click "Extract".
+
+  8. Inside the extracted folder you will find
+     "MSD_4PL_Analysis.exe" — this is the app.
+     Move it to your Desktop or a folder of your choice.
+
+  NOTE: If you do not see the Artifacts section, make sure
+  you are logged into GitHub. Artifacts are only visible to
+  logged-in users.
 
 
 FIRST-TIME OPENING (Windows Security Warning)
