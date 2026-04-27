@@ -1,0 +1,147 @@
+═══════════════════════════════════════════════════════════════
+  MSD 4PL Analysis Tool — Instructions for New Users
+═══════════════════════════════════════════════════════════════
+
+SYSTEM REQUIREMENTS
+───────────────────
+  • Windows 10 or later  (64-bit)
+  • No Python or additional software installation required —
+    the app is fully self-contained
+
+
+GETTING THE APP
+───────────────
+  1. Go to the following link and sign in with your GitHub account
+     (free — no subscription needed):
+
+       https://github.com/aomer92/msd-4pl-analysis/actions
+
+  2. Click the most recent workflow run listed (it will be named
+     "Build Windows Executable" with a green checkmark ✓).
+
+  3. Scroll to the bottom of the page to the "Artifacts" section.
+
+  4. Click "MSD_4PL_Analysis_Windows" to download a ZIP file.
+
+  5. Open the ZIP and extract "MSD_4PL_Analysis.exe" to your
+     Desktop or a folder of your choice.
+
+
+FIRST-TIME OPENING (Windows Security Warning)
+──────────────────────────────────────────────
+  Because this app was not downloaded from the Microsoft Store,
+  Windows Defender SmartScreen may block it the first time.
+
+  If you see "Windows protected your PC":
+    1. Click "More info" (below the warning message)
+    2. Click "Run anyway"
+    3. The app will open normally.
+
+  If Windows Defender flags it as a threat:
+    1. Open Windows Security → Virus & threat protection
+    2. Click "Protection history"
+    3. Find the blocked item and click "Allow"
+
+
+USING THE APP — STEP BY STEP
+─────────────────────────────
+
+  STEP 1 — Select your MSD data file
+    Click "Browse…" next to "MSD Data File" and select your
+    exported MSD .txt file (from the MSD instrument software).
+
+  STEP 2 — Select your plate map
+    Click "Browse…" next to "Plate Map CSV" and select the
+    plate map .csv file for your experiment.
+
+  STEP 3 — Choose where to save the results
+    Click "Browse…" next to "Output Excel" to choose a file
+    name and location for the results spreadsheet.
+    (Default: msd_4pl_results.xlsx)
+
+  STEP 4 — Configure analysis options (optional)
+    • Spots per Well   — Leave blank to auto-detect, or enter
+                         1, 4, or 10 to override.
+    • Units            — e.g. "pg/mL" (appears in output headers)
+    • %CV Threshold    — Flag replicates above this CV (default 25)
+    • Plate Dilution   — Comma-separated factors if samples were
+                         diluted before plating (e.g. 1,2,1)
+    • LLOQ Method      — "Mean + 10×SD" is the standard method;
+                         "3× Blank Mean" is an alternative
+    • Total Protein    — Optional CSV for signal normalisation
+
+  STEP 5 — Set group dilution factors (if applicable)
+    If your plate map uses named groups (e.g. HTT2B7, MSH3, NFL),
+    click "Detect Groups" to load them automatically, then enter
+    any per-group dilution factors and QC expected concentrations.
+
+  STEP 6 — Run the analysis
+    Click "▶  Run Analysis" at the bottom of the window.
+    A progress screen will appear while the analysis runs.
+    The app will close automatically when it finishes.
+
+  STEP 7 — Review your results
+    Two output files will be created in the location you chose:
+    • results.xlsx  — Full Excel workbook with standard curves,
+                      fitted parameters, LLOQ, and all unknowns
+    • results.html  — Interactive HTML report with zoomable
+                      overlay charts (open in any web browser)
+
+
+PLATE MAP FORMAT
+────────────────
+  The plate map must be a CSV file in 96-well grid format
+  (rows A–H, columns 1–12). Each cell should contain one of:
+
+    GroupName:concentration    — Standard/calibrator
+                                 e.g.  HTT2B7:800000
+    GroupName:SampleID         — Unknown sample
+                                 e.g.  HTT2B7:1001 / NV704A / mCTX
+    GroupName:HQC              — Quality control (HQC / MQC / LQC)
+    GroupName:0                — Blank / background
+
+  Multiple groups can share the same standard well using "&":
+    HTT2B7&MSH3:800000         — applies this standard to both groups
+
+  If there is only one group, the "GroupName:" prefix can be omitted.
+
+
+HISTORY
+────────
+  The app remembers your last runs. To reload a previous
+  experiment's settings, double-click any entry in the
+  "Run History" section, then click "Load Selected Run".
+
+
+TROUBLESHOOTING
+───────────────
+  App won't open / SmartScreen blocks it:
+    → Click "More info" then "Run anyway" in the SmartScreen dialog.
+
+  App opens then immediately closes (flashes):
+    → This can happen if a previous run left a temp file locked.
+      Wait 30 seconds and try again, or restart your computer.
+
+  "MSD file contains X plates but plate map contains Y":
+    → Your plate map must have the same number of plate grids
+      as MSD plates. Add a second grid below the first in the CSV.
+
+  No standards detected / curve fit failed:
+    → Check that the plate map wells labelled as standards have
+      numeric concentrations (not text) after the colon.
+
+  Results file won't open (Excel says it's corrupt):
+    → Make sure the output path does not already have the file
+      open in Excel. Close Excel first, then re-run.
+
+  The app is slow to start (30–60 seconds first launch):
+    → This is normal for a self-contained Windows executable.
+      Subsequent launches on the same day will be faster.
+
+
+CONTACT
+────────
+  For questions about the analysis or plate map setup, please
+  contact the person who shared this app with you.
+
+═══════════════════════════════════════════════════════════════
