@@ -1644,6 +1644,34 @@ def generate_html_report(results, html_path, msd_path, units=None,
             hovertemplate=f'%{{x:.4g}} → %{{y:,.0f}}<extra>{trace_label}</extra>'
         ))
 
+        # Standard replicate points and means for this curve
+        if res.get('standards'):
+            _std_grps = {}
+            for s in res['standards']:
+                _std_grps.setdefault(s['conc'], []).append(s['signal'])
+            _rep_xs = [c for c, sigs in _std_grps.items() for _ in sigs]
+            _rep_ys = [sig for sigs in _std_grps.values() for sig in sigs]
+            _mean_xs = list(_std_grps.keys())
+            _mean_ys = [float(np.mean(v)) for v in _std_grps.values()]
+            # Individual replicates (small, semi-transparent)
+            _group_trace_indices[group or ''].append(len(overlay_fig.data))
+            overlay_fig.add_trace(go.Scatter(
+                x=_rep_xs, y=_rep_ys,
+                mode='markers', name=f'{trace_label} replicates',
+                legendgroup=trace_label, showlegend=False,
+                marker=dict(color=color, size=5, symbol='circle', opacity=0.35),
+                hovertemplate=f'Conc: %{{x:.4g}}<br>Signal: %{{y:,.0f}}<extra>{trace_label} replicate</extra>'
+            ))
+            # Means (larger, opaque)
+            _group_trace_indices[group or ''].append(len(overlay_fig.data))
+            overlay_fig.add_trace(go.Scatter(
+                x=_mean_xs, y=_mean_ys,
+                mode='markers', name=f'{trace_label} means',
+                legendgroup=trace_label, showlegend=False,
+                marker=dict(color=color, size=8, symbol='circle'),
+                hovertemplate=f'Conc: %{{x:.4g}}<br>Mean signal: %{{y:,.0f}}<extra>{trace_label} mean</extra>'
+            ))
+
         # Sample (unknown) scatter points for this curve, color-matched
         _grp_key = group if group and group != '_default' else ''
         if _grp_key and group_dilution_factors and _grp_key in group_dilution_factors:
