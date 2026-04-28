@@ -1894,7 +1894,7 @@ def generate_html_report(results, html_path, msd_path, units=None,
             font=dict(size=10),
         ),
         margin=dict(l=60, r=220, t=110, b=60),
-        height=560
+        height=644
     )
     overlay_div = overlay_fig.to_html(full_html=False, include_plotlyjs=False,
                                        div_id='overlay_chart', config={'responsive': True})
