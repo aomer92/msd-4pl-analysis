@@ -1481,11 +1481,26 @@ def generate_html_report(results, html_path, msd_path, units=None,
             std_means = [np.mean(std_groups_local[c]['signals']) for c in std_concs]
             all_concs_pos = [c for c in std_concs if c > 0]
             all_sigs_pos  = [s for s in std_means if s > 0]
+
+            # Individual replicate points (smaller, semi-transparent)
+            rep_concs, rep_sigs = [], []
+            for c in std_concs:
+                for sig in std_groups_local[c]['signals']:
+                    rep_concs.append(c)
+                    rep_sigs.append(sig)
+            fig.add_trace(go.Scatter(
+                x=rep_concs, y=rep_sigs,
+                mode='markers', name='Replicates',
+                marker=dict(color='#2F5496', size=6, symbol='circle', opacity=0.4),
+                hovertemplate='Conc: %{x:.4g}<br>Signal: %{y:,.0f}<extra>Replicate</extra>'
+            ))
+
+            # Means (larger, opaque)
             fig.add_trace(go.Scatter(
                 x=std_concs, y=std_means,
-                mode='markers', name='Standards',
+                mode='markers', name='Std Means',
                 marker=dict(color='#2F5496', size=9, symbol='circle'),
-                hovertemplate='Conc: %{x:.4g}<br>Signal: %{y:,.0f}<extra>Standards</extra>'
+                hovertemplate='Conc: %{x:.4g}<br>Signal: %{y:,.0f}<extra>Std Mean</extra>'
             ))
 
         lloq_sig = res.get('lloq_sig')
@@ -1520,6 +1535,35 @@ def generate_html_report(results, html_path, msd_path, units=None,
                 except Exception:
                     pass
 
+        # ── Unknown sample scatter points ─────────────────────────────────────
+        _grp_key = group if group and group != '_default' else ''
+        if _grp_key and group_dilution_factors and _grp_key in group_dilution_factors:
+            _factor = group_dilution_factors[_grp_key]
+        else:
+            _factor = (plate_dilution_factors or {}).get(plate, 1.0)
+        _unk_xs, _unk_ys, _unk_names = [], [], []
+        for u in res.get('unknowns', []):
+            sname = u['sample_name']
+            if _identify_qc_level(sname):
+                continue
+            sig = u['signal']
+            conc = u.get('interp_conc', np.nan)
+            if np.isfinite(sig) and sig > 0 and np.isfinite(conc) and conc > 0:
+                _unk_xs.append(conc * _factor)
+                _unk_ys.append(sig)
+                _unk_names.append(sname)
+        sample_trace_idx = len(fig.data)
+        has_samples = bool(_unk_xs)
+        if has_samples:
+            fig.add_trace(go.Scatter(
+                x=_unk_xs, y=_unk_ys,
+                mode='markers', name='Samples',
+                marker=dict(color='#27AE60', size=8, symbol='circle-open',
+                            line=dict(width=2, color='#27AE60')),
+                text=_unk_names,
+                hovertemplate='%{text}<br>Conc: %{x:.4g}<br>Signal: %{y:,.0f}<extra>Sample</extra>'
+            ))
+
         x_range = ([np.log10(min(all_concs_pos)) - 0.25, np.log10(max(all_concs_pos)) + 0.25]
                    if all_concs_pos else None)
         y_range = ([np.log10(min(all_sigs_pos)) - 0.15, np.log10(max(all_sigs_pos)) + 0.15]
@@ -1542,8 +1586,16 @@ def generate_html_report(results, html_path, msd_path, units=None,
             autosize=True, height=400
         )
         div_id = f"curve_p{plate}_s{spot}_{group or 'default'}"
-        return (label, fig.to_html(full_html=False, include_plotlyjs=False,
-                                   div_id=div_id, config={'responsive': True}))
+        chart_html = fig.to_html(full_html=False, include_plotlyjs=False,
+                                  div_id=div_id, config={'responsive': True})
+        if has_samples:
+            btn = (
+                f'<button class="curve-toggle-btn" data-active="1" '
+                f'onclick="msdToggleCurveSamples(this,\'{div_id}\',{sample_trace_idx})">'
+                f'\U0001f441 Samples</button>'
+            )
+            chart_html = btn + chart_html
+        return (label, chart_html)
 
     from concurrent.futures import ThreadPoolExecutor
     with ThreadPoolExecutor() as _pool:
@@ -2129,6 +2181,10 @@ def generate_html_report(results, html_path, msd_path, units=None,
   h2 {{ font-size: 16px; color: #3a506b; margin: 20px 0 12px; font-weight: 700; }}
   .section {{ background: white; border-radius: 6px; box-shadow: 0 1px 4px rgba(0,0,0,0.08);
                padding: 20px; margin-bottom: 24px; }}
+  .curve-toggle-btn {{ padding: 5px 14px; border: none; border-radius: 4px; cursor: pointer;
+                       font-size: 12px; font-weight: 600; background: #27AE60; color: white;
+                       margin-bottom: 6px; display: inline-block; }}
+  .curve-toggle-btn:hover {{ background: #1e8449; }}
 </style>
 </head>
 <body>
@@ -2269,6 +2325,13 @@ function msdOverlayAll(show) {{
     b.setAttribute('data-active', show ? '1' : '0');
     b.style.opacity = show ? '1.0' : '0.4';
   }});
+}}
+function msdToggleCurveSamples(btn, divId, traceIdx) {{
+  var gd = document.getElementById(divId);
+  var active = btn.getAttribute('data-active') === '1';
+  Plotly.restyle(gd, {{visible: active ? false : true}}, [traceIdx]);
+  btn.setAttribute('data-active', active ? '0' : '1');
+  btn.style.opacity = active ? '0.4' : '1.0';
 }}
 </script>
 </body>
