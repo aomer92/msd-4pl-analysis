@@ -1606,8 +1606,8 @@ def generate_html_report(results, html_path, msd_path, units=None,
     overlay_fig = go.Figure()
     colors = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd',
               '#8c564b', '#e377c2', '#7f7f7f', '#bcbd22', '#17becf']
-    _group_trace_indices = defaultdict(list)  # group → [trace indices] for toggle buttons
-    _overlay_sample_trace_indices = []        # all sample scatter traces (for global toggle)
+    _group_trace_indices = defaultdict(list)        # group → [trace indices] for toggle buttons
+    _overlay_sample_indices_by_group = defaultdict(list)  # group → sample trace indices only
 
     # Build a stable group→color map (one color per unique group, first-seen order)
     # so that curve traces and expected-concentration bands share the same color.
@@ -1664,7 +1664,7 @@ def generate_html_report(results, html_path, msd_path, units=None,
         if _unk_xs:
             _sample_tidx = len(overlay_fig.data)
             _group_trace_indices[group or ''].append(_sample_tidx)
-            _overlay_sample_trace_indices.append(_sample_tidx)
+            _overlay_sample_indices_by_group[group or ''].append(_sample_tidx)
             overlay_fig.add_trace(go.Scatter(
                 x=_unk_xs, y=_unk_ys,
                 mode='markers', name=f'{trace_label} samples',
@@ -1878,13 +1878,6 @@ def generate_html_report(results, html_path, msd_path, units=None,
             f'<button style="{_bs}background:#888;color:white;" '
             f'onclick="msdOverlayAll(false)">Hide All</button>',
         ]
-        if _overlay_sample_trace_indices:
-            _btn_parts.append(
-                f'<button data-active="1" '
-                f'style="{_bs}background:#27AE60;color:white;margin-left:8px;" '
-                f'onclick="msdToggleGrp(this,{_json.dumps(_overlay_sample_trace_indices)},[])">'
-                f'\U0001f441️ Samples</button>'
-            )
         for _grp in sorted(_group_trace_indices.keys()):
             _tidxs = _group_trace_indices[_grp]
             _sidxs = _group_shape_indices.get(_grp, [])
@@ -1897,6 +1890,23 @@ def generate_html_report(results, html_path, msd_path, units=None,
                 f'{_display}</button>'
             )
         _btn_parts.append('</div>')
+        # Per-group Samples toggle row (only shown when at least one group has samples)
+        if _overlay_sample_indices_by_group:
+            _btn_parts.append(
+                '<div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:10px;align-items:center;">'
+                '<span style="font-size:12px;color:#555;font-weight:600;margin-right:4px;">Samples:</span>'
+            )
+            for _grp in sorted(_overlay_sample_indices_by_group.keys()):
+                _sidxs = _overlay_sample_indices_by_group[_grp]
+                _clr = _group_color_map.get(_grp, '#27AE60')
+                _display = _grp if _grp and _grp != '_default' else 'Default'
+                _btn_parts.append(
+                    f'<button data-active="1" '
+                    f'style="{_bs}background:{_clr};color:white;opacity:0.75;" '
+                    f'onclick="msdToggleGrp(this,{_json.dumps(_sidxs)},[])">'
+                    f'\U0001f441️ {_display}</button>'
+                )
+            _btn_parts.append('</div>')
         _overlay_btns = ''.join(_btn_parts)
 
     # ── Summary table rows ────────────────────────────────────────────────────
