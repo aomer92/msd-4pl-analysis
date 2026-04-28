@@ -1838,7 +1838,7 @@ def generate_html_report(results, html_path, msd_path, units=None,
         _lloq_legend_y = 0.15
 
     overlay_fig.update_layout(
-        title=dict(text='Standard Curve Overlay', x=0.5),
+        title=dict(text='Standard Curve Overlay', x=0.5, y=0.98, yanchor='top'),
         xaxis=dict(title=f'Concentration{unit_suffix}', type='log',
                    showgrid=True, gridcolor='#eee',
                    exponentformat='power', showexponent='all',
@@ -1847,18 +1847,26 @@ def generate_html_report(results, html_path, msd_path, units=None,
                    showgrid=True, gridcolor='#eee',
                    exponentformat='power', showexponent='all'),
         plot_bgcolor='white', paper_bgcolor='white',
-        legend=dict(orientation='v', x=1.02, y=1,
-                    itemclick='toggle', itemdoubleclick='toggleothers'),
+        # Main legend: horizontal, wraps into multiple rows above the plot
+        legend=dict(
+            orientation='h',
+            x=0, xanchor='left',
+            y=1.0, yanchor='bottom',
+            itemclick='toggle', itemdoubleclick='toggleothers',
+            font=dict(size=11),
+            tracegroupgap=4,
+        ),
+        # LLOQ legend: compact vertical strip on the right
         legend2=dict(
             orientation='v',
-            x=1.02, y=_lloq_legend_y,
-            yanchor='middle',
+            x=1.02, y=0.5,
+            xanchor='left', yanchor='middle',
             bgcolor='rgba(0,0,0,0)',
             borderwidth=0,
             font=dict(size=10),
         ),
-        margin=dict(l=60, r=340, t=60, b=60),
-        height=520
+        margin=dict(l=60, r=220, t=180, b=60),
+        height=580
     )
     overlay_div = overlay_fig.to_html(full_html=False, include_plotlyjs=False,
                                        div_id='overlay_chart', config={'responsive': True})
