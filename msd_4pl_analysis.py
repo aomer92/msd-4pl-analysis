@@ -2565,13 +2565,21 @@ function spRenderGroupPanel() {{
     var hdr = document.createElement('div');
     hdr.className = 'sp-group-header';
     hdr.style.background = g.color;
+    var isFirst = (spGroups.indexOf(g) === 0);
+    var isLast  = (spGroups.indexOf(g) === spGroups.length - 1);
+    var btnStyle = 'background:rgba(255,255,255,0.25);color:white;border-color:rgba(255,255,255,0.4);';
+    var btnDisabled = 'background:rgba(255,255,255,0.08);color:rgba(255,255,255,0.3);border-color:rgba(255,255,255,0.15);cursor:default;';
     hdr.innerHTML =
       '<span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="' + g.name + '">' + g.name + '</span>' +
-      '<button class="sp-btn sp-btn-icon" style="background:rgba(255,255,255,0.25);color:white;border-color:rgba(255,255,255,0.4);" ' +
+      '<button class="sp-btn sp-btn-icon" style="' + (isFirst ? btnDisabled : btnStyle) + '" ' +
+        (isFirst ? 'disabled ' : 'onclick="spMoveGroup(' + g.id + ',-1)" ') + 'title="Move up">&#x25B4;</button>' +
+      '<button class="sp-btn sp-btn-icon" style="' + (isLast  ? btnDisabled : btnStyle) + '" ' +
+        (isLast  ? 'disabled ' : 'onclick="spMoveGroup(' + g.id + ',1)" ')  + 'title="Move down">&#x25BE;</button>' +
+      '<button class="sp-btn sp-btn-icon" style="' + btnStyle + '" ' +
         'onclick="spRenameGroup(' + g.id + ')" title="Rename group">&#x270F;</button>' +
-      '<button class="sp-btn sp-btn-icon" style="background:rgba(255,255,255,0.25);color:white;border-color:rgba(255,255,255,0.4);" ' +
+      '<button class="sp-btn sp-btn-icon" style="' + btnStyle + '" ' +
         'onclick="spToggleGroup(' + g.id + ')" title="Show/hide in chart">' + (g.visible ? '&#128065;' : '&#128564;') + '</button>' +
-      '<button class="sp-btn sp-btn-icon" style="background:rgba(255,255,255,0.25);color:white;border-color:rgba(255,255,255,0.4);" ' +
+      '<button class="sp-btn sp-btn-icon" style="' + btnStyle + '" ' +
         'onclick="spDeleteGroup(' + g.id + ')" title="Delete group">&#x2715;</button>';
     block.appendChild(hdr);
     // Drop zone
@@ -2711,6 +2719,16 @@ function spAssignChecked() {{
   spRenderChart();
 }}
 
+function spMoveGroup(id, dir) {{
+  var idx = spGroups.findIndex(function(x) {{ return x.id == id; }});
+  var newIdx = idx + dir;
+  if (newIdx < 0 || newIdx >= spGroups.length) return;
+  var tmp = spGroups[idx];
+  spGroups[idx] = spGroups[newIdx];
+  spGroups[newIdx] = tmp;
+  spRenderGroupPanel();
+  spRenderChart();
+}}
 function spRenameGroup(id) {{
   var g = spGroups.find(function(x) {{ return x.id == id; }});
   if (!g) return;
