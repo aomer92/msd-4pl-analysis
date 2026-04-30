@@ -2053,6 +2053,7 @@ def generate_html_report(results, html_path, msd_path, units=None,
                 d['concs'].append(u['interp_conc'])
             d['wells'].append(u['well'])
 
+    _sp_entries = []
     tp_index = defaultdict(int)
     unk_rows_html = []
     for (sname, group, plate), data in sorted(all_unk_groups.items()):
@@ -2096,6 +2097,9 @@ def generate_html_report(results, html_path, msd_path, units=None,
             else:
                 factor = plate_dilution_factors.get(plate, 1.0)
         corrected = avg_conc * factor if np.isfinite(avg_conc) else np.nan
+        if np.isfinite(corrected) and not _identify_qc_level(sname):
+            _sp_entries.append({'analyte': group or 'Default', 'sample': sname,
+                                'conc': float(corrected), 'flag': flag, 'plate': plate})
 
         # Total protein & normalized (same in-order assignment as create_output)
         animal, tissue = _extract_animal_tissue(sname)
@@ -2132,6 +2136,28 @@ def generate_html_report(results, html_path, msd_path, units=None,
             f"<td>{factor_str}</td><td>{corr_str}</td>"
             f"<td>{tp_str}</td><td>{norm_str}</td></tr>"
         )
+
+    # ── Sample plot JSON ──────────────────────────────────────────────────────
+    _sp_by_analyte = defaultdict(lambda: defaultdict(list))
+    for e in _sp_entries:
+        _sp_by_analyte[e['analyte']][e['sample']].append({'conc': e['conc'], 'flag': e['flag'], 'plate': e['plate']})
+
+    _sp_data = {'analytes': [], 'units': units or '', 'samples': {}}
+    for _sp_analyte in sorted(_sp_by_analyte.keys()):
+        _sp_data['analytes'].append(_sp_analyte)
+        _sp_data['samples'][_sp_analyte] = []
+        for _sp_sname in sorted(_sp_by_analyte[_sp_analyte].keys()):
+            _sp_elist = _sp_by_analyte[_sp_analyte][_sp_sname]
+            _sp_concs = [_e['conc'] for _e in _sp_elist]
+            _sp_flags = [_e['flag'] for _e in _sp_elist]
+            _sp_mean = float(np.mean(_sp_concs))
+            _sp_sd = float(np.std(_sp_concs, ddof=1)) if len(_sp_concs) > 1 else 0.0
+            _sp_any_flagged = any(f != 'In Range' for f in _sp_flags)
+            _sp_data['samples'][_sp_analyte].append({
+                'name': _sp_sname, 'mean': _sp_mean, 'sd': _sp_sd,
+                'values': _sp_concs, 'flags': _sp_flags, 'anyFlagged': _sp_any_flagged
+            })
+    _sp_json = _json.dumps(_sp_data)
 
     # ── Assemble curve cards HTML ─────────────────────────────────────────────
     curves_section_html = '\n'.join(
@@ -2241,6 +2267,24 @@ def generate_html_report(results, html_path, msd_path, units=None,
                        font-size: 12px; font-weight: 600; background: #27AE60; color: white;
                        margin-bottom: 6px; display: inline-block; }}
   .curve-toggle-btn:hover {{ background: #1e8449; }}
+  .sp-panel {{ background:white;border-radius:6px;box-shadow:0 1px 4px rgba(0,0,0,0.08);padding:14px; }}
+  .sp-drop-zone {{ min-height:80px;border:2px dashed #ccc;border-radius:4px;padding:6px;display:flex;flex-wrap:wrap;gap:4px;align-content:flex-start;transition:background 0.15s; }}
+  .sp-drop-zone.drag-over {{ background:#e8f4fd;border-color:#2F5496; }}
+  .sp-chip {{ display:inline-flex;align-items:center;gap:4px;padding:3px 8px;border-radius:12px;font-size:11px;cursor:grab;user-select:none;border:1px solid rgba(0,0,0,0.15);background:white; }}
+  .sp-chip.flagged {{ border-color:#c0392b;color:#c0392b; }}
+  .sp-chip input[type=checkbox] {{ cursor:pointer;margin:0; }}
+  .sp-group-block {{ margin-bottom:10px;border-radius:6px;overflow:hidden;border:1px solid #ddd; }}
+  .sp-group-header {{ display:flex;align-items:center;gap:6px;padding:6px 10px;font-size:12px;font-weight:600;color:white; }}
+  .sp-group-drop {{ min-height:36px;padding:6px;display:flex;flex-wrap:wrap;gap:4px;align-content:flex-start; }}
+  .sp-btn {{ padding:5px 12px;border:1px solid #ccc;border-radius:4px;cursor:pointer;font-size:12px;background:white;color:#333; }}
+  .sp-btn:hover {{ background:#f0f0f0; }}
+  .sp-btn-primary {{ background:#2F5496;color:white;border-color:#2F5496; }}
+  .sp-btn-primary:hover {{ background:#3a65b5; }}
+  .sp-btn-icon {{ padding:3px 7px;font-size:11px;border-radius:3px; }}
+  .sp-sort-btn {{ background:white; }}
+  .active-sort {{ background:#2F5496 !important;color:white !important;border-color:#2F5496 !important; }}
+  .sp-analyte-btn {{ padding:7px 18px;border:none;border-radius:4px;cursor:pointer;font-size:13px;font-weight:500;background:#dde3ec;color:#333; }}
+  .sp-analyte-btn.active {{ background:#2F5496;color:white; }}
 </style>
 </head>
 <body>
@@ -2255,6 +2299,7 @@ def generate_html_report(results, html_path, msd_path, units=None,
   <button class="tab-btn active" onclick="showTab('summary', this)">Summary</button>
   <button class="tab-btn" onclick="showTab('curves', this)">Standard Curves</button>
   <button class="tab-btn" onclick="showTab('unknowns', this)">All Unknowns</button>
+  <button class="tab-btn" onclick="showTab('sampleplots', this)">Sample Plots</button>
   <div style="margin-left:auto;display:flex;align-items:center;gap:8px;padding-right:12px;">
     {excel_btn_html}
     <button class="export-btn" onclick="window.print()">⬇ Export PDF</button>
@@ -2310,6 +2355,41 @@ def generate_html_report(results, html_path, msd_path, units=None,
     </div>
   </div>
 
+  <div id="tab-sampleplots" class="tab-pane">
+    <h2>Sample Plots</h2>
+    <div id="sp-analyte-bar" style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:14px;"></div>
+    <div style="display:grid;grid-template-columns:280px 1fr;gap:16px;margin-bottom:16px;">
+      <div style="display:flex;flex-direction:column;gap:10px;">
+        <div class="sp-panel">
+          <div style="font-weight:600;font-size:13px;color:#3a506b;margin-bottom:8px;">
+            Unassigned Samples
+            <label style="font-weight:400;font-size:12px;float:right;cursor:pointer;">
+              <input type="checkbox" id="sp-show-unassigned" checked onchange="spRenderChart()"> Show
+            </label>
+          </div>
+          <div id="sp-unassigned-pool" class="sp-drop-zone" ondragover="spDragOver(event)" ondrop="spDrop(event,'__unassigned__')"></div>
+          <div style="margin-top:8px;display:flex;gap:6px;align-items:center;flex-wrap:wrap;">
+            <button class="sp-btn sp-btn-primary" onclick="spAssignChecked()">Assign to Group &#x2192;</button>
+            <button class="sp-btn" onclick="spCreateGroup()">&#xFF0B; New Group</button>
+          </div>
+        </div>
+        <div class="sp-panel" style="flex:1;">
+          <div style="font-weight:600;font-size:13px;color:#3a506b;margin-bottom:8px;">Groups</div>
+          <div id="sp-groups-container"></div>
+        </div>
+      </div>
+      <div>
+        <div style="display:flex;gap:8px;align-items:center;margin-bottom:10px;flex-wrap:wrap;">
+          <span style="font-size:12px;font-weight:600;color:#555;">Sort:</span>
+          <button class="sp-btn sp-sort-btn active-sort" id="sp-sort-group" onclick="spSetSort('group',this)">By Group</button>
+          <button class="sp-btn sp-sort-btn" id="sp-sort-asc" onclick="spSetSort('asc',this)">Value &#x2191;</button>
+          <button class="sp-btn sp-sort-btn" id="sp-sort-desc" onclick="spSetSort('desc',this)">Value &#x2193;</button>
+        </div>
+        <div id="sp-chart" style="width:100%;"></div>
+      </div>
+    </div>
+  </div>
+
 </div>
 
 <script>
@@ -2321,6 +2401,7 @@ function showTab(name, btn) {{
   btn.classList.add('active');
   // Resize all Plotly charts now that their containers are visible
   pane.querySelectorAll('.js-plotly-plot').forEach(el => Plotly.Plots.resize(el));
+  if (name === 'sampleplots') spInit();
 }}
 
 function sortTable(th) {{
@@ -2389,6 +2470,424 @@ function msdToggleCurveSamples(btn, divId, traceIdx) {{
   btn.setAttribute('data-active', active ? '0' : '1');
   btn.style.opacity = active ? '0.4' : '1.0';
 }}
+
+// ── Sample Plots Tab ─────────────────────────────────────────────────────────
+var SP_DATA = {_sp_json};
+var spInitialized = false;
+var spCurrentAnalyte = null;
+var spGroups = [];          // [{{id, name, color, visible, samples:[]}}]
+var spUnassigned = [];      // [sampleName, ...]
+var spSortMode = 'group';
+var spGroupIdCounter = 0;
+var spDragPayload = null;   // {{name, fromGroup}}
+var SP_PALETTE = ['#1f77b4','#ff7f0e','#2ca02c','#9467bd','#8c564b','#e377c2','#17becf','#bcbd22'];
+
+function spNextColor() {{
+  return SP_PALETTE[spGroups.length % SP_PALETTE.length];
+}}
+
+function spInit() {{
+  if (!spInitialized) {{
+    spInitialized = true;
+    spGroups = [];
+    spGroupIdCounter = 0;
+    spSortMode = 'group';
+    var analytes = SP_DATA.analytes || [];
+    spCurrentAnalyte = analytes.length > 0 ? analytes[0] : null;
+    // Populate unassigned with all samples for current analyte
+    spUnassigned = spCurrentAnalyte && SP_DATA.samples[spCurrentAnalyte]
+      ? SP_DATA.samples[spCurrentAnalyte].map(function(s) {{ return s.name; }})
+      : [];
+    spBuildAnalyteBar();
+  }}
+  spRenderGroupPanel();
+  spRenderChart();
+}}
+
+function spBuildAnalyteBar() {{
+  var bar = document.getElementById('sp-analyte-bar');
+  if (!bar) return;
+  bar.innerHTML = '';
+  (SP_DATA.analytes || []).forEach(function(a) {{
+    var btn = document.createElement('button');
+    btn.className = 'sp-analyte-btn' + (a === spCurrentAnalyte ? ' active' : '');
+    btn.textContent = a;
+    btn.onclick = function() {{ spSelectAnalyte(a); }};
+    bar.appendChild(btn);
+  }});
+}}
+
+function spSelectAnalyte(name) {{
+  spCurrentAnalyte = name;
+  // Update unassigned: samples in current analyte not already in a group
+  var allSamples = SP_DATA.samples[name] ? SP_DATA.samples[name].map(function(s) {{ return s.name; }}) : [];
+  var inGroups = {{}};
+  spGroups.forEach(function(g) {{ g.samples.forEach(function(s) {{ inGroups[s] = true; }}); }});
+  spUnassigned = allSamples.filter(function(s) {{ return !inGroups[s]; }});
+  document.querySelectorAll('.sp-analyte-btn').forEach(function(b) {{
+    b.classList.toggle('active', b.textContent === name);
+  }});
+  spRenderGroupPanel();
+  spRenderChart();
+}}
+
+function spGetSampleData(sname) {{
+  if (!spCurrentAnalyte || !SP_DATA.samples[spCurrentAnalyte]) return null;
+  var arr = SP_DATA.samples[spCurrentAnalyte];
+  for (var i = 0; i < arr.length; i++) {{
+    if (arr[i].name === sname) return arr[i];
+  }}
+  return null;
+}}
+
+function spRenderGroupPanel() {{
+  // Unassigned pool
+  var pool = document.getElementById('sp-unassigned-pool');
+  if (pool) {{
+    pool.innerHTML = '';
+    spUnassigned.forEach(function(sname) {{
+      pool.appendChild(spMakeChip(sname, '__unassigned__'));
+    }});
+  }}
+  // Groups container
+  var gc = document.getElementById('sp-groups-container');
+  if (!gc) return;
+  gc.innerHTML = '';
+  spGroups.forEach(function(g) {{
+    var block = document.createElement('div');
+    block.className = 'sp-group-block';
+    // Header
+    var hdr = document.createElement('div');
+    hdr.className = 'sp-group-header';
+    hdr.style.background = g.color;
+    hdr.innerHTML =
+      '<span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="' + g.name + '">' + g.name + '</span>' +
+      '<button class="sp-btn sp-btn-icon" style="background:rgba(255,255,255,0.25);color:white;border-color:rgba(255,255,255,0.4);" ' +
+        'onclick="spToggleGroup(' + g.id + ')" title="Show/hide in chart">' + (g.visible ? '&#128065;' : '&#128564;') + '</button>' +
+      '<button class="sp-btn sp-btn-icon" style="background:rgba(255,255,255,0.25);color:white;border-color:rgba(255,255,255,0.4);" ' +
+        'onclick="spDeleteGroup(' + g.id + ')" title="Delete group">&#x2715;</button>';
+    block.appendChild(hdr);
+    // Drop zone
+    var dz = document.createElement('div');
+    dz.className = 'sp-group-drop sp-drop-zone';
+    dz.setAttribute('ondragover', 'spDragOver(event)');
+    dz.setAttribute('ondrop', "spDrop(event,'" + g.id + "')");
+    g.samples.forEach(function(sname) {{
+      dz.appendChild(spMakeChip(sname, g.id));
+    }});
+    block.appendChild(dz);
+    gc.appendChild(block);
+  }});
+}}
+
+function spMakeChip(sname, groupId) {{
+  var d = spGetSampleData(sname);
+  var flagged = d && d.anyFlagged;
+  var span = document.createElement('span');
+  span.className = 'sp-chip' + (flagged ? ' flagged' : '');
+  span.draggable = true;
+  span.title = sname;
+  var label = (flagged ? '⚠ ' : '') + sname;
+  if (groupId === '__unassigned__') {{
+    // Add checkbox for assign-to-group
+    var cb = document.createElement('input');
+    cb.type = 'checkbox';
+    cb.setAttribute('data-sample', sname);
+    cb.onclick = function(e) {{ e.stopPropagation(); }};
+    span.appendChild(cb);
+  }}
+  var txt = document.createElement('span');
+  txt.textContent = label;
+  txt.style.maxWidth = '120px';
+  txt.style.overflow = 'hidden';
+  txt.style.textOverflow = 'ellipsis';
+  txt.style.whiteSpace = 'nowrap';
+  span.appendChild(txt);
+  span.addEventListener('dragstart', function(e) {{ spDragStart(e, sname, groupId); }});
+  span.addEventListener('dragend', function(e) {{ spDragEnd(e); }});
+  return span;
+}}
+
+function spDragStart(e, name, fromGroup) {{
+  spDragPayload = {{name: name, fromGroup: fromGroup}};
+  e.dataTransfer.effectAllowed = 'move';
+  e.currentTarget.style.opacity = '0.4';
+}}
+
+function spDragEnd(e) {{
+  e.currentTarget.style.opacity = '1';
+  document.querySelectorAll('.sp-drop-zone').forEach(function(z) {{
+    z.classList.remove('drag-over');
+  }});
+}}
+
+function spDragOver(e) {{
+  e.preventDefault();
+  e.dataTransfer.dropEffect = 'move';
+  var zone = e.currentTarget.closest('.sp-drop-zone');
+  if (zone) zone.classList.add('drag-over');
+}}
+
+function spDrop(e, toGroupId) {{
+  e.preventDefault();
+  document.querySelectorAll('.sp-drop-zone').forEach(function(z) {{ z.classList.remove('drag-over'); }});
+  if (!spDragPayload) return;
+  var name = spDragPayload.name;
+  var fromGroup = spDragPayload.fromGroup;
+  spDragPayload = null;
+  if (fromGroup === toGroupId) return;
+  // Remove from source
+  if (fromGroup === '__unassigned__') {{
+    spUnassigned = spUnassigned.filter(function(s) {{ return s !== name; }});
+  }} else {{
+    var sg = spGroups.find(function(g) {{ return g.id == fromGroup; }});
+    if (sg) sg.samples = sg.samples.filter(function(s) {{ return s !== name; }});
+  }}
+  // Add to destination
+  if (toGroupId === '__unassigned__') {{
+    if (spUnassigned.indexOf(name) === -1) spUnassigned.push(name);
+  }} else {{
+    var tg = spGroups.find(function(g) {{ return g.id == toGroupId; }});
+    if (tg && tg.samples.indexOf(name) === -1) tg.samples.push(name);
+  }}
+  spRenderGroupPanel();
+  spRenderChart();
+}}
+
+function spCreateGroup() {{
+  var name = prompt('Group name:');
+  if (!name || !name.trim()) return;
+  name = name.trim();
+  spGroups.push({{
+    id: ++spGroupIdCounter,
+    name: name,
+    color: spNextColor(),
+    visible: true,
+    samples: []
+  }});
+  spRenderGroupPanel();
+  spRenderChart();
+}}
+
+function spAssignChecked() {{
+  var checked = [];
+  document.querySelectorAll('#sp-unassigned-pool input[type=checkbox]:checked').forEach(function(cb) {{
+    checked.push(cb.getAttribute('data-sample'));
+  }});
+  if (!checked.length) {{ alert('Check at least one sample first.'); return; }}
+  var name = prompt('Assign to group name:');
+  if (!name || !name.trim()) return;
+  name = name.trim();
+  var g = spGroups.find(function(x) {{ return x.name === name; }});
+  if (!g) {{
+    g = {{ id: ++spGroupIdCounter, name: name, color: spNextColor(), visible: true, samples: [] }};
+    spGroups.push(g);
+  }}
+  checked.forEach(function(s) {{
+    spUnassigned = spUnassigned.filter(function(u) {{ return u !== s; }});
+    if (g.samples.indexOf(s) === -1) g.samples.push(s);
+  }});
+  spRenderGroupPanel();
+  spRenderChart();
+}}
+
+function spDeleteGroup(id) {{
+  var g = spGroups.find(function(x) {{ return x.id == id; }});
+  if (!g) return;
+  // Return samples to unassigned
+  g.samples.forEach(function(s) {{
+    if (spUnassigned.indexOf(s) === -1) spUnassigned.push(s);
+  }});
+  spGroups = spGroups.filter(function(x) {{ return x.id != id; }});
+  spRenderGroupPanel();
+  spRenderChart();
+}}
+
+function spToggleGroup(id) {{
+  var g = spGroups.find(function(x) {{ return x.id == id; }});
+  if (!g) return;
+  g.visible = !g.visible;
+  spRenderGroupPanel();
+  spRenderChart();
+}}
+
+function spSetSort(mode, btn) {{
+  spSortMode = mode;
+  document.querySelectorAll('.sp-sort-btn').forEach(function(b) {{ b.classList.remove('active-sort'); }});
+  btn.classList.add('active-sort');
+  spRenderChart();
+}}
+
+function spRenderChart() {{
+  if (!spCurrentAnalyte || !SP_DATA.samples[spCurrentAnalyte]) {{
+    Plotly.purge('sp-chart');
+    return;
+  }}
+  var allData = SP_DATA.samples[spCurrentAnalyte];
+  var showUnassigned = document.getElementById('sp-show-unassigned') ? document.getElementById('sp-show-unassigned').checked : true;
+  var units = SP_DATA.units || '';
+  var yTitle = 'Concentration' + (units ? ' (' + units + ')' : '');
+
+  // Build ordered list of {{sname, color, groupName}} segments
+  var segments = [];  // [{{groupName, color, items:[sampleName]}}]
+
+  spGroups.forEach(function(g) {{
+    if (!g.visible) return;
+    var items = g.samples.filter(function(s) {{
+      return allData.some(function(d) {{ return d.name === s; }});
+    }});
+    if (spSortMode === 'asc') {{
+      items.sort(function(a, b) {{
+        var da = allData.find(function(d) {{ return d.name === a; }});
+        var db = allData.find(function(d) {{ return d.name === b; }});
+        return (da ? da.mean : 0) - (db ? db.mean : 0);
+      }});
+    }} else if (spSortMode === 'desc') {{
+      items.sort(function(a, b) {{
+        var da = allData.find(function(d) {{ return d.name === a; }});
+        var db = allData.find(function(d) {{ return d.name === b; }});
+        return (db ? db.mean : 0) - (da ? da.mean : 0);
+      }});
+    }}
+    if (items.length) segments.push({{groupName: g.name, color: g.color, items: items}});
+  }});
+
+  var unassignedItems = showUnassigned
+    ? spUnassigned.filter(function(s) {{ return allData.some(function(d) {{ return d.name === s; }}); }})
+    : [];
+  if (spSortMode === 'asc') {{
+    unassignedItems.sort(function(a, b) {{
+      var da = allData.find(function(d) {{ return d.name === a; }});
+      var db = allData.find(function(d) {{ return d.name === b; }});
+      return (da ? da.mean : 0) - (db ? db.mean : 0);
+    }});
+  }} else if (spSortMode === 'desc') {{
+    unassignedItems.sort(function(a, b) {{
+      var da = allData.find(function(d) {{ return d.name === a; }});
+      var db = allData.find(function(d) {{ return d.name === b; }});
+      return (db ? db.mean : 0) - (da ? da.mean : 0);
+    }});
+  }}
+  if (unassignedItems.length) segments.push({{groupName: 'Unassigned', color: 'rgba(150,150,150,0.7)', items: unassignedItems}});
+
+  // Flatten to ordered x-axis labels
+  var orderedNames = [];
+  segments.forEach(function(seg) {{ seg.items.forEach(function(s) {{ orderedNames.push(s); }}); }});
+
+  if (!orderedNames.length) {{
+    Plotly.purge('sp-chart');
+    return;
+  }}
+
+  // Build traces per group-segment
+  var traces = [];
+  var shapes = [];
+  var xCursor = 0;
+
+  segments.forEach(function(seg, si) {{
+    var xVals = [];
+    var yMeans = [];
+    var ySDs = [];
+    var barColors = [];
+    var scatterX = [];
+    var scatterY = [];
+    var scatterColors = [];
+
+    seg.items.forEach(function(sname) {{
+      var d = allData.find(function(x) {{ return x.name === sname; }});
+      if (!d) return;
+      var flagged = d.anyFlagged;
+      var barColor = flagged ? 'rgba(200,50,50,0.8)' : seg.color;
+      xVals.push(sname);
+      yMeans.push(d.mean);
+      ySDs.push(d.sd || 0);
+      barColors.push(barColor);
+      // Individual points
+      (d.values || []).forEach(function(v) {{
+        scatterX.push(sname);
+        scatterY.push(v);
+        scatterColors.push(flagged ? 'rgba(180,20,20,0.9)' : seg.color);
+      }});
+    }});
+
+    // Separator shape before this segment (except the first)
+    if (si > 0 && xCursor > 0) {{
+      shapes.push({{
+        type: 'line',
+        xref: 'x', yref: 'paper',
+        x0: xCursor - 0.5, x1: xCursor - 0.5,
+        y0: 0, y1: 1,
+        line: {{ color: '#aaa', width: 1, dash: 'dot' }}
+      }});
+    }}
+
+    // Bar trace
+    traces.push({{
+      type: 'bar',
+      name: seg.groupName,
+      x: xVals,
+      y: yMeans,
+      error_y: {{
+        type: 'data',
+        array: ySDs,
+        visible: true,
+        color: '#444',
+        thickness: 1.5,
+        width: 4
+      }},
+      marker: {{ color: barColors }},
+      showlegend: true,
+      legendgroup: seg.groupName,
+      hovertemplate: '<b>%{{x}}</b><br>Mean: %{{y:.4g}}<extra>' + seg.groupName + '</extra>'
+    }});
+
+    // Scatter trace for individual points
+    if (scatterX.length) {{
+      traces.push({{
+        type: 'scatter',
+        mode: 'markers',
+        name: seg.groupName + ' pts',
+        x: scatterX,
+        y: scatterY,
+        marker: {{
+          color: scatterColors,
+          size: 6,
+          symbol: 'circle',
+          line: {{ color: 'rgba(0,0,0,0.4)', width: 1 }}
+        }},
+        showlegend: false,
+        legendgroup: seg.groupName,
+        hovertemplate: '<b>%{{x}}</b><br>Value: %{{y:.4g}}<extra></extra>'
+      }});
+    }}
+
+    xCursor += seg.items.length;
+  }});
+
+  var layout = {{
+    barmode: 'group',
+    height: 460,
+    margin: {{ l: 60, r: 40, t: 40, b: 160 }},
+    xaxis: {{
+      tickangle: -40,
+      automargin: true,
+      categoryorder: 'array',
+      categoryarray: orderedNames
+    }},
+    yaxis: {{
+      title: yTitle,
+      automargin: true,
+      rangemode: 'tozero'
+    }},
+    shapes: shapes,
+    legend: {{ orientation: 'h', x: 0, y: 1.08 }},
+    paper_bgcolor: 'white',
+    plot_bgcolor: 'white'
+  }};
+
+  Plotly.react('sp-chart', traces, layout, {{responsive: true}});
+}}
+// ── End Sample Plots Tab ─────────────────────────────────────────────────────
 </script>
 </body>
 </html>"""
