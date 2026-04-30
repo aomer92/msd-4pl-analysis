@@ -2568,6 +2568,8 @@ function spRenderGroupPanel() {{
     hdr.innerHTML =
       '<span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="' + g.name + '">' + g.name + '</span>' +
       '<button class="sp-btn sp-btn-icon" style="background:rgba(255,255,255,0.25);color:white;border-color:rgba(255,255,255,0.4);" ' +
+        'onclick="spRenameGroup(' + g.id + ')" title="Rename group">&#x270F;</button>' +
+      '<button class="sp-btn sp-btn-icon" style="background:rgba(255,255,255,0.25);color:white;border-color:rgba(255,255,255,0.4);" ' +
         'onclick="spToggleGroup(' + g.id + ')" title="Show/hide in chart">' + (g.visible ? '&#128065;' : '&#128564;') + '</button>' +
       '<button class="sp-btn sp-btn-icon" style="background:rgba(255,255,255,0.25);color:white;border-color:rgba(255,255,255,0.4);" ' +
         'onclick="spDeleteGroup(' + g.id + ')" title="Delete group">&#x2715;</button>';
@@ -2709,6 +2711,15 @@ function spAssignChecked() {{
   spRenderChart();
 }}
 
+function spRenameGroup(id) {{
+  var g = spGroups.find(function(x) {{ return x.id == id; }});
+  if (!g) return;
+  var newName = prompt('Rename group:', g.name);
+  if (newName === null || newName.trim() === '') return;
+  g.name = newName.trim();
+  spRenderGroupPanel();
+  spRenderChart();
+}}
 function spDeleteGroup(id) {{
   var g = spGroups.find(function(x) {{ return x.id == id; }});
   if (!g) return;
