@@ -2751,7 +2751,7 @@ function spRenderChart() {{
   var allData = SP_DATA.samples[spCurrentAnalyte];
   var showUnassigned = document.getElementById('sp-show-unassigned') ? document.getElementById('sp-show-unassigned').checked : true;
   var units = SP_DATA.units || '';
-  var yTitle = 'Concentration' + (units ? ' (' + units + ')' : '');
+  var yTitle = spCurrentAnalyte + ' Concentration' + (units ? ' (' + units + ')' : '');
 
   // Build ordered list of {{sname, color, groupName}} segments
   var segments = [];  // [{{groupName, color, items:[sampleName]}}]
