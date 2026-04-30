@@ -2930,7 +2930,7 @@ function spRenderChart() {{
   var layout = {{
     barmode: 'group',
     height: 460,
-    margin: {{ l: 60, r: 40, t: 40, b: 160 }},
+    margin: {{ l: 100, r: 40, t: 40, b: 160 }},
     xaxis: {{
       tickangle: -40,
       automargin: true,
@@ -2938,8 +2938,8 @@ function spRenderChart() {{
       categoryarray: orderedNames
     }},
     yaxis: {{
-      title: yTitle,
-      automargin: true,
+      title: {{ text: yTitle, standoff: 12 }},
+      automargin: false,
       rangemode: 'tozero'
     }},
     shapes: shapes,
