@@ -2361,11 +2361,14 @@ def generate_html_report(results, html_path, msd_path, units=None,
     <div style="display:grid;grid-template-columns:280px 1fr;gap:16px;margin-bottom:16px;">
       <div style="display:flex;flex-direction:column;gap:10px;">
         <div class="sp-panel">
-          <div style="font-weight:600;font-size:13px;color:#3a506b;margin-bottom:8px;">
+          <div style="font-weight:600;font-size:13px;color:#3a506b;margin-bottom:8px;display:flex;align-items:center;justify-content:space-between;">
             Unassigned Samples
-            <label style="font-weight:400;font-size:12px;float:right;cursor:pointer;">
-              <input type="checkbox" id="sp-show-unassigned" checked onchange="spRenderChart()"> Show
-            </label>
+            <span style="display:flex;gap:8px;align-items:center;">
+              <button class="sp-btn sp-btn-icon" id="sp-select-all-btn" onclick="spSelectAllUnassigned(this)" style="font-size:11px;">Select All</button>
+              <label style="font-weight:400;font-size:12px;cursor:pointer;">
+                <input type="checkbox" id="sp-show-unassigned" checked onchange="spRenderChart()"> Show
+              </label>
+            </span>
           </div>
           <div id="sp-unassigned-pool" class="sp-drop-zone" ondragover="spDragOver(event)" ondrop="spDrop(event,'__unassigned__')"></div>
           <div style="margin-top:8px;display:flex;gap:6px;align-items:center;flex-wrap:wrap;">
@@ -2718,6 +2721,12 @@ function spSetSort(mode, btn) {{
   spRenderChart();
 }}
 
+function spSelectAllUnassigned(btn) {{
+  var cbs = document.querySelectorAll('#sp-unassigned-pool input[type=checkbox]');
+  var allChecked = Array.from(cbs).every(function(cb) {{ return cb.checked; }});
+  cbs.forEach(function(cb) {{ cb.checked = !allChecked; }});
+  btn.textContent = allChecked ? 'Select All' : 'Deselect All';
+}}
 function spRenderChart() {{
   if (!spCurrentAnalyte || !SP_DATA.samples[spCurrentAnalyte]) {{
     Plotly.purge('sp-chart');
@@ -2749,7 +2758,7 @@ function spRenderChart() {{
         return (db ? db.mean : 0) - (da ? da.mean : 0);
       }});
     }}
-    if (items.length) segments.push({{groupName: g.name, color: g.color, items: items}});
+    if (items.length) segments.push({{groupName: g.name, color: g.color, items: items, collapsed: true}});
   }});
 
   var unassignedItems = showUnassigned
@@ -2768,11 +2777,17 @@ function spRenderChart() {{
       return (db ? db.mean : 0) - (da ? da.mean : 0);
     }});
   }}
-  if (unassignedItems.length) segments.push({{groupName: 'Unassigned', color: 'rgba(150,150,150,0.7)', items: unassignedItems}});
+  if (unassignedItems.length) segments.push({{groupName: 'Unassigned', color: 'rgba(150,150,150,0.7)', items: unassignedItems, collapsed: false}});
 
-  // Flatten to ordered x-axis labels
+  // Flatten to ordered x-axis labels (collapsed groups → group name; unassigned → sample names)
   var orderedNames = [];
-  segments.forEach(function(seg) {{ seg.items.forEach(function(s) {{ orderedNames.push(s); }}); }});
+  segments.forEach(function(seg) {{
+    if (seg.collapsed) {{
+      orderedNames.push(seg.groupName);
+    }} else {{
+      seg.items.forEach(function(s) {{ orderedNames.push(s); }});
+    }}
+  }});
 
   if (!orderedNames.length) {{
     Plotly.purge('sp-chart');
@@ -2792,23 +2807,54 @@ function spRenderChart() {{
     var scatterX = [];
     var scatterY = [];
     var scatterColors = [];
+    var scatterText = [];
 
-    seg.items.forEach(function(sname) {{
-      var d = allData.find(function(x) {{ return x.name === sname; }});
-      if (!d) return;
-      var flagged = d.anyFlagged;
-      var barColor = flagged ? 'rgba(200,50,50,0.8)' : seg.color;
-      xVals.push(sname);
-      yMeans.push(d.mean);
-      ySDs.push(d.sd || 0);
-      barColors.push(barColor);
-      // Individual points
-      (d.values || []).forEach(function(v) {{
-        scatterX.push(sname);
-        scatterY.push(v);
-        scatterColors.push(flagged ? 'rgba(180,20,20,0.9)' : seg.color);
+    if (seg.collapsed) {{
+      // One bar for the entire group; individual points are all sample values
+      var allVals = [], anyFlagged = false, sampleMeans = [];
+      seg.items.forEach(function(sname) {{
+        var d = allData.find(function(x) {{ return x.name === sname; }});
+        if (!d) return;
+        if (d.anyFlagged) anyFlagged = true;
+        sampleMeans.push(d.mean);
+        (d.values || []).forEach(function(v) {{
+          allVals.push({{v: v, sname: sname, flagged: d.anyFlagged || false}});
+        }});
       }});
-    }});
+      var grpMean = sampleMeans.length ? sampleMeans.reduce(function(a,b){{return a+b;}},0)/sampleMeans.length : 0;
+      var grpSD = 0;
+      if (allVals.length > 1) {{
+        var vm = allVals.reduce(function(a,b){{return a+b.v;}},0)/allVals.length;
+        grpSD = Math.sqrt(allVals.reduce(function(a,b){{return a+Math.pow(b.v-vm,2);}},0)/(allVals.length-1));
+      }}
+      xVals = [seg.groupName];
+      yMeans = [grpMean];
+      ySDs = [grpSD];
+      barColors = [anyFlagged ? 'rgba(200,50,50,0.8)' : seg.color];
+      allVals.forEach(function(pt) {{
+        scatterX.push(seg.groupName);
+        scatterY.push(pt.v);
+        scatterColors.push(pt.flagged ? 'rgba(180,20,20,0.9)' : seg.color);
+        scatterText.push(pt.sname);
+      }});
+    }} else {{
+      // Individual bar per sample (unassigned pool)
+      seg.items.forEach(function(sname) {{
+        var d = allData.find(function(x) {{ return x.name === sname; }});
+        if (!d) return;
+        var flagged = d.anyFlagged;
+        xVals.push(sname);
+        yMeans.push(d.mean);
+        ySDs.push(d.sd || 0);
+        barColors.push(flagged ? 'rgba(200,50,50,0.8)' : seg.color);
+        (d.values || []).forEach(function(v) {{
+          scatterX.push(sname);
+          scatterY.push(v);
+          scatterColors.push(flagged ? 'rgba(180,20,20,0.9)' : seg.color);
+          scatterText.push(sname);
+        }});
+      }});
+    }}
 
     // Separator shape before this segment (except the first)
     if (si > 0 && xCursor > 0) {{
@@ -2855,13 +2901,14 @@ function spRenderChart() {{
           symbol: 'circle',
           line: {{ color: 'rgba(0,0,0,0.4)', width: 1 }}
         }},
+        text: scatterText,
         showlegend: false,
         legendgroup: seg.groupName,
-        hovertemplate: '<b>%{{x}}</b><br>Value: %{{y:.4g}}<extra></extra>'
+        hovertemplate: '<b>%{{text}}</b><br>Value: %{{y:.4g}}<extra></extra>'
       }});
     }}
 
-    xCursor += seg.items.length;
+    xCursor += seg.collapsed ? 1 : seg.items.length;
   }});
 
   var layout = {{
