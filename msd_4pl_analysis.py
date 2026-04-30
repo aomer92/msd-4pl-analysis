@@ -2483,6 +2483,7 @@ var spUnassigned = [];      // [sampleName, ...]
 var spSortMode = 'group';
 var spGroupIdCounter = 0;
 var spDragPayload = null;   // {{name, fromGroup}}
+var spLastCheckedIdx = -1;  // for shift+click range selection in unassigned pool
 var SP_PALETTE = ['#1f77b4','#ff7f0e','#2ca02c','#9467bd','#8c564b','#e377c2','#17becf','#bcbd22'];
 
 function spNextColor() {{
@@ -2544,6 +2545,7 @@ function spGetSampleData(sname) {{
 }}
 
 function spRenderGroupPanel() {{
+  spLastCheckedIdx = -1;  // reset range anchor whenever the pool is rebuilt
   // Unassigned pool
   var pool = document.getElementById('sp-unassigned-pool');
   if (pool) {{
@@ -2592,11 +2594,24 @@ function spMakeChip(sname, groupId) {{
   span.title = sname;
   var label = (flagged ? '⚠ ' : '') + sname;
   if (groupId === '__unassigned__') {{
-    // Add checkbox for assign-to-group
+    // Add checkbox with shift+click range selection
     var cb = document.createElement('input');
     cb.type = 'checkbox';
     cb.setAttribute('data-sample', sname);
-    cb.onclick = function(e) {{ e.stopPropagation(); }};
+    cb.onclick = function(e) {{
+      e.stopPropagation();
+      var idx = spUnassigned.indexOf(sname);
+      var allCbs = Array.from(document.querySelectorAll('#sp-unassigned-pool input[type=checkbox]'));
+      if (e.shiftKey && spLastCheckedIdx >= 0 && idx !== spLastCheckedIdx) {{
+        var lo = Math.min(spLastCheckedIdx, idx);
+        var hi = Math.max(spLastCheckedIdx, idx);
+        var newState = allCbs[idx].checked;
+        for (var i = lo; i <= hi; i++) {{
+          if (allCbs[i]) allCbs[i].checked = newState;
+        }}
+      }}
+      spLastCheckedIdx = idx;
+    }};
     span.appendChild(cb);
   }}
   var txt = document.createElement('span');
@@ -2726,6 +2741,7 @@ function spSelectAllUnassigned(btn) {{
   var allChecked = Array.from(cbs).every(function(cb) {{ return cb.checked; }});
   cbs.forEach(function(cb) {{ cb.checked = !allChecked; }});
   btn.textContent = allChecked ? 'Select All' : 'Deselect All';
+  spLastCheckedIdx = -1;  // reset range anchor after bulk action
 }}
 function spRenderChart() {{
   if (!spCurrentAnalyte || !SP_DATA.samples[spCurrentAnalyte]) {{
