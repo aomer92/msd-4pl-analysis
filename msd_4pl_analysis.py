@@ -125,7 +125,7 @@ The Excel workbook contains:
     by sample name, with averaged signals and concentrations.
 """
 
-import re, sys, argparse, os, tempfile, json, subprocess, platform
+import re, sys, argparse, os, tempfile, json, subprocess, platform, functools
 
 LAST_RUN_PATH = os.path.join(os.path.expanduser('~'), '.msd_4pl_last_run.json')
 MAX_RUN_HISTORY = 5
@@ -224,6 +224,7 @@ def _ensure_deps():
 
 QC_LEVELS = ["ULOQ", "HQC", "MQC", "LQC", "LLOQ"]
 
+@functools.lru_cache(maxsize=None)
 def _identify_qc_level(sample_name):
     """Return which QC level (ULOQ/HQC/MQC/LQC/LLOQ) this sample represents, or None."""
     upper = sample_name.upper()
@@ -239,6 +240,8 @@ def four_pl(x, a, b, c, d):
 
 def inverse_4pl(y, a, b, c, d):
     """Solve 4PL for x given y."""
+    if abs(b) < 1e-9:          # degenerate Hill slope → undefined inverse
+        return np.nan
     denom = y - d
     if denom == 0:
         return np.nan
@@ -941,40 +944,94 @@ def _section_title(ws, row, title, span=5):
     ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=span)
 
 
+def _resolve_dilution_factor(sample_name, group, plate,
+                             qc_dilution_factors=None,
+                             group_dilution_factors=None,
+                             plate_dilution_factors=None):
+    """Return the dilution factor for a sample using priority: QC > group > plate.
+
+    Returns the resolved factor (float, default 1.0).
+    """
+    plate_dilution_factors = plate_dilution_factors or {}
+    grp_key = group if group and group != '_default' else ''
+
+    # QC level takes highest priority when a matching factor exists
+    if qc_dilution_factors:
+        level = _identify_qc_level(sample_name)
+        if level:
+            grp_qc = qc_dilution_factors.get(grp_key, {})
+            if level in grp_qc:
+                return grp_qc[level]
+
+    # Group-level factor next
+    if grp_key and group_dilution_factors and grp_key in group_dilution_factors:
+        return group_dilution_factors[grp_key]
+
+    # Fall back to per-plate factor
+    return plate_dilution_factors.get(plate, 1.0)
+
+
+def _compute_qc_summary(results, qc_dilution_factors, qc_expected_concentrations):
+    """Aggregate QC replicate wells and compute corrected concentrations and recovery.
+
+    Returns (qc_summary_rows, qc_overlay_points) — both lists of dicts.
+    Called by both create_output (Excel) and generate_html_report (HTML) to
+    avoid duplicating this logic.
+    """
+    qc_summary_rows = []
+    qc_overlay_points = []
+    if not qc_dilution_factors:
+        return qc_summary_rows, qc_overlay_points
+
+    qc_groups = defaultdict(list)
+    for res in results:
+        grp = res.get('group', '') or ''
+        group_qc = qc_dilution_factors.get(grp, {})
+        for unk in res.get('unknowns', []):
+            sname = unk.get('sample_name', '')
+            level = _identify_qc_level(sname)
+            if level and level in group_qc:
+                key = (sname, grp, res['plate'])
+                qc_groups[key].append({
+                    'signal': unk['signal'],
+                    'interp_conc': unk['interp_conc'],
+                    'level': level,
+                })
+
+    for (sname, grp, plate), entries in sorted(qc_groups.items()):
+        sigs  = [e['signal']       for e in entries if np.isfinite(e['signal'])]
+        concs = [e['interp_conc']  for e in entries if np.isfinite(e['interp_conc'])]
+        level = entries[0]['level']
+        qc_factor = qc_dilution_factors.get(grp, {}).get(level, 1.0)
+        avg_sig  = np.mean(sigs)  if sigs  else np.nan
+        avg_conc = np.mean(concs) if concs else np.nan
+        corrected = avg_conc * qc_factor if np.isfinite(avg_conc) else np.nan
+        exp_conc = (
+            (qc_expected_concentrations or {}).get(grp)
+            if isinstance(qc_expected_concentrations, dict)
+            else qc_expected_concentrations
+        )
+        recovery = (corrected / exp_conc * 100
+                    if exp_conc and np.isfinite(corrected) else np.nan)
+        row = {
+            'sample_name': sname, 'level': level, 'plate': plate, 'group': grp,
+            'avg_signal': avg_sig, 'corrected_conc': corrected, 'recovery': recovery,
+        }
+        qc_summary_rows.append(row)
+        if np.isfinite(corrected) and np.isfinite(avg_sig) and corrected > 0 and avg_sig > 0:
+            qc_overlay_points.append({**row, 'signal': avg_sig})
+
+    return qc_summary_rows, qc_overlay_points
+
+
 def create_output(results, output_path, msd_path, raw_plate_blocks, units=None, cv_threshold=25, plate_dilution_factors=None, lloq_method='current', total_protein_map=None, qc_dilution_factors=None, qc_expected_concentrations=None, group_dilution_factors=None):
     wb = Workbook()
     wb.remove(wb.active)
     tmp_dir = tempfile.mkdtemp(prefix='msd_charts_')
 
     # Pre-collect QC overlay points (corrected conc + signal) for overlay chart
-    qc_overlay_points = []   # used by chart
-    qc_summary_rows = []     # used by Summary sheet table
-    if qc_dilution_factors:
-        qc_groups = defaultdict(list)
-        for res in results:
-            for unk in res.get('unknowns', []):
-                sname = unk.get('sample_name', '')
-                level = _identify_qc_level(sname)
-                grp = res.get('group', '') or ''
-                group_qc = qc_dilution_factors.get(grp, {})
-                if level and level in group_qc:
-                    key = (sname, grp, res['plate'])
-                    qc_groups[key].append({'signal': unk['signal'], 'interp_conc': unk['interp_conc'], 'level': level})
-        for (sname, grp, plate), entries in sorted(qc_groups.items()):
-            sigs = [e['signal'] for e in entries if np.isfinite(e['signal'])]
-            concs = [e['interp_conc'] for e in entries if np.isfinite(e['interp_conc'])]
-            level = entries[0]['level']
-            qc_factor = qc_dilution_factors.get(grp, {}).get(level, 1.0)
-            avg_sig = np.mean(sigs) if sigs else np.nan
-            avg_conc = np.mean(concs) if concs else np.nan
-            corrected = avg_conc * qc_factor if np.isfinite(avg_conc) else np.nan
-            exp_conc = (qc_expected_concentrations or {}).get(grp) if isinstance(qc_expected_concentrations, dict) else qc_expected_concentrations
-            recovery = (corrected / exp_conc * 100 if exp_conc and np.isfinite(corrected) else np.nan)
-            row = {'sample_name': sname, 'level': level, 'plate': plate, 'group': grp,
-                   'avg_signal': avg_sig, 'corrected_conc': corrected, 'recovery': recovery}
-            qc_summary_rows.append(row)
-            if np.isfinite(corrected) and np.isfinite(avg_sig) and corrected > 0 and avg_sig > 0:
-                qc_overlay_points.append({**row, 'signal': avg_sig})
+    qc_summary_rows, qc_overlay_points = _compute_qc_summary(
+        results, qc_dilution_factors, qc_expected_concentrations)
 
     # Pre-generate all charts before Excel writing (sequential — matplotlib mathtext is not thread-safe)
     overlay_path = generate_overlay_chart(
@@ -1295,24 +1352,13 @@ def create_output(results, output_path, msd_path, raw_plate_blocks, units=None, 
         wells = ', '.join(sorted(g['well'] for g in group))
 
         # Determine dilution factor: QC > group > plate
-        qc_level = _identify_qc_level(sample_name) if qc_dilution_factors else None
-        if qc_level:
-            _grp_key = curve_group if curve_group and curve_group != '_default' else ''
-            _group_qc = (qc_dilution_factors or {}).get(_grp_key, {})
-            if qc_level in _group_qc:
-                factor = _group_qc[qc_level]
-                is_qc_factor = True
-            else:
-                # fall through to group/plate factor below
-                qc_level = None
-        if not qc_level:
-            _grp = curve_group if curve_group and curve_group != '_default' else ''
-            if _grp and group_dilution_factors and _grp in group_dilution_factors:
-                factor = group_dilution_factors[_grp]
-                is_qc_factor = True
-            else:
-                factor = plate_dilution_factors.get(plate, 1.0)
-                is_qc_factor = plate in plate_dilution_factors
+        factor = _resolve_dilution_factor(
+            sample_name, curve_group, plate,
+            qc_dilution_factors, group_dilution_factors, plate_dilution_factors)
+        is_qc_factor = bool(_identify_qc_level(sample_name) and qc_dilution_factors) or \
+                       bool(curve_group and group_dilution_factors and
+                            (curve_group if curve_group != '_default' else '') in group_dilution_factors) or \
+                       (plate in plate_dilution_factors)
 
         corrected_conc = avg_conc * factor if np.isfinite(avg_conc) else np.nan
 
@@ -1419,7 +1465,7 @@ def generate_html_report(results, html_path, msd_path, units=None,
                           qc_dilution_factors=None, qc_expected_concentrations=None,
                           plate_dilution_factors=None, lloq_method='current',
                           total_protein_map=None, excel_path=None,
-                          group_dilution_factors=None):
+                          group_dilution_factors=None, cv_threshold=25):
     """Generate a self-contained interactive HTML report alongside the Excel output."""
     try:
         import plotly.graph_objects as go
@@ -1432,35 +1478,9 @@ def generate_html_report(results, html_path, msd_path, units=None,
     unit_suffix = f" ({units})" if units else ""
     lloq_method_label = "3× Blank Mean" if lloq_method == '3xblank' else "Blank Mean + 10×SD"
 
-    # ── Recompute QC summary rows ─────────────────────────────────────────────
-    qc_summary_rows = []
-    qc_overlay_points = []
-    if qc_dilution_factors:
-        qc_groups = defaultdict(list)
-        for res in results:
-            for unk in res.get('unknowns', []):
-                sname = unk.get('sample_name', '')
-                level = _identify_qc_level(sname)
-                grp = res.get('group', '') or ''
-                group_qc = qc_dilution_factors.get(grp, {})
-                if level and level in group_qc:
-                    key = (sname, grp, res['plate'])
-                    qc_groups[key].append({'signal': unk['signal'], 'interp_conc': unk['interp_conc'], 'level': level})
-        for (sname, grp, plate), entries in sorted(qc_groups.items()):
-            sigs = [e['signal'] for e in entries if np.isfinite(e['signal'])]
-            concs = [e['interp_conc'] for e in entries if np.isfinite(e['interp_conc'])]
-            level = entries[0]['level']
-            qc_factor = qc_dilution_factors.get(grp, {}).get(level, 1.0)
-            avg_sig = np.mean(sigs) if sigs else np.nan
-            avg_conc = np.mean(concs) if concs else np.nan
-            corrected = avg_conc * qc_factor if np.isfinite(avg_conc) else np.nan
-            exp_conc = (qc_expected_concentrations or {}).get(grp) if isinstance(qc_expected_concentrations, dict) else qc_expected_concentrations
-            recovery = (corrected / exp_conc * 100 if exp_conc and np.isfinite(corrected) else np.nan)
-            row_data = {'sample_name': sname, 'level': level, 'plate': plate, 'group': grp,
-                        'avg_signal': avg_sig, 'corrected_conc': corrected, 'recovery': recovery}
-            qc_summary_rows.append(row_data)
-            if np.isfinite(corrected) and np.isfinite(avg_sig) and corrected > 0 and avg_sig > 0:
-                qc_overlay_points.append({**row_data, 'signal': avg_sig})
+    # ── QC summary rows (shared helper avoids duplication with create_output) ──
+    qc_summary_rows, qc_overlay_points = _compute_qc_summary(
+        results, qc_dilution_factors, qc_expected_concentrations)
 
     # ── Per-spot standard curve figures (built in parallel) ──────────────────
     def _build_curve_div(res):
@@ -1508,7 +1528,7 @@ def generate_html_report(results, html_path, msd_path, units=None,
             concs_for_fit = [s['conc'] for s in res.get('standards', []) if s['conc'] > 0]
             if concs_for_fit:
                 c_min, c_max = min(concs_for_fit), max(concs_for_fit)
-                x_fit = np.logspace(np.log10(c_min * 0.5), np.log10(c_max * 2), 200)
+                x_fit = np.logspace(np.log10(c_min * 0.5), np.log10(c_max * 2), 80)
                 y_fit = four_pl(x_fit, *res['params'])
                 all_sigs_pos += [v for v in y_fit if v > 0]
                 fig.add_trace(go.Scatter(
@@ -1536,11 +1556,9 @@ def generate_html_report(results, html_path, msd_path, units=None,
                     pass
 
         # ── Unknown sample scatter points ─────────────────────────────────────
-        _grp_key = group if group and group != '_default' else ''
-        if _grp_key and group_dilution_factors and _grp_key in group_dilution_factors:
-            _factor = group_dilution_factors[_grp_key]
-        else:
-            _factor = (plate_dilution_factors or {}).get(plate, 1.0)
+        _factor = _resolve_dilution_factor(
+            '', group, plate,
+            None, group_dilution_factors, plate_dilution_factors)
         _unk_xs, _unk_ys, _unk_names = [], [], []
         for u in res.get('unknowns', []):
             sname = u['sample_name']
@@ -1628,7 +1646,7 @@ def generate_html_report(results, html_path, msd_path, units=None,
         if not concs_for_fit:
             continue
         c_min, c_max = min(concs_for_fit), max(concs_for_fit)
-        x_fit = np.logspace(np.log10(c_min * 0.5), np.log10(c_max * 2), 200)
+        x_fit = np.logspace(np.log10(c_min * 0.5), np.log10(c_max * 2), 80)
         y_fit = four_pl(x_fit, *res['params'])
         x_fit = list(x_fit)
         y_fit = list(y_fit)
@@ -2082,20 +2100,9 @@ def generate_html_report(results, html_path, msd_path, units=None,
             flag = 'Out of Range'
 
         # Dilution factor & corrected conc (QC > group > plate)
-        qc_level = _identify_qc_level(sname) if qc_dilution_factors else None
-        if qc_level:
-            _hgrp = group if group and group != '_default' else ''
-            _hgroup_qc = (qc_dilution_factors or {}).get(_hgrp, {})
-            if qc_level in _hgroup_qc:
-                factor = _hgroup_qc[qc_level]
-            else:
-                qc_level = None
-        if not qc_level:
-            _hg = group if group and group != '_default' else ''
-            if _hg and group_dilution_factors and _hg in group_dilution_factors:
-                factor = group_dilution_factors[_hg]
-            else:
-                factor = plate_dilution_factors.get(plate, 1.0)
+        factor = _resolve_dilution_factor(
+            sname, group, plate,
+            qc_dilution_factors, group_dilution_factors, plate_dilution_factors)
         corrected = avg_conc * factor if np.isfinite(avg_conc) else np.nan
         # Total protein & normalized (same in-order assignment as create_output)
         animal, tissue = _extract_animal_tissue(sname)
@@ -2119,7 +2126,7 @@ def generate_html_report(results, html_path, msd_path, units=None,
 
         flag_class = ('status-good' if flag == 'In Range'
                       else 'status-warn' if flag in ('> ULOQ', '< LLOQ') else '')
-        cv_class = 'cv-bad' if np.isfinite(cv) and cv > 25 else ''
+        cv_class = 'cv-bad' if np.isfinite(cv) and cv > cv_threshold else ''
         avg_sig_str  = f"{avg_sig:,.1f}" if np.isfinite(avg_sig) else 'N/A'
         avg_conc_str = f"{avg_conc:.4g}" if np.isfinite(avg_conc) else 'N/A'
         cv_str       = f"{cv:.1f}" if np.isfinite(cv) else 'N/A'
@@ -3856,7 +3863,8 @@ def run_analysis(msd_path, platemap_path, output_path, spots_override=None, unit
                              qc_dilution_factors, qc_expected_concentrations,
                              plate_dilution_factors, lloq_method,
                              total_protein_map, output_path,
-                             group_dilution_factors=group_dilution_factors)
+                             group_dilution_factors=group_dilution_factors,
+                             cv_threshold=cv_threshold)
         if os.path.exists(html_path):
             _open_file(html_path)
     except Exception as e:
