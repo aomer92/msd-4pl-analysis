@@ -2167,6 +2167,76 @@ def generate_html_report(results, html_path, msd_path, units=None,
             })
     _sp_json = _json.dumps(_sp_data)
 
+    # ── QC plot JSON ──────────────────────────────────────────────────────────
+    all_qc_groups = defaultdict(lambda: {'signals': [], 'concs': [], 'wells': [],
+                                          'spot': None, 'group': '', 'plate': None})
+    for res in results:
+        plate, spot, group = res['plate'], res['spot'], res.get('group', '')
+        for u in res.get('unknowns', []):
+            sname = u['sample_name']
+            if not _identify_qc_level(sname):
+                continue
+            key = (sname, group, plate)
+            d = all_qc_groups[key]
+            d['spot'] = spot; d['group'] = group; d['plate'] = plate
+            if np.isfinite(u['signal']):
+                d['signals'].append(u['signal'])
+            if np.isfinite(u['interp_conc']):
+                d['concs'].append(u['interp_conc'])
+            d['wells'].append(u['well'])
+
+    _qp_entries = []
+    for (sname, group, plate), data in sorted(all_qc_groups.items()):
+        avg_conc = np.mean(data['concs']) if data['concs'] else np.nan
+        if not np.isfinite(avg_conc):
+            continue
+        level = _identify_qc_level(sname)
+        qc_factor = 1.0
+        if qc_dilution_factors:
+            _hgrp = group if group and group != '_default' else ''
+            _grp_qc = (qc_dilution_factors or {}).get(_hgrp, {})
+            if level and level in _grp_qc:
+                qc_factor = _grp_qc[level]
+        corrected = avg_conc * qc_factor
+        exp_conc = None
+        if qc_expected_concentrations:
+            _hgrp = group if group and group != '_default' else ''
+            exp_conc = (qc_expected_concentrations.get(_hgrp)
+                        if isinstance(qc_expected_concentrations, dict)
+                        else qc_expected_concentrations)
+        recovery = (corrected / exp_conc * 100) if (exp_conc and exp_conc != 0) else None
+        _qp_entries.append({
+            'analyte': group or 'Default', 'sample': sname, 'level': level or '',
+            'plate': plate, 'conc': float(corrected),
+            'expected': float(exp_conc) if exp_conc is not None else None,
+            'recovery': float(recovery) if recovery is not None else None,
+            'values': [float(c * qc_factor) for c in data['concs']],
+        })
+
+    _qp_by_analyte = defaultdict(lambda: defaultdict(list))
+    for e in _qp_entries:
+        _qp_by_analyte[e['analyte']][e['sample']].append(e)
+
+    _qp_data = {'analytes': [], 'units': units or '', 'levels': list(QC_LEVELS), 'samples': {}, 'expected': {}}
+    for _qp_analyte in sorted(_qp_by_analyte.keys()):
+        _qp_data['analytes'].append(_qp_analyte)
+        _qp_data['samples'][_qp_analyte] = []
+        for _qp_sname in sorted(_qp_by_analyte[_qp_analyte].keys()):
+            _qp_elist = _qp_by_analyte[_qp_analyte][_qp_sname]
+            _qp_concs = [e['conc'] for e in _qp_elist]
+            _qp_vals = [v for e in _qp_elist for v in e.get('values', [])]
+            _qp_mean = float(np.mean(_qp_concs))
+            _qp_sd = float(np.std(_qp_concs, ddof=1)) if len(_qp_concs) > 1 else 0.0
+            _qp_level = _qp_elist[0]['level']
+            _qp_exp = _qp_elist[0].get('expected')
+            if _qp_exp is not None:
+                _qp_data['expected'][_qp_analyte] = _qp_exp
+            _qp_data['samples'][_qp_analyte].append({
+                'name': _qp_sname, 'level': _qp_level,
+                'mean': _qp_mean, 'sd': _qp_sd, 'values': _qp_vals,
+            })
+    _qp_json = _json.dumps(_qp_data)
+
     # ── Assemble curve cards HTML ─────────────────────────────────────────────
     curves_section_html = '\n'.join(
         f'<div class="curve-card"><h3>{label}</h3>{div_html}</div>'
@@ -2308,6 +2378,7 @@ def generate_html_report(results, html_path, msd_path, units=None,
   <button class="tab-btn" onclick="showTab('curves', this)">Standard Curves</button>
   <button class="tab-btn" onclick="showTab('unknowns', this)">All Unknowns</button>
   <button class="tab-btn" onclick="showTab('sampleplots', this)">Sample Plots</button>
+  <button class="tab-btn" onclick="showTab('qcplots', this)">QC Plots</button>
   <div style="margin-left:auto;display:flex;align-items:center;gap:8px;padding-right:12px;">
     {excel_btn_html}
     <button class="export-btn" onclick="window.print()">⬇ Export PDF</button>
@@ -2406,6 +2477,44 @@ def generate_html_report(results, html_path, msd_path, units=None,
     </div>
   </div>
 
+  <div id="tab-qcplots" class="tab-pane">
+    <h2>QC Plots</h2>
+    <div id="qp-analyte-bar" style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:14px;"></div>
+    <div style="display:grid;grid-template-columns:280px 1fr;gap:16px;margin-bottom:16px;">
+      <div style="display:flex;flex-direction:column;gap:10px;">
+        <div class="sp-panel">
+          <div style="font-weight:600;font-size:13px;color:#3a506b;margin-bottom:8px;display:flex;align-items:center;justify-content:space-between;">
+            Unassigned Samples
+            <span style="display:flex;gap:8px;align-items:center;">
+              <button class="sp-btn sp-btn-icon" id="qp-select-all-btn" onclick="qpSelectAllUnassigned(this)" style="font-size:11px;">Select All</button>
+              <label style="font-weight:400;font-size:12px;cursor:pointer;">
+                <input type="checkbox" id="qp-show-unassigned" checked onchange="qpRenderChart()"> Show
+              </label>
+            </span>
+          </div>
+          <div id="qp-unassigned-pool" class="sp-drop-zone" ondragover="qpDragOver(event)" ondrop="qpDrop(event,'__unassigned__')"></div>
+          <div style="margin-top:8px;display:flex;gap:6px;align-items:center;flex-wrap:wrap;">
+            <button class="sp-btn sp-btn-primary" onclick="qpAssignChecked()">Assign to Group &#x2192;</button>
+            <button class="sp-btn" onclick="qpCreateGroup()">&#xFF0B; New Group</button>
+          </div>
+        </div>
+        <div class="sp-panel" style="flex:1;">
+          <div style="font-weight:600;font-size:13px;color:#3a506b;margin-bottom:8px;">Groups</div>
+          <div id="qp-groups-container"></div>
+        </div>
+      </div>
+      <div>
+        <div style="display:flex;gap:8px;align-items:center;margin-bottom:10px;flex-wrap:wrap;">
+          <span style="font-size:12px;font-weight:600;color:#555;">Sort:</span>
+          <button class="sp-btn sp-sort-btn active-sort" id="qp-sort-group" onclick="qpSetSort('group',this)">By Group</button>
+          <button class="sp-btn sp-sort-btn" id="qp-sort-asc" onclick="qpSetSort('asc',this)">Value &#x2191;</button>
+          <button class="sp-btn sp-sort-btn" id="qp-sort-desc" onclick="qpSetSort('desc',this)">Value &#x2193;</button>
+        </div>
+        <div id="qp-chart" style="width:100%;"></div>
+      </div>
+    </div>
+  </div>
+
 </div>
 
 <script>
@@ -2418,6 +2527,7 @@ function showTab(name, btn) {{
   // Resize all Plotly charts now that their containers are visible
   pane.querySelectorAll('.js-plotly-plot').forEach(el => Plotly.Plots.resize(el));
   if (name === 'sampleplots') spInit();
+  if (name === 'qcplots') qpInit();
 }}
 
 function sortTable(th) {{
@@ -2499,6 +2609,17 @@ var spDragPayload = null;   // {{name, fromGroup}}
 var spLastCheckedIdx = -1;  // for shift+click range selection in unassigned pool
 var spValueMode = 'corrected';  // 'corrected' | 'normalized'
 var SP_PALETTE = ['#1f77b4','#ff7f0e','#2ca02c','#9467bd','#8c564b','#e377c2','#17becf','#bcbd22'];
+
+var QP_DATA = {_qp_json};
+var qpInitialized = false;
+var qpCurrentAnalyte = null;
+var qpGroups = [];
+var qpUnassigned = [];
+var qpSortMode = 'group';
+var qpGroupIdCounter = 0;
+var qpDragPayload = null;
+var qpLastCheckedIdx = -1;
+var QP_PALETTE = ['#e41a1c','#ff7f00','#4daf4a','#377eb8','#984ea3','#a65628','#f781bf','#999999'];
 
 function spNextColor() {{
   return SP_PALETTE[spGroups.length % SP_PALETTE.length];
@@ -3024,6 +3145,526 @@ function spRenderChart() {{
 
   Plotly.react('sp-chart', traces, layout, {{responsive: true}});
 }}
+// ── QC Plots Tab ─────────────────────────────────────────────────────────────
+function qpNextColor() {{
+  return QP_PALETTE[qpGroups.length % QP_PALETTE.length];
+}}
+
+function qpApplyDefaultGrouping() {{
+  // Auto-group unassigned samples by QC level
+  var levelSamples = {{}};
+  (QP_DATA.levels || []).forEach(function(level) {{
+    levelSamples[level] = [];
+  }});
+  var remaining = [];
+  qpUnassigned.forEach(function(sname) {{
+    var allSamples = QP_DATA.samples[qpCurrentAnalyte] || [];
+    var entry = allSamples.find(function(s) {{ return s.name === sname; }});
+    if (entry && entry.level && levelSamples.hasOwnProperty(entry.level)) {{
+      levelSamples[entry.level].push(sname);
+    }} else {{
+      remaining.push(sname);
+    }}
+  }});
+  qpUnassigned = remaining;
+  (QP_DATA.levels || []).forEach(function(level) {{
+    if (levelSamples[level].length > 0) {{
+      qpGroups.push({{
+        id: ++qpGroupIdCounter,
+        name: level,
+        color: QP_PALETTE[qpGroups.length % QP_PALETTE.length],
+        visible: true,
+        samples: levelSamples[level]
+      }});
+    }}
+  }});
+}}
+
+function qpInit() {{
+  if (!qpInitialized) {{
+    qpInitialized = true;
+    qpGroups = [];
+    qpGroupIdCounter = 0;
+    qpSortMode = 'group';
+    var analytes = QP_DATA.analytes || [];
+    qpCurrentAnalyte = analytes.length > 0 ? analytes[0] : null;
+    qpUnassigned = qpCurrentAnalyte && QP_DATA.samples[qpCurrentAnalyte]
+      ? QP_DATA.samples[qpCurrentAnalyte].map(function(s) {{ return s.name; }})
+      : [];
+    qpApplyDefaultGrouping();
+    qpBuildAnalyteBar();
+  }}
+  qpRenderGroupPanel();
+  qpRenderChart();
+}}
+
+function qpBuildAnalyteBar() {{
+  var bar = document.getElementById('qp-analyte-bar');
+  if (!bar) return;
+  bar.innerHTML = '';
+  (QP_DATA.analytes || []).forEach(function(a) {{
+    var btn = document.createElement('button');
+    btn.className = 'sp-analyte-btn' + (a === qpCurrentAnalyte ? ' active' : '');
+    btn.textContent = a;
+    btn.onclick = function() {{ qpSelectAnalyte(a); }};
+    bar.appendChild(btn);
+  }});
+}}
+
+function qpSelectAnalyte(name) {{
+  qpCurrentAnalyte = name;
+  qpGroups = [];
+  qpGroupIdCounter = 0;
+  var allSamples = QP_DATA.samples[name] ? QP_DATA.samples[name].map(function(s) {{ return s.name; }}) : [];
+  qpUnassigned = allSamples.slice();
+  qpApplyDefaultGrouping();
+  document.querySelectorAll('#qp-analyte-bar .sp-analyte-btn').forEach(function(b) {{
+    b.classList.toggle('active', b.textContent === name);
+  }});
+  qpRenderGroupPanel();
+  qpRenderChart();
+}}
+
+function qpGetSampleData(sname) {{
+  if (!qpCurrentAnalyte || !QP_DATA.samples[qpCurrentAnalyte]) return null;
+  var arr = QP_DATA.samples[qpCurrentAnalyte];
+  for (var i = 0; i < arr.length; i++) {{
+    if (arr[i].name === sname) return arr[i];
+  }}
+  return null;
+}}
+
+function qpRenderGroupPanel() {{
+  qpLastCheckedIdx = -1;
+  var pool = document.getElementById('qp-unassigned-pool');
+  if (pool) {{
+    pool.innerHTML = '';
+    qpUnassigned.forEach(function(sname) {{
+      pool.appendChild(qpMakeChip(sname, '__unassigned__'));
+    }});
+  }}
+  var gc = document.getElementById('qp-groups-container');
+  if (!gc) return;
+  gc.innerHTML = '';
+  qpGroups.forEach(function(g) {{
+    var block = document.createElement('div');
+    block.className = 'sp-group-block';
+    var hdr = document.createElement('div');
+    hdr.className = 'sp-group-header';
+    hdr.style.background = g.color;
+    var isFirst = (qpGroups.indexOf(g) === 0);
+    var isLast  = (qpGroups.indexOf(g) === qpGroups.length - 1);
+    var btnStyle = 'background:rgba(255,255,255,0.25);color:white;border-color:rgba(255,255,255,0.4);';
+    var btnDisabled = 'background:rgba(255,255,255,0.08);color:rgba(255,255,255,0.3);border-color:rgba(255,255,255,0.15);cursor:default;';
+    hdr.innerHTML =
+      '<span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="' + g.name + '">' + g.name + '</span>' +
+      '<button class="sp-btn sp-btn-icon" style="' + (isFirst ? btnDisabled : btnStyle) + '" ' +
+        (isFirst ? 'disabled ' : 'onclick="qpMoveGroup(' + g.id + ',-1)" ') + 'title="Move up">&#x25B4;</button>' +
+      '<button class="sp-btn sp-btn-icon" style="' + (isLast  ? btnDisabled : btnStyle) + '" ' +
+        (isLast  ? 'disabled ' : 'onclick="qpMoveGroup(' + g.id + ',1)" ')  + 'title="Move down">&#x25BE;</button>' +
+      '<button class="sp-btn sp-btn-icon" style="' + btnStyle + '" ' +
+        'onclick="qpRenameGroup(' + g.id + ')" title="Rename group">&#x270F;</button>' +
+      '<button class="sp-btn sp-btn-icon" style="' + btnStyle + '" ' +
+        'onclick="qpToggleGroup(' + g.id + ')" title="Show/hide in chart">' + (g.visible ? '&#128065;' : '&#128564;') + '</button>' +
+      '<button class="sp-btn sp-btn-icon" style="' + btnStyle + '" ' +
+        'onclick="qpDeleteGroup(' + g.id + ')" title="Delete group">&#x2715;</button>';
+    block.appendChild(hdr);
+    var dz = document.createElement('div');
+    dz.className = 'sp-group-drop sp-drop-zone';
+    dz.setAttribute('ondragover', 'qpDragOver(event)');
+    dz.setAttribute('ondrop', "qpDrop(event,'" + g.id + "')");
+    g.samples.forEach(function(sname) {{
+      dz.appendChild(qpMakeChip(sname, g.id));
+    }});
+    block.appendChild(dz);
+    gc.appendChild(block);
+  }});
+}}
+
+function qpMakeChip(sname, groupId) {{
+  var span = document.createElement('span');
+  span.className = 'sp-chip';
+  span.draggable = true;
+  span.title = sname;
+  var label = sname;
+  if (groupId === '__unassigned__') {{
+    var cb = document.createElement('input');
+    cb.type = 'checkbox';
+    cb.setAttribute('data-sample', sname);
+    cb.onclick = function(e) {{
+      e.stopPropagation();
+      var idx = qpUnassigned.indexOf(sname);
+      var allCbs = Array.from(document.querySelectorAll('#qp-unassigned-pool input[type=checkbox]'));
+      if (e.shiftKey && qpLastCheckedIdx >= 0 && idx !== qpLastCheckedIdx) {{
+        var lo = Math.min(qpLastCheckedIdx, idx);
+        var hi = Math.max(qpLastCheckedIdx, idx);
+        var newState = allCbs[idx].checked;
+        for (var i = lo; i <= hi; i++) {{
+          if (allCbs[i]) allCbs[i].checked = newState;
+        }}
+      }}
+      qpLastCheckedIdx = idx;
+    }};
+    span.appendChild(cb);
+  }}
+  var txt = document.createElement('span');
+  txt.textContent = label;
+  txt.style.maxWidth = '120px';
+  txt.style.overflow = 'hidden';
+  txt.style.textOverflow = 'ellipsis';
+  txt.style.whiteSpace = 'nowrap';
+  span.appendChild(txt);
+  span.addEventListener('dragstart', function(e) {{ qpDragStart(e, sname, groupId); }});
+  span.addEventListener('dragend', function(e) {{ qpDragEnd(e); }});
+  return span;
+}}
+
+function qpCreateGroup() {{
+  var name = prompt('Group name:');
+  if (!name || !name.trim()) return;
+  name = name.trim();
+  qpGroups.push({{
+    id: ++qpGroupIdCounter,
+    name: name,
+    color: qpNextColor(),
+    visible: true,
+    samples: []
+  }});
+  qpRenderGroupPanel();
+  qpRenderChart();
+}}
+
+function qpSelectAllUnassigned(btn) {{
+  var cbs = document.querySelectorAll('#qp-unassigned-pool input[type=checkbox]');
+  var allChecked = Array.from(cbs).every(function(cb) {{ return cb.checked; }});
+  cbs.forEach(function(cb) {{ cb.checked = !allChecked; }});
+  btn.textContent = allChecked ? 'Select All' : 'Deselect All';
+  qpLastCheckedIdx = -1;
+}}
+
+function qpAssignChecked() {{
+  var checked = [];
+  document.querySelectorAll('#qp-unassigned-pool input[type=checkbox]:checked').forEach(function(cb) {{
+    checked.push(cb.getAttribute('data-sample'));
+  }});
+  if (!checked.length) {{ alert('Check at least one sample first.'); return; }}
+  var name = prompt('Assign to group name:');
+  if (!name || !name.trim()) return;
+  name = name.trim();
+  var g = qpGroups.find(function(x) {{ return x.name === name; }});
+  if (!g) {{
+    g = {{ id: ++qpGroupIdCounter, name: name, color: qpNextColor(), visible: true, samples: [] }};
+    qpGroups.push(g);
+  }}
+  checked.forEach(function(s) {{
+    qpUnassigned = qpUnassigned.filter(function(u) {{ return u !== s; }});
+    if (g.samples.indexOf(s) === -1) g.samples.push(s);
+  }});
+  qpRenderGroupPanel();
+  qpRenderChart();
+}}
+
+function qpDeleteGroup(id) {{
+  var g = qpGroups.find(function(x) {{ return x.id == id; }});
+  if (!g) return;
+  g.samples.forEach(function(s) {{
+    if (qpUnassigned.indexOf(s) === -1) qpUnassigned.push(s);
+  }});
+  qpGroups = qpGroups.filter(function(x) {{ return x.id != id; }});
+  qpRenderGroupPanel();
+  qpRenderChart();
+}}
+
+function qpToggleGroup(id) {{
+  var g = qpGroups.find(function(x) {{ return x.id == id; }});
+  if (!g) return;
+  g.visible = !g.visible;
+  qpRenderGroupPanel();
+  qpRenderChart();
+}}
+
+function qpRenameGroup(id) {{
+  var g = qpGroups.find(function(x) {{ return x.id == id; }});
+  if (!g) return;
+  var newName = prompt('Rename group:', g.name);
+  if (newName === null || newName.trim() === '') return;
+  g.name = newName.trim();
+  qpRenderGroupPanel();
+  qpRenderChart();
+}}
+
+function qpMoveGroup(id, dir) {{
+  var idx = qpGroups.findIndex(function(x) {{ return x.id == id; }});
+  var newIdx = idx + dir;
+  if (newIdx < 0 || newIdx >= qpGroups.length) return;
+  var tmp = qpGroups[idx];
+  qpGroups[idx] = qpGroups[newIdx];
+  qpGroups[newIdx] = tmp;
+  qpRenderGroupPanel();
+  qpRenderChart();
+}}
+
+function qpSetSort(mode, btn) {{
+  qpSortMode = mode;
+  document.querySelectorAll('#tab-qcplots .sp-sort-btn').forEach(function(b) {{ b.classList.remove('active-sort'); }});
+  btn.classList.add('active-sort');
+  qpRenderChart();
+}}
+
+function qpDragStart(e, name, fromGroup) {{
+  qpDragPayload = {{name: name, fromGroup: fromGroup}};
+  e.dataTransfer.effectAllowed = 'move';
+  e.currentTarget.style.opacity = '0.4';
+}}
+
+function qpDragEnd(e) {{
+  e.currentTarget.style.opacity = '1';
+  document.querySelectorAll('#tab-qcplots .sp-drop-zone').forEach(function(z) {{
+    z.classList.remove('drag-over');
+  }});
+}}
+
+function qpDragOver(e) {{
+  e.preventDefault();
+  e.dataTransfer.dropEffect = 'move';
+  var zone = e.currentTarget.closest('.sp-drop-zone');
+  if (zone) zone.classList.add('drag-over');
+}}
+
+function qpDrop(e, toGroupId) {{
+  e.preventDefault();
+  document.querySelectorAll('#tab-qcplots .sp-drop-zone').forEach(function(z) {{ z.classList.remove('drag-over'); }});
+  if (!qpDragPayload) return;
+  var name = qpDragPayload.name;
+  var fromGroup = qpDragPayload.fromGroup;
+  qpDragPayload = null;
+  if (fromGroup === toGroupId) return;
+  if (fromGroup === '__unassigned__') {{
+    qpUnassigned = qpUnassigned.filter(function(s) {{ return s !== name; }});
+  }} else {{
+    var sg = qpGroups.find(function(g) {{ return g.id == fromGroup; }});
+    if (sg) sg.samples = sg.samples.filter(function(s) {{ return s !== name; }});
+  }}
+  if (toGroupId === '__unassigned__') {{
+    if (qpUnassigned.indexOf(name) === -1) qpUnassigned.push(name);
+  }} else {{
+    var tg = qpGroups.find(function(g) {{ return g.id == toGroupId; }});
+    if (tg && tg.samples.indexOf(name) === -1) tg.samples.push(name);
+  }}
+  qpRenderGroupPanel();
+  qpRenderChart();
+}}
+
+function qpRenderChart() {{
+  if (!qpCurrentAnalyte || !QP_DATA.samples[qpCurrentAnalyte]) {{
+    Plotly.purge('qp-chart');
+    return;
+  }}
+  var allData = QP_DATA.samples[qpCurrentAnalyte];
+  var showUnassigned = document.getElementById('qp-show-unassigned') ? document.getElementById('qp-show-unassigned').checked : true;
+  var units = QP_DATA.units || '';
+  var yTitle = qpCurrentAnalyte + ' Concentration' + (units ? ' (' + units + ')' : '');
+
+  var segments = [];
+
+  qpGroups.forEach(function(g) {{
+    if (!g.visible) return;
+    var items = g.samples.filter(function(s) {{
+      return allData.some(function(d) {{ return d.name === s; }});
+    }});
+    if (qpSortMode === 'asc') {{
+      items.sort(function(a, b) {{
+        var da = allData.find(function(d) {{ return d.name === a; }});
+        var db = allData.find(function(d) {{ return d.name === b; }});
+        return (da ? da.mean : 0) - (db ? db.mean : 0);
+      }});
+    }} else if (qpSortMode === 'desc') {{
+      items.sort(function(a, b) {{
+        var da = allData.find(function(d) {{ return d.name === a; }});
+        var db = allData.find(function(d) {{ return d.name === b; }});
+        return (db ? db.mean : 0) - (da ? da.mean : 0);
+      }});
+    }}
+    if (items.length) segments.push({{groupName: g.name, color: g.color, items: items, collapsed: true}});
+  }});
+
+  var unassignedItems = showUnassigned
+    ? qpUnassigned.filter(function(s) {{ return allData.some(function(d) {{ return d.name === s; }}); }})
+    : [];
+  if (qpSortMode === 'asc') {{
+    unassignedItems.sort(function(a, b) {{
+      var da = allData.find(function(d) {{ return d.name === a; }});
+      var db = allData.find(function(d) {{ return d.name === b; }});
+      return (da ? da.mean : 0) - (db ? db.mean : 0);
+    }});
+  }} else if (qpSortMode === 'desc') {{
+    unassignedItems.sort(function(a, b) {{
+      var da = allData.find(function(d) {{ return d.name === a; }});
+      var db = allData.find(function(d) {{ return d.name === b; }});
+      return (db ? db.mean : 0) - (da ? da.mean : 0);
+    }});
+  }}
+  if (unassignedItems.length) segments.push({{groupName: 'Unassigned', color: 'rgba(150,150,150,0.7)', items: unassignedItems, collapsed: false}});
+
+  var orderedNames = [];
+  segments.forEach(function(seg) {{
+    if (seg.collapsed) {{
+      orderedNames.push(seg.groupName);
+    }} else {{
+      seg.items.forEach(function(s) {{ orderedNames.push(s); }});
+    }}
+  }});
+
+  if (!orderedNames.length) {{
+    Plotly.purge('qp-chart');
+    return;
+  }}
+
+  var traces = [];
+  var shapes = [];
+  var xCursor = 0;
+
+  segments.forEach(function(seg, si) {{
+    var xVals = [];
+    var yMeans = [];
+    var ySDs = [];
+    var barColors = [];
+    var scatterX = [];
+    var scatterY = [];
+    var scatterColors = [];
+    var scatterText = [];
+
+    if (seg.collapsed) {{
+      var allVals = [], sampleMeans = [];
+      seg.items.forEach(function(sname) {{
+        var d = allData.find(function(x) {{ return x.name === sname; }});
+        if (!d) return;
+        sampleMeans.push(d.mean);
+        (d.values || []).forEach(function(v) {{
+          allVals.push({{v: v, sname: sname}});
+        }});
+      }});
+      var grpMean = sampleMeans.length ? sampleMeans.reduce(function(a,b){{return a+b;}},0)/sampleMeans.length : 0;
+      var grpSD = 0;
+      if (allVals.length > 1) {{
+        var vm = allVals.reduce(function(a,b){{return a+b.v;}},0)/allVals.length;
+        grpSD = Math.sqrt(allVals.reduce(function(a,b){{return a+Math.pow(b.v-vm,2);}},0)/(allVals.length-1));
+      }}
+      xVals = [seg.groupName];
+      yMeans = [grpMean];
+      ySDs = [grpSD];
+      barColors = [seg.color];
+      allVals.forEach(function(pt) {{
+        scatterX.push(seg.groupName);
+        scatterY.push(pt.v);
+        scatterColors.push(seg.color);
+        scatterText.push(pt.sname);
+      }});
+    }} else {{
+      seg.items.forEach(function(sname) {{
+        var d = allData.find(function(x) {{ return x.name === sname; }});
+        if (!d) return;
+        xVals.push(sname);
+        yMeans.push(d.mean);
+        ySDs.push(d.sd);
+        barColors.push(seg.color);
+        (d.values || []).forEach(function(v) {{
+          scatterX.push(sname);
+          scatterY.push(v);
+          scatterColors.push(seg.color);
+          scatterText.push(sname);
+        }});
+      }});
+    }}
+
+    if (si > 0 && xCursor > 0) {{
+      shapes.push({{
+        type: 'line',
+        xref: 'x', yref: 'paper',
+        x0: xCursor - 0.5, x1: xCursor - 0.5,
+        y0: 0, y1: 1,
+        line: {{ color: '#aaa', width: 1, dash: 'dot' }}
+      }});
+    }}
+
+    traces.push({{
+      type: 'bar',
+      name: seg.groupName,
+      x: xVals,
+      y: yMeans,
+      error_y: {{
+        type: 'data',
+        array: ySDs,
+        visible: true,
+        color: '#444',
+        thickness: 1.5,
+        width: 4
+      }},
+      marker: {{ color: barColors }},
+      showlegend: true,
+      legendgroup: seg.groupName,
+      hovertemplate: '<b>%{{x}}</b><br>Mean: %{{y:.4g}}<extra>' + seg.groupName + '</extra>'
+    }});
+
+    if (scatterX.length) {{
+      traces.push({{
+        type: 'scatter',
+        mode: 'markers',
+        name: seg.groupName + ' pts',
+        x: scatterX,
+        y: scatterY,
+        marker: {{
+          color: scatterColors,
+          size: 6,
+          symbol: 'circle',
+          line: {{ color: 'rgba(0,0,0,0.4)', width: 1 }}
+        }},
+        text: scatterText,
+        showlegend: false,
+        legendgroup: seg.groupName,
+        hovertemplate: '<b>%{{text}}</b><br>Value: %{{y:.4g}}<extra></extra>'
+      }});
+    }}
+
+    xCursor += seg.collapsed ? 1 : seg.items.length;
+  }});
+
+  // Expected concentration reference lines (±30% band)
+  var expConc = QP_DATA.expected && QP_DATA.expected[qpCurrentAnalyte];
+  if (expConc) {{
+    shapes.push({{type:'rect', xref:'paper', yref:'y', x0:0, x1:1,
+                 y0: expConc*0.7, y1: expConc*1.3,
+                 fillcolor:'rgba(255,165,0,0.12)', line:{{width:0}}}});
+    shapes.push({{type:'line', xref:'paper', yref:'y', x0:0, x1:1,
+                 y0: expConc, y1: expConc,
+                 line:{{color:'orange', width:1.5, dash:'dash'}}}});
+  }}
+
+  var layout = {{
+    barmode: 'group',
+    height: 460,
+    margin: {{ l: 100, r: 40, t: 40, b: 160 }},
+    xaxis: {{
+      tickangle: -40,
+      automargin: true,
+      categoryorder: 'array',
+      categoryarray: orderedNames
+    }},
+    yaxis: {{
+      title: {{ text: yTitle, standoff: 12 }},
+      automargin: false,
+      rangemode: 'tozero'
+    }},
+    shapes: shapes,
+    legend: {{ orientation: 'h', x: 0, y: 1.08 }},
+    paper_bgcolor: 'white',
+    plot_bgcolor: 'white'
+  }};
+
+  Plotly.react('qp-chart', traces, layout, {{responsive: true}});
+}}
+// ── End QC Plots Tab ──────────────────────────────────────────────────────────
+
 // ── End Sample Plots Tab ─────────────────────────────────────────────────────
 </script>
 </body>
