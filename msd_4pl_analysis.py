@@ -130,6 +130,13 @@ import re, sys, argparse, os, tempfile, json, subprocess, platform, functools
 LAST_RUN_PATH = os.path.join(os.path.expanduser('~'), '.msd_4pl_last_run.json')
 MAX_RUN_HISTORY = 5
 
+# ── Analysis thresholds ───────────────────────────────────────────────────────
+R2_GOOD         = 0.99   # R² ≥ this → "Good" curve fit
+R2_ACCEPTABLE   = 0.95   # R² ≥ this → "Acceptable" curve fit (else "Poor")
+QC_RECOVERY_LOW  = 70.0  # % recovery below this → QC failure
+QC_RECOVERY_HIGH = 130.0 # % recovery above this → QC failure
+DEFAULT_CV_THRESHOLD = 25.0  # %CV above this → flagged
+
 def _load_run_history():
     """Return list of up to MAX_RUN_HISTORY prior run dicts, newest first.
     Handles legacy single-dict format transparently."""
@@ -313,8 +320,8 @@ def fit_4pl(conc, signal):
             bounds=bounds,
         )
         return popt, _weighted_r2(popt)
-    except Exception:
-        pass
+    except (RuntimeError, ValueError):
+        pass  # RuntimeError = maxfev exceeded or no convergence; ValueError = bad input
 
     # ── Fallback: unweighted fit ─────────────────────────────────────────────
     try:
@@ -325,7 +332,7 @@ def fit_4pl(conc, signal):
             bounds=bounds,
         )
         return popt, _weighted_r2(popt)
-    except Exception:
+    except (RuntimeError, ValueError):
         return None, None
 
 
@@ -372,7 +379,7 @@ def generate_std_curve_chart(res, tmp_dir, lloq_method='current'):
             lloq_conc = inverse_4pl(lloq_sig, *params)
             if not (np.isfinite(lloq_conc) and lloq_conc > 0):
                 lloq_conc = None
-        except:
+        except (ValueError, ZeroDivisionError, OverflowError):
             lloq_conc = None
 
     # Generate smooth fitted curve
@@ -860,6 +867,8 @@ def calculate_lloq_signal(signals, lloq_method='current'):
         return mean_sig * 3
     if len(values) > 1:
         return mean_sig + 10 * np.std(values, ddof=1)
+    print("  ⚠ LLOQ not computed: only one finite blank replicate available "
+          "(mean + 10×SD requires ≥2). Use '3×Blank Mean' method for single blanks.")
     return None
 
 
@@ -1077,7 +1086,7 @@ def create_output(results, output_path, msd_path, raw_plate_blocks, units=None, 
                     lloq_conc = inverse_4pl(lloq_sig, *res['params'])
                     if np.isfinite(lloq_conc) and lloq_conc > 0:
                         lloq_conc_val = round(lloq_conc, 4)
-                except:
+                except (ValueError, ZeroDivisionError, OverflowError):
                     pass
         vals.append(lloq_sig_val)
         vals.append(lloq_conc_val)
@@ -1086,7 +1095,8 @@ def create_output(results, output_path, msd_path, raw_plate_blocks, units=None, 
             vals += [round(res['r2'], 6)]
             flag_text = "No standards" if res.get('no_standards') else ""
             vals.append(flag_text)
-            vals.append("Good" if res['r2'] >= 0.99 else ("Acceptable" if res['r2'] >= 0.95 else "Poor"))
+            r2v = res['r2']
+            vals.append("Good" if r2v >= R2_GOOD else ("Acceptable" if r2v >= R2_ACCEPTABLE else ("Negative R²" if r2v < 0 else "Poor")))
         else:
             vals += ["N/A", "", "Failed"]
 
@@ -1127,7 +1137,7 @@ def create_output(results, output_path, msd_path, raw_plate_blocks, units=None, 
             if np.isfinite(qr['recovery']):
                 rec_cell.value = round(qr['recovery'], 1)
                 rec_cell.number_format = '0.0'
-                rec_cell.font = PASS_FONT if 70.0 <= qr['recovery'] <= 130.0 else FAIL_FONT
+                rec_cell.font = PASS_FONT if QC_RECOVERY_LOW <= qr['recovery'] <= QC_RECOVERY_HIGH else FAIL_FONT
             else:
                 rec_cell.value = "N/A"
             _style_row(ws, next_row, len(qc_h))
@@ -1639,6 +1649,7 @@ def generate_html_report(results, html_path, msd_path, units=None,
             _group_color_map[g] = colors[_col_idx % len(colors)]
             _col_idx += 1
 
+    _overlay_x_vals = []   # accumulated during first pass; avoids a second iteration
     for i, res in enumerate(results):
         if res['params'] is None:
             continue
@@ -1646,6 +1657,7 @@ def generate_html_report(results, html_path, msd_path, units=None,
         if not concs_for_fit:
             continue
         c_min, c_max = min(concs_for_fit), max(concs_for_fit)
+        _overlay_x_vals.extend([c_min * 0.5, c_max * 2.0])
         x_fit = np.logspace(np.log10(c_min * 0.5), np.log10(c_max * 2), 80)
         y_fit = four_pl(x_fit, *res['params'])
         x_fit = list(x_fit)
@@ -1708,6 +1720,7 @@ def generate_html_report(results, html_path, msd_path, units=None,
                 _unk_ys.append(sig)
                 _unk_names.append(sname)
         if _unk_xs:
+            _overlay_x_vals.extend(_unk_xs)
             _sample_tidx = len(overlay_fig.data)
             _group_trace_indices[group or ''].append(_sample_tidx)
             _overlay_sample_indices_by_group[group or ''].append(_sample_tidx)
@@ -1828,37 +1841,12 @@ def generate_html_report(results, html_path, msd_path, units=None,
             annotation_position='top right'
         )
 
-    # Compute explicit x-range from curve traces and QC points so that
-    # add_vrect boundaries don't blow out the log-scale axis autorange.
-    _overlay_x_vals = []
-    for res in results:
-        if res['params'] is None:
-            continue
-        concs_for_fit = [s['conc'] for s in res.get('standards', []) if s['conc'] > 0]
-        if concs_for_fit:
-            _overlay_x_vals.append(min(concs_for_fit) * 0.5)
-            _overlay_x_vals.append(max(concs_for_fit) * 2.0)
+    # Extend x-range accumulator with QC points (the curve/sample values were
+    # already collected during the first trace-building loop above).
     if qc_overlay_points:
         for _qp in qc_overlay_points:
             if np.isfinite(_qp['corrected_conc']) and _qp['corrected_conc'] > 0:
                 _overlay_x_vals.append(_qp['corrected_conc'])
-    # Include sample points so axis range covers them
-    _factor_map = plate_dilution_factors or {}
-    for res in results:
-        if res['params'] is None:
-            continue
-        _rg = res.get('group', '')
-        _rg = _rg if _rg and _rg != '_default' else ''
-        if _rg and group_dilution_factors and _rg in group_dilution_factors:
-            _f = group_dilution_factors[_rg]
-        else:
-            _f = _factor_map.get(res['plate'], 1.0)
-        for u in res.get('unknowns', []):
-            if _identify_qc_level(u['sample_name']):
-                continue
-            conc = u.get('interp_conc', np.nan)
-            if np.isfinite(conc) and conc > 0:
-                _overlay_x_vals.append(conc * _f)
     overlay_x_range = None
     if _overlay_x_vals:
         overlay_x_range = [np.log10(min(_overlay_x_vals)) - 0.2,
@@ -1972,7 +1960,10 @@ def generate_html_report(results, html_path, msd_path, units=None,
             a, b, c, d = [f"{v:.4g}" for v in res['params']]
             r2 = f"{res['r2']:.6f}"
             r2_val = res['r2']
-            status = 'Good' if r2_val >= 0.99 else ('Acceptable' if r2_val >= 0.95 else 'Poor')
+            status = ('Good' if r2_val >= R2_GOOD
+                      else 'Acceptable' if r2_val >= R2_ACCEPTABLE
+                      else 'Negative R²' if r2_val < 0
+                      else 'Poor')
             flags = ''
         else:
             status = 'Failed'
@@ -1988,7 +1979,8 @@ def generate_html_report(results, html_path, msd_path, units=None,
                 except Exception:
                     pass
         status_class = {'Good': 'status-good', 'Acceptable': 'status-warn',
-                        'Poor': 'status-fail', 'Failed': 'status-fail'}.get(status, '')
+                        'Poor': 'status-fail', 'Negative R²': 'status-fail',
+                        'Failed': 'status-fail'}.get(status, '')
         summary_rows_html.append(
             f"<tr><td>{plate}</td><td>{spot}</td><td>{group}</td>"
             f"<td>{a}</td><td>{b}</td><td>{c}</td><td>{d}</td>"
@@ -3804,7 +3796,7 @@ def run_analysis(msd_path, platemap_path, output_path, spots_override=None, unit
                     for u in unknowns:
                         try:
                             u['interp_conc'] = inverse_4pl(u['signal'], *params)
-                        except:
+                        except (ValueError, ZeroDivisionError, OverflowError):
                             u['interp_conc'] = np.nan
                 else:
                     if not no_standards:
