@@ -2098,9 +2098,6 @@ def generate_html_report(results, html_path, msd_path, units=None,
                 factor = plate_dilution_factors.get(plate, 1.0)
         corrected = avg_conc * factor if np.isfinite(avg_conc) else np.nan
         if np.isfinite(corrected) and not _identify_qc_level(sname):
-            _sp_entries.append({'analyte': group or 'Default', 'sample': sname,
-                                'conc': float(corrected), 'flag': flag, 'plate': plate})
-
         # Total protein & normalized (same in-order assignment as create_output)
         animal, tissue = _extract_animal_tissue(sname)
         tp_val = None
@@ -2114,6 +2111,12 @@ def generate_html_report(results, html_path, msd_path, units=None,
         norm_val = (corrected / tp_val
                     if tp_val is not None and np.isfinite(corrected) and tp_val != 0
                     else None)
+
+        if np.isfinite(corrected) and not _identify_qc_level(sname):
+            _sp_entries.append({'analyte': group or 'Default', 'sample': sname,
+                                'conc': float(corrected),
+                                'norm': float(norm_val) if norm_val is not None else None,
+                                'flag': flag, 'plate': plate})
 
         flag_class = ('status-good' if flag == 'In Range'
                       else 'status-warn' if flag in ('> ULOQ', '< LLOQ') else '')
@@ -2140,22 +2143,28 @@ def generate_html_report(results, html_path, msd_path, units=None,
     # ── Sample plot JSON ──────────────────────────────────────────────────────
     _sp_by_analyte = defaultdict(lambda: defaultdict(list))
     for e in _sp_entries:
-        _sp_by_analyte[e['analyte']][e['sample']].append({'conc': e['conc'], 'flag': e['flag'], 'plate': e['plate']})
+        _sp_by_analyte[e['analyte']][e['sample']].append(
+            {'conc': e['conc'], 'norm': e.get('norm'), 'flag': e['flag'], 'plate': e['plate']})
 
-    _sp_data = {'analytes': [], 'units': units or '', 'samples': {}}
+    _sp_has_norm = any(e.get('norm') is not None for e in _sp_entries)
+    _sp_data = {'analytes': [], 'units': units or '', 'hasNorm': _sp_has_norm, 'samples': {}}
     for _sp_analyte in sorted(_sp_by_analyte.keys()):
         _sp_data['analytes'].append(_sp_analyte)
         _sp_data['samples'][_sp_analyte] = []
         for _sp_sname in sorted(_sp_by_analyte[_sp_analyte].keys()):
             _sp_elist = _sp_by_analyte[_sp_analyte][_sp_sname]
             _sp_concs = [_e['conc'] for _e in _sp_elist]
+            _sp_norms = [_e['norm'] for _e in _sp_elist if _e.get('norm') is not None]
             _sp_flags = [_e['flag'] for _e in _sp_elist]
             _sp_mean = float(np.mean(_sp_concs))
             _sp_sd = float(np.std(_sp_concs, ddof=1)) if len(_sp_concs) > 1 else 0.0
+            _sp_norm_mean = float(np.mean(_sp_norms)) if _sp_norms else None
+            _sp_norm_sd = float(np.std(_sp_norms, ddof=1)) if len(_sp_norms) > 1 else (0.0 if _sp_norms else None)
             _sp_any_flagged = any(f != 'In Range' for f in _sp_flags)
             _sp_data['samples'][_sp_analyte].append({
-                'name': _sp_sname, 'mean': _sp_mean, 'sd': _sp_sd,
-                'values': _sp_concs, 'flags': _sp_flags, 'anyFlagged': _sp_any_flagged
+                'name': _sp_sname, 'mean': _sp_mean, 'sd': _sp_sd, 'values': _sp_concs,
+                'normMean': _sp_norm_mean, 'normSd': _sp_norm_sd, 'normValues': _sp_norms,
+                'flags': _sp_flags, 'anyFlagged': _sp_any_flagged
             })
     _sp_json = _json.dumps(_sp_data)
 
@@ -2382,6 +2391,11 @@ def generate_html_report(results, html_path, msd_path, units=None,
         </div>
       </div>
       <div>
+        <div id="sp-value-toggle" style="display:none;gap:8px;align-items:center;margin-bottom:10px;flex-wrap:wrap;">
+          <span style="font-size:12px;font-weight:600;color:#555;">Values:</span>
+          <button class="sp-btn sp-sort-btn active-sort" id="sp-val-corrected" onclick="spSetValueMode('corrected',this)">Corrected Conc.</button>
+          <button class="sp-btn sp-sort-btn" id="sp-val-norm" onclick="spSetValueMode('normalized',this)">Normalized Protein</button>
+        </div>
         <div style="display:flex;gap:8px;align-items:center;margin-bottom:10px;flex-wrap:wrap;">
           <span style="font-size:12px;font-weight:600;color:#555;">Sort:</span>
           <button class="sp-btn sp-sort-btn active-sort" id="sp-sort-group" onclick="spSetSort('group',this)">By Group</button>
@@ -2484,6 +2498,7 @@ var spSortMode = 'group';
 var spGroupIdCounter = 0;
 var spDragPayload = null;   // {{name, fromGroup}}
 var spLastCheckedIdx = -1;  // for shift+click range selection in unassigned pool
+var spValueMode = 'corrected';  // 'corrected' | 'normalized'
 var SP_PALETTE = ['#1f77b4','#ff7f0e','#2ca02c','#9467bd','#8c564b','#e377c2','#17becf','#bcbd22'];
 
 function spNextColor() {{
@@ -2496,6 +2511,7 @@ function spInit() {{
     spGroups = [];
     spGroupIdCounter = 0;
     spSortMode = 'group';
+    spValueMode = 'corrected';
     var analytes = SP_DATA.analytes || [];
     spCurrentAnalyte = analytes.length > 0 ? analytes[0] : null;
     // Populate unassigned with all samples for current analyte
@@ -2503,6 +2519,9 @@ function spInit() {{
       ? SP_DATA.samples[spCurrentAnalyte].map(function(s) {{ return s.name; }})
       : [];
     spBuildAnalyteBar();
+    // Show value-mode toggle only when normalized data is available
+    var vt = document.getElementById('sp-value-toggle');
+    if (vt) vt.style.display = SP_DATA.hasNorm ? 'flex' : 'none';
   }}
   spRenderGroupPanel();
   spRenderChart();
@@ -2772,6 +2791,24 @@ function spSelectAllUnassigned(btn) {{
   btn.textContent = allChecked ? 'Select All' : 'Deselect All';
   spLastCheckedIdx = -1;  // reset range anchor after bulk action
 }}
+function spSetValueMode(mode, btn) {{
+  spValueMode = mode;
+  ['sp-val-corrected','sp-val-norm'].forEach(function(id) {{
+    var el = document.getElementById(id);
+    if (el) el.classList.remove('active-sort');
+  }});
+  if (btn) btn.classList.add('active-sort');
+  spRenderChart();
+}}
+
+// Helper: pick mean/sd/values from a data entry based on current value mode
+function spGetVals(d) {{
+  if (spValueMode === 'normalized' && d.normMean !== null && d.normMean !== undefined) {{
+    return {{ mean: d.normMean, sd: d.normSd || 0, values: d.normValues || [] }};
+  }}
+  return {{ mean: d.mean, sd: d.sd || 0, values: d.values || [] }};
+}}
+
 function spRenderChart() {{
   if (!spCurrentAnalyte || !SP_DATA.samples[spCurrentAnalyte]) {{
     Plotly.purge('sp-chart');
@@ -2780,7 +2817,9 @@ function spRenderChart() {{
   var allData = SP_DATA.samples[spCurrentAnalyte];
   var showUnassigned = document.getElementById('sp-show-unassigned') ? document.getElementById('sp-show-unassigned').checked : true;
   var units = SP_DATA.units || '';
-  var yTitle = spCurrentAnalyte + ' Concentration' + (units ? ' (' + units + ')' : '');
+  var yTitle = spValueMode === 'normalized'
+    ? spCurrentAnalyte + ' Normalized Concentration'
+    : spCurrentAnalyte + ' Concentration' + (units ? ' (' + units + ')' : '');
 
   // Build ordered list of {{sname, color, groupName}} segments
   var segments = [];  // [{{groupName, color, items:[sampleName]}}]
@@ -2794,13 +2833,13 @@ function spRenderChart() {{
       items.sort(function(a, b) {{
         var da = allData.find(function(d) {{ return d.name === a; }});
         var db = allData.find(function(d) {{ return d.name === b; }});
-        return (da ? da.mean : 0) - (db ? db.mean : 0);
+        return (da ? spGetVals(da).mean : 0) - (db ? spGetVals(db).mean : 0);
       }});
     }} else if (spSortMode === 'desc') {{
       items.sort(function(a, b) {{
         var da = allData.find(function(d) {{ return d.name === a; }});
         var db = allData.find(function(d) {{ return d.name === b; }});
-        return (db ? db.mean : 0) - (da ? da.mean : 0);
+        return (db ? spGetVals(db).mean : 0) - (da ? spGetVals(da).mean : 0);
       }});
     }}
     if (items.length) segments.push({{groupName: g.name, color: g.color, items: items, collapsed: true}});
@@ -2813,13 +2852,13 @@ function spRenderChart() {{
     unassignedItems.sort(function(a, b) {{
       var da = allData.find(function(d) {{ return d.name === a; }});
       var db = allData.find(function(d) {{ return d.name === b; }});
-      return (da ? da.mean : 0) - (db ? db.mean : 0);
+      return (da ? spGetVals(da).mean : 0) - (db ? spGetVals(db).mean : 0);
     }});
   }} else if (spSortMode === 'desc') {{
     unassignedItems.sort(function(a, b) {{
       var da = allData.find(function(d) {{ return d.name === a; }});
       var db = allData.find(function(d) {{ return d.name === b; }});
-      return (db ? db.mean : 0) - (da ? da.mean : 0);
+      return (db ? spGetVals(db).mean : 0) - (da ? spGetVals(da).mean : 0);
     }});
   }}
   if (unassignedItems.length) segments.push({{groupName: 'Unassigned', color: 'rgba(150,150,150,0.7)', items: unassignedItems, collapsed: false}});
@@ -2861,8 +2900,9 @@ function spRenderChart() {{
         var d = allData.find(function(x) {{ return x.name === sname; }});
         if (!d) return;
         if (d.anyFlagged) anyFlagged = true;
-        sampleMeans.push(d.mean);
-        (d.values || []).forEach(function(v) {{
+        var vals = spGetVals(d);
+        sampleMeans.push(vals.mean);
+        vals.values.forEach(function(v) {{
           allVals.push({{v: v, sname: sname, flagged: d.anyFlagged || false}});
         }});
       }});
@@ -2888,11 +2928,12 @@ function spRenderChart() {{
         var d = allData.find(function(x) {{ return x.name === sname; }});
         if (!d) return;
         var flagged = d.anyFlagged;
+        var vals = spGetVals(d);
         xVals.push(sname);
-        yMeans.push(d.mean);
-        ySDs.push(d.sd || 0);
+        yMeans.push(vals.mean);
+        ySDs.push(vals.sd);
         barColors.push(flagged ? 'rgba(200,50,50,0.8)' : seg.color);
-        (d.values || []).forEach(function(v) {{
+        vals.values.forEach(function(v) {{
           scatterX.push(sname);
           scatterY.push(v);
           scatterColors.push(flagged ? 'rgba(180,20,20,0.9)' : seg.color);
