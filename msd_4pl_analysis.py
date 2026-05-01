@@ -2097,7 +2097,6 @@ def generate_html_report(results, html_path, msd_path, units=None,
             else:
                 factor = plate_dilution_factors.get(plate, 1.0)
         corrected = avg_conc * factor if np.isfinite(avg_conc) else np.nan
-        if np.isfinite(corrected) and not _identify_qc_level(sname):
         # Total protein & normalized (same in-order assignment as create_output)
         animal, tissue = _extract_animal_tissue(sname)
         tp_val = None
