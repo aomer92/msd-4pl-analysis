@@ -466,8 +466,10 @@ def generate_std_curve_chart(res, tmp_dir, lloq_method='current'):
 
     plt.tight_layout()
 
-    # Save
-    fname = f"chart_P{plate}_S{spot}{'_' + group if group else ''}.png"
+    # Save — sanitize name components so characters like '/' don't split the path
+    def _safe(s):
+        return re.sub(r'[^\w\-.]', '_', str(s))
+    fname = f"chart_P{_safe(plate)}_S{_safe(spot)}{'_' + _safe(group) if group else ''}.png"
     fpath = os.path.join(tmp_dir, fname)
     fig.savefig(fpath, dpi=96, bbox_inches='tight', facecolor='white')
     plt.close(fig)
