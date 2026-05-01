@@ -2390,10 +2390,10 @@ def generate_html_report(results, html_path, msd_path, units=None,
         </div>
       </div>
       <div>
-        <div id="sp-value-toggle" style="display:none;gap:8px;align-items:center;margin-bottom:10px;flex-wrap:wrap;">
+        <div id="sp-value-toggle" style="display:flex;gap:8px;align-items:center;margin-bottom:10px;flex-wrap:wrap;">
           <span style="font-size:12px;font-weight:600;color:#555;">Values:</span>
           <button class="sp-btn sp-sort-btn active-sort" id="sp-val-corrected" onclick="spSetValueMode('corrected',this)">Corrected Conc.</button>
-          <button class="sp-btn sp-sort-btn" id="sp-val-norm" onclick="spSetValueMode('normalized',this)">Normalized Protein</button>
+          <button class="sp-btn sp-sort-btn" id="sp-val-norm" onclick="spSetValueMode('normalized',this)" title="Requires total protein data">Normalized Protein</button>
         </div>
         <div style="display:flex;gap:8px;align-items:center;margin-bottom:10px;flex-wrap:wrap;">
           <span style="font-size:12px;font-weight:600;color:#555;">Sort:</span>
@@ -2519,8 +2519,13 @@ function spInit() {{
       : [];
     spBuildAnalyteBar();
     // Show value-mode toggle only when normalized data is available
-    var vt = document.getElementById('sp-value-toggle');
-    if (vt) vt.style.display = SP_DATA.hasNorm ? 'flex' : 'none';
+    var normBtn = document.getElementById('sp-val-norm');
+    if (normBtn && !SP_DATA.hasNorm) {{
+      normBtn.disabled = true;
+      normBtn.style.opacity = '0.4';
+      normBtn.style.cursor = 'not-allowed';
+      normBtn.title = 'No total protein data loaded';
+    }}
   }}
   spRenderGroupPanel();
   spRenderChart();
