@@ -135,6 +135,11 @@ _GITHUB_REPO  = "aomer92/msd-4pl-analysis"
 _RELEASES_URL = f"https://api.github.com/repos/{_GITHUB_REPO}/releases/latest"
 _DOWNLOAD_URL = f"https://github.com/{_GITHUB_REPO}/releases/latest"
 
+_EMAIL_REGISTER_URL = f"https://github.com/{_GITHUB_REPO}/subscription"  # GitHub Watch page
+_FORMSPREE_ENDPOINT = ""   # optional: set to your Formspree form ID (e.g. "xyzabcde")
+#   → create a free form at https://formspree.io, paste the 8-char ID above
+#   → submissions arrive in your email; you maintain the mailing list manually
+
 def _parse_version(v):
     """'1.2.3' → (1, 2, 3).  Returns (0,) on bad input."""
     try:
@@ -142,8 +147,10 @@ def _parse_version(v):
     except Exception:
         return (0,)
 
-def _fetch_latest_version():
-    """Return (tag_str, download_url) or (None, None) on any failure."""
+def _fetch_latest_release():
+    """Return dict with keys: tag, html_url, assets  — or None on failure.
+    assets is {platform_key: browser_download_url} where platform_key is
+    'windows' or 'macos'."""
     try:
         req = urllib.request.Request(
             _RELEASES_URL,
@@ -152,11 +159,177 @@ def _fetch_latest_version():
         )
         with urllib.request.urlopen(req, timeout=8) as resp:
             data = json.loads(resp.read().decode())
-        tag = data.get("tag_name", "")
+        tag      = data.get("tag_name", "")
         html_url = data.get("html_url", _DOWNLOAD_URL)
-        return tag, html_url
+        assets   = {}
+        for a in data.get("assets", []):
+            name = a.get("name", "").lower()
+            url  = a.get("browser_download_url", "")
+            if "windows" in name:
+                assets["windows"] = url
+            elif "macos" in name or "mac" in name:
+                assets["macos"] = url
+        return {"tag": tag, "html_url": html_url, "assets": assets}
     except Exception:
-        return None, None
+        return None
+
+# ── backward-compat shim used by the banner code ─────────────────────────────
+def _fetch_latest_version():
+    """Return (tag_str, html_url) or (None, None)."""
+    r = _fetch_latest_release()
+    if r:
+        return r["tag"], r["html_url"]
+    return None, None
+
+# ── Auto-install update ───────────────────────────────────────────────────────
+import zipfile
+
+def _platform_asset_key():
+    """Return 'windows' or 'macos' based on current OS."""
+    if sys.platform == "win32":
+        return "windows"
+    if sys.platform == "darwin":
+        return "macos"
+    return None
+
+def _current_exe_path():
+    """Return the path to the running executable (works frozen + plain Python)."""
+    if getattr(sys, 'frozen', False):
+        return sys.executable          # PyInstaller frozen app
+    return os.path.abspath(sys.argv[0])
+
+def _download_file(url, dest_path, progress_cb=None):
+    """Download url → dest_path.  progress_cb(bytes_done, total) called periodically."""
+    req = urllib.request.Request(
+        url, headers={"User-Agent": f"MSD-4PL-Analysis/{__version__}"})
+    with urllib.request.urlopen(req, timeout=60) as resp:
+        total = int(resp.headers.get("Content-Length", 0))
+        done  = 0
+        chunk = 65536
+        with open(dest_path, "wb") as f:
+            while True:
+                buf = resp.read(chunk)
+                if not buf:
+                    break
+                f.write(buf)
+                done += len(buf)
+                if progress_cb:
+                    progress_cb(done, total)
+
+def _install_update_windows(zip_path, new_exe_name="MSD 4PL Analysis.exe"):
+    """Extract new exe from zip, write a swap .bat, exit.
+    The .bat waits for this process to end, copies, relaunches."""
+    import zipfile as _zf
+    stage_dir = os.path.join(tempfile.gettempdir(), "_msd_update_stage")
+    os.makedirs(stage_dir, exist_ok=True)
+
+    # Extract zip, look for the exe
+    with _zf.ZipFile(zip_path) as z:
+        z.extractall(stage_dir)
+
+    # Find the exe in the extracted tree
+    new_exe = None
+    for root_d, _dirs, files in os.walk(stage_dir):
+        for fname in files:
+            if fname.lower().endswith(".exe"):
+                new_exe = os.path.join(root_d, fname)
+                break
+        if new_exe:
+            break
+    if not new_exe:
+        raise FileNotFoundError("No .exe found in update zip")
+
+    current_exe = _current_exe_path()
+    bat_path = os.path.join(tempfile.gettempdir(), "_msd_updater.bat")
+    bat_content = (
+        "@echo off\n"
+        ":: Wait 3 s for the old process to fully exit\n"
+        "timeout /t 3 /nobreak >nul\n"
+        f'copy /Y "{new_exe}" "{current_exe}"\n'
+        f'start "" "{current_exe}"\n'
+        ":: Clean up staging folder\n"
+        f'rmdir /S /Q "{stage_dir}"\n'
+        "del \"%~f0\"\n"
+    )
+    with open(bat_path, "w") as f:
+        f.write(bat_content)
+
+    # Launch the batch file hidden, then let GUI code call sys.exit()
+    subprocess.Popen(
+        ["cmd.exe", "/c", bat_path],
+        creationflags=subprocess.CREATE_NO_WINDOW,
+        close_fds=True,
+    )
+
+def _install_update_macos(zip_path):
+    """Extract new .app from zip, replace current .app bundle, relaunch."""
+    import zipfile as _zf
+    stage_dir = os.path.join(tempfile.gettempdir(), "_msd_update_stage")
+    os.makedirs(stage_dir, exist_ok=True)
+
+    with _zf.ZipFile(zip_path) as z:
+        z.extractall(stage_dir)
+
+    # Find the .app in the extracted tree
+    new_app = None
+    for item in os.listdir(stage_dir):
+        if item.endswith(".app"):
+            new_app = os.path.join(stage_dir, item)
+            break
+    if not new_app:
+        raise FileNotFoundError("No .app bundle found in update zip")
+
+    # Find current .app bundle (go up from sys.executable until we hit .app)
+    current_exe = _current_exe_path()
+    current_app = current_exe
+    for _ in range(10):
+        if current_app.endswith(".app"):
+            break
+        current_app = os.path.dirname(current_app)
+    else:
+        # Fallback: install alongside the script
+        current_app = os.path.join(os.path.dirname(current_exe),
+                                   os.path.basename(new_app))
+
+    # Write a tiny shell script that waits, replaces, and relaunches
+    sh_path = os.path.join(tempfile.gettempdir(), "_msd_updater.sh")
+    sh_content = (
+        "#!/bin/bash\n"
+        "sleep 3\n"
+        f'rm -rf "{current_app}"\n'
+        f'cp -R "{new_app}" "{current_app}"\n'
+        f'open "{current_app}"\n'
+        f'rm -rf "{stage_dir}"\n'
+        f'rm -- "$0"\n'
+    )
+    with open(sh_path, "w") as f:
+        f.write(sh_content)
+    os.chmod(sh_path, 0o755)
+    subprocess.Popen(["/bin/bash", sh_path], close_fds=True)
+
+def _register_email_formspree(email):
+    """POST email to Formspree endpoint.  Returns (ok:bool, msg:str)."""
+    if not _FORMSPREE_ENDPOINT:
+        return False, "No Formspree endpoint configured"
+    try:
+        payload = json.dumps({"email": email,
+                              "version": __version__,
+                              "platform": sys.platform}).encode()
+        req = urllib.request.Request(
+            f"https://formspree.io/f/{_FORMSPREE_ENDPOINT}",
+            data=payload,
+            headers={"Content-Type": "application/json",
+                     "Accept": "application/json",
+                     "User-Agent": f"MSD-4PL-Analysis/{__version__}"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            result = json.loads(resp.read().decode())
+        if result.get("ok"):
+            return True, "Registered successfully"
+        return False, result.get("error", "Unknown error")
+    except Exception as exc:
+        return False, str(exc)
 
 LAST_RUN_PATH = os.path.join(os.path.expanduser('~'), '.msd_4pl_last_run.json')
 MAX_RUN_HISTORY = 5
@@ -4368,41 +4541,199 @@ def run_interactive():
     tk.Canvas(root, height=2, bg='#7ba7bc', highlightthickness=0).pack(fill=tk.X)
 
     # ── Update-available banner (hidden until update checker fires) ──────
-    _update_bar = tk.Frame(root, bg='#e8a020', cursor='hand2')
-    _update_lbl = tk.Label(_update_bar, text='', bg='#e8a020', fg='white',
-                           font=('Helvetica', 10), anchor='w', padx=10)
+    _update_bar   = tk.Frame(root, bg='#e8a020')
+    _update_lbl   = tk.Label(_update_bar, text='', bg='#e8a020', fg='white',
+                             font=('Helvetica', 10), anchor='w', padx=10)
     _update_lbl.pack(side=tk.LEFT, fill=tk.X, expand=True)
-    _update_dismiss = tk.Label(_update_bar, text='✕', bg='#e8a020', fg='white',
-                               font=('Helvetica', 11, 'bold'), padx=10, cursor='hand2')
-    _update_dismiss.pack(side=tk.RIGHT)
-    _update_link = ''
+
+    _upd_install_btn = tk.Label(_update_bar, text='  ⬇ Install Update  ',
+                                bg='#b36800', fg='white',
+                                font=('Helvetica', 10, 'bold'),
+                                relief='flat', cursor='hand2', padx=6, pady=2)
+    _upd_install_btn.pack(side=tk.RIGHT, padx=(0, 4), pady=3)
+
+    _upd_browser_btn = tk.Label(_update_bar, text='  Open Release Page  ',
+                                bg='#c47a00', fg='white',
+                                font=('Helvetica', 10),
+                                relief='flat', cursor='hand2', padx=6, pady=2)
+    _upd_browser_btn.pack(side=tk.RIGHT, padx=(0, 2), pady=3)
+
+    _upd_dismiss = tk.Label(_update_bar, text=' ✕ ', bg='#e8a020', fg='white',
+                            font=('Helvetica', 11, 'bold'), cursor='hand2', padx=6)
+    _upd_dismiss.pack(side=tk.RIGHT, pady=3)
+
+    _update_release_info = {}   # filled by _show_update_banner: {tag, html_url, assets}
 
     def _open_release_page(_e=None):
-        if _update_link:
-            import webbrowser
-            webbrowser.open(_update_link)
+        import webbrowser
+        webbrowser.open(_update_release_info.get('html_url', _DOWNLOAD_URL))
 
     def _dismiss_update(_e=None):
         _update_bar.pack_forget()
 
-    _update_bar.bind('<Button-1>', _open_release_page)
-    _update_lbl.bind('<Button-1>', _open_release_page)
-    _update_dismiss.bind('<Button-1>', _dismiss_update)
+    def _do_install_update(_e=None):
+        """Download the platform-appropriate zip and swap executables."""
+        import webbrowser
+        assets   = _update_release_info.get('assets', {})
+        plat_key = _platform_asset_key()
+        dl_url   = assets.get(plat_key) if plat_key else None
 
-    def _show_update_banner(tag, url):
-        nonlocal _update_link
-        _update_link = url
+        if not dl_url:
+            # Fallback — open browser to release page
+            webbrowser.open(_update_release_info.get('html_url', _DOWNLOAD_URL))
+            return
+
+        # ── Progress dialog ───────────────────────────────────────────────
+        dlg = tk.Toplevel(root)
+        dlg.title("Downloading Update")
+        dlg.geometry("420x130")
+        dlg.resizable(False, False)
+        dlg.grab_set()
+        tk.Label(dlg, text=f"Downloading {_update_release_info.get('tag','update')}…",
+                 font=('Helvetica', 11)).pack(pady=(18, 6))
+        _prog_var = tk.DoubleVar(value=0)
+        prog_bar  = ttk.Progressbar(dlg, variable=_prog_var,
+                                    maximum=100, length=360, mode='determinate')
+        prog_bar.pack(pady=4)
+        status_lbl = tk.Label(dlg, text='Connecting…', font=('Helvetica', 9),
+                              fg='#555')
+        status_lbl.pack()
+
+        def _progress(done, total):
+            if total > 0:
+                pct = done / total * 100
+                root.after(0, lambda: (_prog_var.set(pct),
+                                       status_lbl.config(
+                                           text=f'{done//1024} / {total//1024} KB')))
+
+        def _worker():
+            try:
+                tmp_zip = os.path.join(tempfile.gettempdir(),
+                                       f"_msd_update_{plat_key}.zip")
+                _download_file(dl_url, tmp_zip, progress_cb=_progress)
+
+                def _apply():
+                    dlg.destroy()
+                    if plat_key == 'windows':
+                        _install_update_windows(tmp_zip)
+                        import tkinter.messagebox as mb
+                        mb.showinfo(
+                            "Update Ready",
+                            "The update has been downloaded.\n\n"
+                            "The application will now close and restart "
+                            "automatically with the new version.",
+                            parent=root)
+                        root.destroy()
+                    elif plat_key == 'macos':
+                        _install_update_macos(tmp_zip)
+                        import tkinter.messagebox as mb
+                        mb.showinfo(
+                            "Update Ready",
+                            "The update has been downloaded.\n\n"
+                            "The application will now close. The new version "
+                            "will launch automatically.",
+                            parent=root)
+                        root.destroy()
+                root.after(0, _apply)
+
+            except Exception as exc:
+                def _err():
+                    dlg.destroy()
+                    import tkinter.messagebox as mb
+                    mb.showerror("Update Failed",
+                                 f"Could not install the update:\n{exc}\n\n"
+                                 "Please download it manually from the release page.",
+                                 parent=root)
+                root.after(0, _err)
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    _upd_install_btn.bind('<Button-1>', _do_install_update)
+    _upd_browser_btn.bind('<Button-1>', _open_release_page)
+    _upd_dismiss.bind('<Button-1>',    _dismiss_update)
+
+    def _show_update_banner(release_info):
+        _update_release_info.clear()
+        _update_release_info.update(release_info)
+        tag = release_info.get('tag', '')
         _update_lbl.config(
-            text=f'  ⬆  New version {tag} available — click to download')
-        # Insert just below the accent rule (before the scrollable content)
+            text=f'  ⬆  Version {tag} is available  ')
+        plat_key = _platform_asset_key()
+        has_asset = bool(release_info.get('assets', {}).get(plat_key))
+        _upd_install_btn.pack(side=tk.RIGHT, padx=(0, 4), pady=3) if has_asset \
+            else _upd_install_btn.pack_forget()
         _update_bar.pack(fill=tk.X, before=_bottom)
 
     def _run_update_check():
-        tag, url = _fetch_latest_version()
-        if tag and _parse_version(tag) > _parse_version(__version__):
-            root.after(0, lambda: _show_update_banner(tag, url))
+        info = _fetch_latest_release()
+        if info and _parse_version(info['tag']) > _parse_version(__version__):
+            root.after(0, lambda: _show_update_banner(info))
 
     threading.Thread(target=_run_update_check, daemon=True).start()
+
+    # ── Email notifications dialog ────────────────────────────────────────
+    def _show_notify_dialog():
+        import webbrowser, tkinter.messagebox as mb
+        dlg = tk.Toplevel(root)
+        dlg.title("Get Update Notifications")
+        dlg.geometry("480x310")
+        dlg.resizable(False, False)
+        dlg.grab_set()
+
+        tk.Label(dlg, text='Get notified about new releases',
+                 font=('Helvetica', 13, 'bold')).pack(pady=(18, 4))
+
+        # ── Option A: GitHub Watch ──
+        sep_a = ttk.LabelFrame(dlg, text='Option A — GitHub Notifications (recommended)',
+                               padding=10)
+        sep_a.pack(fill=tk.X, padx=18, pady=(8, 4))
+        tk.Label(sep_a, text=(
+            'GitHub emails you automatically whenever a new release is published.\n'
+            'Requires a free GitHub account.'
+        ), justify='left', wraplength=400, font=('Helvetica', 10)).pack(anchor='w')
+        tk.Button(sep_a, text='  Open GitHub Watch Page  ',
+                  command=lambda: webbrowser.open(
+                      f"https://github.com/{_GITHUB_REPO}/subscription")
+                  ).pack(anchor='w', pady=(6, 0))
+
+        # ── Option B: Email registration ──
+        sep_b = ttk.LabelFrame(dlg, text='Option B — Register your email',
+                               padding=10)
+        sep_b.pack(fill=tk.X, padx=18, pady=(4, 8))
+
+        if _FORMSPREE_ENDPOINT:
+            row = ttk.Frame(sep_b)
+            row.pack(fill=tk.X)
+            tk.Label(row, text='Email:', font=('Helvetica', 10)).pack(side=tk.LEFT)
+            email_var = tk.StringVar()
+            email_ent = ttk.Entry(row, textvariable=email_var, width=30)
+            email_ent.pack(side=tk.LEFT, padx=(6, 8))
+            status_v = tk.StringVar(value='')
+            tk.Label(sep_b, textvariable=status_v,
+                     font=('Helvetica', 9), fg='#555').pack(anchor='w', pady=(2, 0))
+
+            def _submit():
+                addr = email_var.get().strip()
+                if '@' not in addr:
+                    status_v.set('Please enter a valid email address.')
+                    return
+                status_v.set('Registering…')
+                def _worker():
+                    ok, msg = _register_email_formspree(addr)
+                    root.after(0, lambda: status_v.set(
+                        '✓ Registered! You\'ll receive release emails.' if ok
+                        else f'Error: {msg}'))
+                threading.Thread(target=_worker, daemon=True).start()
+
+            tk.Button(sep_b, text='Register', command=_submit).pack(anchor='w', pady=(6,0))
+        else:
+            tk.Label(sep_b,
+                     text=('Email registration is not configured for this installation.\n'
+                           'Use Option A (GitHub) to receive automatic notifications.'),
+                     justify='left', wraplength=400, font=('Helvetica', 10),
+                     fg='#666').pack(anchor='w')
+
+        ttk.Button(dlg, text='Close', command=dlg.destroy).pack(pady=10)
 
     # ── Fixed bottom action bar (always visible, packed before scroll area) ──
     _bottom = ttk.Frame(root, padding='6 4 12 8')
@@ -4685,6 +5016,9 @@ def run_interactive():
                command=root.destroy).pack(side=tk.RIGHT, padx=(6, 0))
     ttk.Button(_btn_row, text='▶  Run Analysis',
                command=run, default='active').pack(side=tk.RIGHT)
+    # Notification button — left side of the bar
+    ttk.Button(_btn_row, text='🔔  Get Update Notifications',
+               command=_show_notify_dialog).pack(side=tk.LEFT)
 
     root.mainloop()
 
