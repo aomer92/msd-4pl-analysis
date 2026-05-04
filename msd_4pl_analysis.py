@@ -125,7 +125,7 @@ The Excel workbook contains:
     by sample name, with averaged signals and concentrations.
 """
 
-import re, sys, argparse, os, tempfile, json, subprocess, platform, functools
+import re, sys, argparse, os, tempfile, json, subprocess, platform, functools, multiprocessing
 
 LAST_RUN_PATH = os.path.join(os.path.expanduser('~'), '.msd_4pl_last_run.json')
 MAX_RUN_HISTORY = 5
@@ -955,6 +955,14 @@ def _section_title(ws, row, title, span=5):
     ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=span)
 
 
+def _chart_worker(args):
+    """Module-level wrapper so ProcessPoolExecutor can pickle the call."""
+    res, tmp_dir, lloq_method = args
+    path = generate_std_curve_chart(res, tmp_dir, lloq_method)
+    # Return a stable key (not id(res) — memory addresses differ across processes)
+    return (res['plate'], res['spot'], res.get('group', '')), path
+
+
 def _resolve_dilution_factor(sample_name, group, plate,
                              qc_dilution_factors=None,
                              group_dilution_factors=None,
@@ -1050,7 +1058,20 @@ def create_output(results, output_path, msd_path, raw_plate_blocks, units=None, 
         qc_overlay_points if qc_overlay_points else None,
         qc_expected_concentrations if qc_expected_concentrations else None
     )
-    chart_map = {id(res): generate_std_curve_chart(res, tmp_dir, lloq_method) for res in results}
+    # Generate per-spot charts in parallel (each process has its own matplotlib
+    # state, so mathtext thread-safety is not an issue).
+    # Falls back to sequential if the process pool fails (e.g. frozen app edge cases).
+    _chart_args = [(res, tmp_dir, lloq_method) for res in results]
+    _key = lambda r: (r['plate'], r['spot'], r.get('group', ''))
+    try:
+        from concurrent.futures import ProcessPoolExecutor
+        _workers = min(len(results), multiprocessing.cpu_count() or 1)
+        with ProcessPoolExecutor(max_workers=_workers) as _pool:
+            _raw = list(_pool.map(_chart_worker, _chart_args))
+        chart_map = {_key(res): path for res, (_k, path) in zip(results, _raw)}
+    except Exception:
+        chart_map = {_key(res): generate_std_curve_chart(res, tmp_dir, lloq_method)
+                     for res in results}
 
     unit_suffix = f" ({units})" if units else ""
     interp_header = f"Interp. Conc.{unit_suffix}"
@@ -1292,7 +1313,7 @@ def create_output(results, output_path, msd_path, raw_plate_blocks, units=None, 
             row += 1
 
         # Chart — matplotlib image (pre-generated in parallel)
-        chart_path = chart_map.get(id(res))
+        chart_path = chart_map.get((res['plate'], res['spot'], res.get('group', '')))
         if chart_path:
             row += 2
             img = XlImage(chart_path)
@@ -1444,13 +1465,20 @@ def create_output(results, output_path, msd_path, raw_plate_blocks, units=None, 
     for ci in range(1, len(all_h) + 1):
         ws_all.column_dimensions[get_column_letter(ci)].width = 20
 
-    # ── MSD Data Sheet ──────────────────────────────────────────────────────
+    # ── MSD Data Sheet — one row per line, tab-split into columns ────────────
     ws_msd = wb.create_sheet("MSD Data")
     with open(msd_path, 'r', encoding='utf-8', errors='replace') as f:
-        msd_content = f.read()
-    ws_msd.cell(row=1, column=1, value=msd_content)
-    ws_msd.cell(row=1, column=1).alignment = Alignment(wrap_text=True, horizontal='left', vertical='top')
-    ws_msd.column_dimensions['A'].width = 100
+        msd_lines = f.readlines()
+    max_cols = 0
+    for r_idx, line in enumerate(msd_lines, start=1):
+        fields = line.rstrip('\n').split('\t')
+        max_cols = max(max_cols, len(fields))
+        for c_idx, val in enumerate(fields, start=1):
+            ws_msd.cell(row=r_idx, column=c_idx, value=val)
+    # Auto-size first column (usually widest — contains row labels)
+    ws_msd.column_dimensions['A'].width = 40
+    for col_letter in [chr(ord('A') + i) for i in range(1, min(max_cols, 25))]:
+        ws_msd.column_dimensions[col_letter].width = 18
 
     wb.save(output_path)
     print(f"Saved: {output_path}")
@@ -4579,6 +4607,7 @@ def run_interactive():
 
 
 if __name__ == '__main__':
+    multiprocessing.freeze_support()   # required for ProcessPoolExecutor in PyInstaller apps
     parser = argparse.ArgumentParser(description='MSD 4PL Analysis Tool')
     parser.add_argument('--msd', required=False, default=None, help='MSD .txt data file')
     parser.add_argument('--platemap', required=False, default=None, help='Plate map CSV (grid format)')
