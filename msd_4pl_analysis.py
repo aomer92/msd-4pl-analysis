@@ -128,7 +128,7 @@ The Excel workbook contains:
 import re, sys, argparse, os, tempfile, json, subprocess, platform, functools, multiprocessing
 import threading, urllib.request
 
-__version__ = "1.2.0"
+__version__ = "1.3.0"
 
 # ── Auto-update check ─────────────────────────────────────────────────────────
 _GITHUB_REPO  = "aomer92/msd-4pl-analysis"
@@ -544,7 +544,7 @@ def fit_4pl(conc, signal):
 # CHART GENERATION (MSD Discovery Workbench style)
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def generate_std_curve_chart(res, tmp_dir, lloq_method='current'):
+def generate_std_curve_chart(res, tmp_dir, lloq_method='current', units=None):
     """
     Generate a log-log standard curve plot matching MSD Discovery Workbench style.
     Returns path to saved PNG image, or None if curve fit failed.
@@ -559,21 +559,36 @@ def generate_std_curve_chart(res, tmp_dir, lloq_method='current'):
     plate = res['plate']
     spot = res['spot']
     group = res.get('group', '')
+    unit_suffix = f" ({units})" if units else ""
 
-    # Collect standard data
-    std_concs = np.array([s['conc'] for s in standards if s['conc'] > 0])
-    std_sigs = np.array([s['signal'] for s in standards if s['conc'] > 0])
-    if len(std_concs) == 0:
+    # Collect standard data — all individual replicates (including finite-only)
+    std_pts = [(s['conc'], s['signal']) for s in standards
+               if s['conc'] > 0 and np.isfinite(s['signal'])]
+    if not std_pts:
         return None
+    rep_concs = np.array([p[0] for p in std_pts])
+    rep_sigs  = np.array([p[1] for p in std_pts])
 
-    # Calculate LLOQ signal from blanks
-    lloq_sig = None
-    if blanks:
+    # Aggregate replicates per unique concentration → mean ± SD for error bars
+    from collections import defaultdict as _dd
+    _by_conc = _dd(list)
+    for c_val, s_val in std_pts:
+        _by_conc[c_val].append(s_val)
+    agg_concs = np.array(sorted(_by_conc))
+    agg_means = np.array([np.mean(_by_conc[c_val]) for c_val in agg_concs])
+    agg_sds   = np.array([np.std(_by_conc[c_val], ddof=0) for c_val in agg_concs])
+    agg_ns    = np.array([len(_by_conc[c_val]) for c_val in agg_concs])
+    # Only draw error bar where n > 1 and SD > 0
+    yerr_vals = np.where((agg_ns > 1) & (agg_sds > 0), agg_sds, np.nan)
+
+    # Calculate LLOQ signal from blanks (use cached value if available)
+    lloq_sig = res.get('lloq_sig')
+    if lloq_sig is None and blanks:
         bsigs = [bl['signal'] for bl in blanks if np.isfinite(bl['signal'])]
         lloq_sig = calculate_lloq_signal(bsigs, lloq_method)
 
     # ULOQ signal = fitted signal at highest standard concentration
-    uloq_conc = np.max(std_concs)
+    uloq_conc = np.max(agg_concs)
     uloq_sig = four_pl(uloq_conc, *params)
 
     # LLOQ concentration from signal
@@ -587,8 +602,8 @@ def generate_std_curve_chart(res, tmp_dir, lloq_method='current'):
             lloq_conc = None
 
     # Generate smooth fitted curve
-    conc_min = np.min(std_concs) * 0.3
-    conc_max = np.max(std_concs) * 3
+    conc_min = np.min(agg_concs) * 0.3
+    conc_max = np.max(agg_concs) * 3
     x_smooth = np.logspace(np.log10(conc_min), np.log10(conc_max), 200)
     y_smooth = four_pl(x_smooth, *params)
 
@@ -598,7 +613,6 @@ def generate_std_curve_chart(res, tmp_dir, lloq_method='current'):
     # Detection range shading
     if lloq_sig is not None and uloq_sig is not None:
         ax.axhspan(lloq_sig, uloq_sig, alpha=0.08, color='#2244AA', zorder=0)
-        # "In Detection Range" label at left edge, vertically centered
         mid_sig = np.sqrt(lloq_sig * uloq_sig)  # geometric mean for log scale
         ax.text(conc_min * 0.35, mid_sig, 'In Detection Range',
                 fontsize=7.5, color='#1a3a8a', style='italic', ha='left', va='center')
@@ -618,9 +632,17 @@ def generate_std_curve_chart(res, tmp_dir, lloq_method='current'):
     # Fitted curve
     ax.plot(x_smooth, y_smooth, '-', color='#1a3a8a', linewidth=1.5, zorder=3)
 
-    # Observed data points
-    ax.scatter(std_concs, std_sigs, s=35, color='#1a3a8a', zorder=4,
-               edgecolors='#0a2060', linewidths=0.5, label='Standards')
+    # Individual replicate dots (small, semi-transparent) behind the mean markers
+    has_reps = len(rep_concs) > len(agg_concs)
+    if has_reps:
+        ax.scatter(rep_concs, rep_sigs, s=14, color='#6688cc', alpha=0.45,
+                   zorder=3, linewidths=0)
+
+    # Mean markers with SD error bars (error bar hidden when n=1 or SD=0)
+    ax.errorbar(agg_concs, agg_means, yerr=yerr_vals,
+                fmt='o', color='#1a3a8a', markersize=5.5,
+                ecolor='#1a3a8a', elinewidth=1.2, capsize=3.5, capthick=1.2,
+                zorder=4, label='Standards (mean ± SD)' if has_reps else 'Standards')
 
     # Log-log scale
     ax.set_xscale('log')
@@ -628,7 +650,7 @@ def generate_std_curve_chart(res, tmp_dir, lloq_method='current'):
 
     # Axis limits — leave room for labels
     ax.set_xlim(conc_min * 0.25, conc_max * 4)
-    all_sigs = list(std_sigs)
+    all_sigs = list(rep_sigs)
     if lloq_sig is not None:
         all_sigs.append(lloq_sig)
     if uloq_sig is not None:
@@ -637,8 +659,8 @@ def generate_std_curve_chart(res, tmp_dir, lloq_method='current'):
     sig_max = max(all_sigs) * 3
     ax.set_ylim(sig_min, sig_max)
 
-    # Axis formatting
-    ax.set_xlabel('Concentration', fontsize=10, fontweight='bold')
+    # Axis labels — include units on x-axis when provided
+    ax.set_xlabel(f'Concentration{unit_suffix}', fontsize=10, fontweight='bold')
     ax.set_ylabel('Signal', fontsize=10, fontweight='bold')
 
     title_str = f"Plate {plate}, Spot {spot}"
@@ -658,12 +680,11 @@ def generate_std_curve_chart(res, tmp_dir, lloq_method='current'):
     if lloq_conc is not None:
         info_lines.append(f"Calc. Low    {lloq_conc:.2f}")
     info_lines.append(f"Calc. High   {uloq_conc:.0f}")
-    if info_lines:
-        box_text = '\n'.join(info_lines)
-        props = dict(boxstyle='round,pad=0.4', facecolor='white', edgecolor='#666666', alpha=0.9)
-        ax.text(0.98, 0.98, box_text, transform=ax.transAxes, fontsize=8,
-                verticalalignment='top', horizontalalignment='right',
-                bbox=props, family='monospace')
+    box_text = '\n'.join(info_lines)
+    props = dict(boxstyle='round,pad=0.4', facecolor='white', edgecolor='#666666', alpha=0.9)
+    ax.text(0.98, 0.98, box_text, transform=ax.transAxes, fontsize=8,
+            verticalalignment='top', horizontalalignment='right',
+            bbox=props, family='monospace')
 
     # Legend
     ax.legend(loc='lower right', fontsize=8, framealpha=0.9)
@@ -680,7 +701,8 @@ def generate_std_curve_chart(res, tmp_dir, lloq_method='current'):
     return fpath
 
 
-def generate_overlay_chart(results, tmp_dir, qc_overlay_points=None, qc_expected_concentrations=None):
+def generate_overlay_chart(results, tmp_dir, qc_overlay_points=None,
+                           qc_expected_concentrations=None, units=None):
     """
     Generate an overlay plot showing all fitted standard curves on one chart.
     Each spot/group gets its own color. QC points (if provided) are overlaid
@@ -693,8 +715,9 @@ def generate_overlay_chart(results, tmp_dir, qc_overlay_points=None, qc_expected
         return None
 
     fig, ax = plt.subplots(figsize=(12, 7.5))
+    unit_suffix = f" ({units})" if units else ""
 
-    cmap = plt.cm.get_cmap('tab10')
+    cmap = plt.colormaps['tab10']
 
     # Build stable group→color map (first-seen order) so bands match curves
     _grp_color_map = {}
@@ -742,7 +765,7 @@ def generate_overlay_chart(results, tmp_dir, qc_overlay_points=None, qc_expected
                    edgecolors='black', linewidths=0.3, alpha=0.8)
 
     # Shared QC level color palette
-    qc_cmap = plt.cm.get_cmap('Set1')
+    qc_cmap = plt.colormaps['Set1']
     qc_level_colors = {level: qc_cmap(i % 9) for i, level in enumerate(QC_LEVELS)}
 
     # Per-group ±30% expected concentration bands, color-matched to each group's curve
@@ -786,7 +809,7 @@ def generate_overlay_chart(results, tmp_dir, qc_overlay_points=None, qc_expected
     ax.set_yscale('log')
 
     ax.set_xlim(global_conc_min * 0.2, global_conc_max * 5)
-    ax.set_xlabel('Concentration', fontsize=11, fontweight='bold')
+    ax.set_xlabel(f'Concentration{unit_suffix}', fontsize=11, fontweight='bold')
     ax.set_ylabel('Signal', fontsize=11, fontweight='bold')
     ax.set_title('All Standard Curves — Overlay', fontsize=13, fontweight='bold', pad=12)
 
@@ -1162,12 +1185,123 @@ def _section_title(ws, row, title, span=5):
     ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=span)
 
 
+def _physical_cpu_count():
+    """Return physical core count (not hyperthreads) for optimal ProcessPoolExecutor sizing.
+    Falls back to logical_count // 2 if the OS query fails."""
+    try:
+        if sys.platform == 'darwin':
+            n = int(subprocess.check_output(
+                ['sysctl', '-n', 'hw.physicalcpu'], stderr=subprocess.DEVNULL))
+            return max(1, n)
+        if sys.platform.startswith('linux'):
+            pairs = set()
+            phys = core = None
+            with open('/proc/cpuinfo') as _f:
+                for _line in _f:
+                    if _line.startswith('physical id'):
+                        phys = _line.split(':', 1)[1].strip()
+                    elif _line.startswith('core id'):
+                        core = _line.split(':', 1)[1].strip()
+                    elif _line.strip() == '' and phys is not None and core is not None:
+                        pairs.add((phys, core)); phys = core = None
+            if pairs:
+                return max(1, len(pairs))
+        if sys.platform == 'win32':
+            out = subprocess.check_output(
+                ['wmic', 'cpu', 'get', 'NumberOfCores', '/value'],
+                stderr=subprocess.DEVNULL).decode()
+            cores = [int(l.split('=')[1]) for l in out.splitlines()
+                     if l.startswith('NumberOfCores=') and l.split('=')[1].strip().isdigit()]
+            if cores:
+                return max(1, sum(cores))
+    except Exception:
+        pass
+    return max(1, (multiprocessing.cpu_count() or 2) // 2)
+
+
+def _worker_init():
+    """Pre-warm matplotlib in each worker process so the first task doesn't pay
+    the full import + font-cache cost.  Must be module-level to be picklable."""
+    import matplotlib as _mpl
+    _mpl.use('Agg')
+    import matplotlib.pyplot      # loads font manager and mathtext
+    import matplotlib.ticker      # loads ticker formatters
+    import warnings
+    warnings.filterwarnings('ignore')
+
+
 def _chart_worker(args):
     """Module-level wrapper so ProcessPoolExecutor can pickle the call."""
-    res, tmp_dir, lloq_method = args
-    path = generate_std_curve_chart(res, tmp_dir, lloq_method)
+    res, tmp_dir, lloq_method, units = args
+    path = generate_std_curve_chart(res, tmp_dir, lloq_method, units=units)
     # Return a stable key (not id(res) — memory addresses differ across processes)
     return (res['plate'], res['spot'], res.get('group', '')), path
+
+
+def _aggregate_unknowns(results):
+    """Single-pass aggregation of all unknown wells across every result.
+
+    Returns two dicts, both keyed by (sample_name, group, plate):
+
+    unk_data  — non-QC samples:
+        wells, signals (finite), concs (finite interp), spot, group, plate,
+        lloq_sig, uloq_conc, lloq_conc, params
+
+    qc_data   — QC samples (identified by _identify_qc_level):
+        wells, signals (finite), concs (finite interp), spot, group, plate
+
+    Computing both in a single pass avoids iterating over results twice.
+    """
+    unk_data = defaultdict(lambda: {
+        'wells': [], 'signals': [], 'concs': [],
+        'spot': None, 'group': '', 'plate': None,
+        'lloq_sig': None, 'uloq_conc': None, 'lloq_conc': None, 'params': None,
+    })
+    qc_data = defaultdict(lambda: {
+        'wells': [], 'signals': [], 'concs': [],
+        'spot': None, 'group': '', 'plate': None,
+    })
+
+    for res in results:
+        plate  = res['plate']
+        spot   = res['spot']
+        group  = res.get('group', '')
+        params = res.get('params')
+        lloq_sig  = res.get('lloq_sig')
+        std_concs = [s['conc'] for s in res.get('standards', []) if s['conc'] > 0]
+        uloq_conc = max(std_concs) if std_concs else None
+        # Back-calculated LLOQ concentration (more precise than min calibrator)
+        lloq_conc = None
+        if lloq_sig is not None and params is not None:
+            try:
+                lc = inverse_4pl(lloq_sig, *params)
+                lloq_conc = lc if np.isfinite(lc) and lc > 0 else None
+            except Exception:
+                pass
+
+        for unk in res.get('unknowns', []):
+            sname = unk['sample_name']
+            key   = (sname, group, plate)
+            if _identify_qc_level(sname):
+                d = qc_data[key]
+                d['spot'] = spot; d['group'] = group; d['plate'] = plate
+            else:
+                d = unk_data[key]
+                d['spot'] = spot; d['group'] = group; d['plate'] = plate
+                # Per-curve thresholds — first non-None wins (all unknowns in the
+                # same (sample, group, plate) share the same curve)
+                if d['lloq_sig']  is None: d['lloq_sig']  = lloq_sig
+                if d['uloq_conc'] is None: d['uloq_conc'] = uloq_conc
+                if d['lloq_conc'] is None: d['lloq_conc'] = lloq_conc
+                if d['params']    is None: d['params']    = params
+
+            d['wells'].append(unk['well'])
+            if np.isfinite(unk['signal']):
+                d['signals'].append(unk['signal'])
+            if np.isfinite(unk['interp_conc']):
+                d['concs'].append(unk['interp_conc'])
+
+    return unk_data, qc_data
 
 
 def _resolve_dilution_factor(sample_name, group, plate,
@@ -1263,21 +1397,27 @@ def create_output(results, output_path, msd_path, raw_plate_blocks, units=None, 
     overlay_path = generate_overlay_chart(
         results, tmp_dir,
         qc_overlay_points if qc_overlay_points else None,
-        qc_expected_concentrations if qc_expected_concentrations else None
+        qc_expected_concentrations if qc_expected_concentrations else None,
+        units=units
     )
     # Generate per-spot charts in parallel (each process has its own matplotlib
     # state, so mathtext thread-safety is not an issue).
     # Falls back to sequential if the process pool fails (e.g. frozen app edge cases).
-    _chart_args = [(res, tmp_dir, lloq_method) for res in results]
+    _chart_args = [(res, tmp_dir, lloq_method, units) for res in results]
     _key = lambda r: (r['plate'], r['spot'], r.get('group', ''))
     try:
         from concurrent.futures import ProcessPoolExecutor
-        _workers = min(len(results), multiprocessing.cpu_count() or 1)
-        with ProcessPoolExecutor(max_workers=_workers) as _pool:
+        # Use physical cores (not hyperthreads) — chart rendering is CPU-bound
+        # and hyperthreads add context-switch overhead without throughput gain.
+        # Cap at 8 to avoid excessive memory pressure on large-core machines.
+        _workers = min(len(results), _physical_cpu_count(), 8)
+        with ProcessPoolExecutor(max_workers=_workers,
+                                 initializer=_worker_init) as _pool:
             _raw = list(_pool.map(_chart_worker, _chart_args))
         chart_map = {_key(res): path for res, (_k, path) in zip(results, _raw)}
     except Exception:
-        chart_map = {_key(res): generate_std_curve_chart(res, tmp_dir, lloq_method)
+        chart_map = {_key(res): generate_std_curve_chart(res, tmp_dir, lloq_method,
+                                                          units=units)
                      for res in results}
 
     unit_suffix = f" ({units})" if units else ""
@@ -1554,53 +1694,28 @@ def create_output(results, output_path, msd_path, raw_plate_blocks, units=None, 
     # Track how many TP values have been consumed per (animal, tissue) key
     tp_index = defaultdict(int)
 
-    # Group unknowns by (sample_name, group, plate); carry per-curve LLOQ/ULOQ
-    # so each sample is flagged against the curve it was actually measured on.
-    unknown_groups = defaultdict(lambda: {'wells': [], 'signals': [], 'concs': [],
-                                          'lloq_sig': None, 'uloq': None, 'lloq': None})
-    for res in results:
-        curve_group = res.get('group', '')
-        plate = res['plate']
-        std_concs = [s['conc'] for s in res.get('standards', []) if s['conc'] > 0]
-        res_uloq = max(std_concs) if std_concs else None
-        res_lloq = min(std_concs) if std_concs else None
-        res_lloq_sig = res.get('lloq_sig')
-        for unk in res.get('unknowns', []):
-            sample_name = unk.get('sample_name', '')
-            key = (sample_name, curve_group, plate)
-            d = unknown_groups[key]
-            d['wells'].append(unk['well'])
-            d['signals'].append(unk['signal'])
-            d['concs'].append(unk['interp_conc'])
-            # Take first non-None per-curve threshold encountered for this key
-            if d['lloq_sig'] is None:
-                d['lloq_sig'] = res_lloq_sig
-            if d['uloq'] is None:
-                d['uloq'] = res_uloq
-            if d['lloq'] is None:
-                d['lloq'] = res_lloq
+    # Aggregate unknowns and QC in one pass (shared helper avoids re-iteration
+    # in generate_html_report which calls the same function independently).
+    _unk_data, _qc_data_xl = _aggregate_unknowns(results)
 
-    for (sample_name, curve_group, plate) in sorted(unknown_groups.keys()):
-        if _identify_qc_level(sample_name):
-            continue  # QC samples reported in Summary sheet QC Recovery table
-        grp_data = unknown_groups[(sample_name, curve_group, plate)]
-        signals = [s for s in grp_data['signals'] if np.isfinite(s)]
-        concs   = [c for c in grp_data['concs']   if np.isfinite(c)]
+    for (sample_name, curve_group, plate) in sorted(_unk_data.keys()):
+        grp_data = _unk_data[(sample_name, curve_group, plate)]
+        signals = grp_data['signals']   # already finite-filtered by helper
+        concs   = grp_data['concs']     # already finite-filtered by helper
         avg_signal = np.mean(signals) if signals else np.nan
         avg_conc   = np.mean(concs)   if concs   else np.nan
         wells = ', '.join(sorted(grp_data['wells']))
-        uloq     = grp_data['uloq']
-        lloq     = grp_data['lloq']
+        uloq_conc    = grp_data['uloq_conc']
+        lloq_conc    = grp_data['lloq_conc']
         all_lloq_sig = grp_data['lloq_sig']
 
         # Determine dilution factor: QC > group > plate
         factor = _resolve_dilution_factor(
             sample_name, curve_group, plate,
             qc_dilution_factors, group_dilution_factors, plate_dilution_factors)
-        is_qc_factor = bool(_identify_qc_level(sample_name) and qc_dilution_factors) or \
-                       bool(curve_group and group_dilution_factors and
-                            (curve_group if curve_group != '_default' else '') in group_dilution_factors) or \
-                       (plate in plate_dilution_factors)
+        is_qc_factor = bool(curve_group and group_dilution_factors and
+                            (curve_group if curve_group != '_default' else '') in
+                            group_dilution_factors) or (plate in plate_dilution_factors)
 
         corrected_conc = avg_conc * factor if np.isfinite(avg_conc) else np.nan
 
@@ -1608,9 +1723,9 @@ def create_output(results, output_path, msd_path, raw_plate_blocks, units=None, 
         if np.isfinite(avg_signal) and all_lloq_sig and avg_signal < all_lloq_sig:
             flag = "< LLOQ"
         elif np.isfinite(avg_conc):
-            if uloq and avg_conc > uloq:
+            if uloq_conc and avg_conc > uloq_conc:
                 flag = "> ULOQ"
-            elif lloq and avg_conc < lloq:
+            elif lloq_conc and avg_conc < lloq_conc:
                 flag = "< LLOQ"
             else:
                 flag = "In Range"
@@ -2091,25 +2206,6 @@ def generate_html_report(results, html_path, msd_path, units=None,
         overlay_x_range = [np.log10(min(_overlay_x_vals)) - 0.2,
                            np.log10(max(_overlay_x_vals)) + 0.2]
 
-    # Estimate paper-y coordinate for the LLOQ legend so it sits next to the lines.
-    # Collect all visible signal values to infer the auto y-axis log range.
-    _all_visible_sigs = []
-    for res in results:
-        for s in res.get('standards', []):
-            if s.get('signal', 0) > 0:
-                _all_visible_sigs.append(s['signal'])
-        if res.get('lloq_sig') and res['lloq_sig'] > 0:
-            _all_visible_sigs.append(res['lloq_sig'])
-    if _all_visible_sigs and _overlay_all_sigs:
-        _log_min = np.log10(min(_all_visible_sigs))
-        _log_max = np.log10(max(_all_visible_sigs))
-        _avg_lloq = float(np.mean(_overlay_all_sigs))
-        _lloq_paper = ((np.log10(_avg_lloq) - _log_min) / (_log_max - _log_min)
-                       if _log_max > _log_min else 0.15)
-        _lloq_legend_y = float(np.clip(_lloq_paper, 0.05, 0.6))
-    else:
-        _lloq_legend_y = 0.15
-
     overlay_fig.update_layout(
         title=dict(text='Standard Curve Overlay', x=0.5),
         xaxis=dict(title=f'Concentration{unit_suffix}', type='log',
@@ -2252,6 +2348,10 @@ def generate_html_report(results, html_path, msd_path, units=None,
             )
         qc_table_html = f"""
     <h2>QC Recovery</h2>
+    <div class="filter-row">
+      <input class="filter-input" type="search" placeholder="🔍  Filter QC…"
+             oninput="filterTable(this.value,'qcTable')">
+    </div>
     <div class="table-wrap">
     <table id="qcTable" class="data-table sortable">
       <thead><tr>
@@ -2268,51 +2368,20 @@ def generate_html_report(results, html_path, msd_path, units=None,
     </table>
     </div>"""
 
-    # ── All Unknowns table rows (global sort + TP assignment matches create_output) ──
-    # Build global unknowns dict keyed by (sample_name, group, plate) — same as create_output
-    all_unk_groups = defaultdict(lambda: {'signals': [], 'concs': [], 'wells': [],
-                                          'spot': None, 'group': '', 'plate': None,
-                                          'lloq_sig': None, 'params': None, 'uloq_conc': None})
-    for res in results:
-        plate, spot, group = res['plate'], res['spot'], res.get('group', '')
-        lloq_sig = res.get('lloq_sig')
-        params = res['params']
-        uloq_conc = lloq_conc_num = None
-        if params is not None:
-            try:
-                stds = res.get('standards', [])
-                uloq_conc = max((s['conc'] for s in stds if np.isfinite(s['conc'])), default=None)
-                if lloq_sig is not None:
-                    lc = inverse_4pl(lloq_sig, *params)
-                    lloq_conc_num = lc if np.isfinite(lc) and lc > 0 else None
-            except Exception:
-                pass
-        for u in res.get('unknowns', []):
-            sname = u['sample_name']
-            if _identify_qc_level(sname):
-                continue
-            key = (sname, group, plate)
-            d = all_unk_groups[key]
-            d['spot'] = spot; d['group'] = group; d['plate'] = plate
-            d['lloq_sig'] = lloq_sig; d['params'] = params
-            d['uloq_conc'] = uloq_conc; d['lloq_conc_num'] = lloq_conc_num
-            if np.isfinite(u['signal']):
-                d['signals'].append(u['signal'])
-            if np.isfinite(u['interp_conc']):
-                d['concs'].append(u['interp_conc'])
-            d['wells'].append(u['well'])
+    # ── All Unknowns + QC — single aggregation pass (shared with create_output) ──
+    all_unk_groups, all_qc_groups_pre = _aggregate_unknowns(results)
 
     _sp_entries = []
     tp_index = defaultdict(int)
     unk_rows_html = []
     for (sname, group, plate), data in sorted(all_unk_groups.items()):
-        spot = data['spot']
-        lloq_sig = data['lloq_sig']
-        uloq_conc = data.get('uloq_conc')
-        lloq_conc_num = data.get('lloq_conc_num')
+        spot         = data['spot']
+        lloq_sig     = data['lloq_sig']
+        uloq_conc    = data['uloq_conc']
+        lloq_conc    = data['lloq_conc']
 
-        avg_sig = np.mean(data['signals']) if data['signals'] else np.nan
-        avg_conc = np.mean(data['concs']) if data['concs'] else np.nan
+        avg_sig  = np.mean(data['signals']) if data['signals'] else np.nan
+        avg_conc = np.mean(data['concs'])   if data['concs']   else np.nan
         cv = np.nan
         if len(data['concs']) > 1 and np.isfinite(avg_conc) and avg_conc != 0:
             cv = np.std(data['concs'], ddof=1) / avg_conc * 100
@@ -2323,7 +2392,7 @@ def generate_html_report(results, html_path, msd_path, units=None,
         elif np.isfinite(avg_conc):
             if uloq_conc and avg_conc > uloq_conc:
                 flag = '> ULOQ'
-            elif lloq_conc_num and avg_conc < lloq_conc_num:
+            elif lloq_conc and avg_conc < lloq_conc:
                 flag = '< LLOQ'
             else:
                 flag = 'In Range'
@@ -2349,7 +2418,7 @@ def generate_html_report(results, html_path, msd_path, units=None,
                     if tp_val is not None and np.isfinite(corrected) and tp_val != 0
                     else None)
 
-        if np.isfinite(corrected) and not _identify_qc_level(sname):
+        if np.isfinite(corrected):
             _sp_entries.append({'analyte': group or 'Default', 'sample': sname,
                                 'conc': float(corrected),
                                 'norm': float(norm_val) if norm_val is not None else None,
@@ -2405,26 +2474,9 @@ def generate_html_report(results, html_path, msd_path, units=None,
             })
     _sp_json = _json.dumps(_sp_data)
 
-    # ── QC plot JSON ──────────────────────────────────────────────────────────
-    all_qc_groups = defaultdict(lambda: {'signals': [], 'concs': [], 'wells': [],
-                                          'spot': None, 'group': '', 'plate': None})
-    for res in results:
-        plate, spot, group = res['plate'], res['spot'], res.get('group', '')
-        for u in res.get('unknowns', []):
-            sname = u['sample_name']
-            if not _identify_qc_level(sname):
-                continue
-            key = (sname, group, plate)
-            d = all_qc_groups[key]
-            d['spot'] = spot; d['group'] = group; d['plate'] = plate
-            if np.isfinite(u['signal']):
-                d['signals'].append(u['signal'])
-            if np.isfinite(u['interp_conc']):
-                d['concs'].append(u['interp_conc'])
-            d['wells'].append(u['well'])
-
+    # ── QC plot JSON (uses qc_data from the same _aggregate_unknowns call) ──────
     _qp_entries = []
-    for (sname, group, plate), data in sorted(all_qc_groups.items()):
+    for (sname, group, plate), data in sorted(all_qc_groups_pre.items()):
         avg_conc = np.mean(data['concs']) if data['concs'] else np.nan
         if not np.isfinite(avg_conc):
             continue
@@ -2492,10 +2544,11 @@ def generate_html_report(results, html_path, msd_path, units=None,
 
     msd_basename = os.path.basename(msd_path)
     excel_basename = os.path.basename(excel_path) if excel_path else None
-    excel_abs = ('file://' + os.path.abspath(excel_path).replace('\\', '/')) if excel_path else None
+    # download attribute makes the browser download (and therefore open) the file
+    # rather than trying to navigate to it — works for same-directory local files.
     excel_btn_html = (
-        f'<a class="excel-btn" href="{excel_abs}">⬇ Open Excel</a>'
-        if excel_abs else ''
+        f'<a class="excel-btn" href="{excel_basename}" download="{excel_basename}">⬇ Open Excel</a>'
+        if excel_basename else ''
     )
     has_tp = bool(total_protein_map)
     tp_headers = (
@@ -2544,6 +2597,10 @@ def generate_html_report(results, html_path, msd_path, units=None,
   .content {{ padding: 24px 28px; max-width: 1400px; margin: 0 auto; }}
   .tab-pane {{ display: none; }}
   .tab-pane.active {{ display: block; }}
+  .filter-row {{ margin-bottom: 8px; }}
+  .filter-input {{ padding: 6px 12px; border: 1px solid #c8d5e8; border-radius: 6px;
+                   font-size: 13px; width: 280px; outline: none; background: #fafcff; }}
+  .filter-input:focus {{ border-color: #3a506b; box-shadow: 0 0 0 2px rgba(58,80,107,0.12); }}
   .table-wrap {{ overflow-x: auto; margin-bottom: 24px; }}
   .data-table {{ border-collapse: collapse; width: 100%; background: white;
                   box-shadow: 0 1px 4px rgba(0,0,0,0.08); border-radius: 4px; }}
@@ -2634,6 +2691,10 @@ def generate_html_report(results, html_path, msd_path, units=None,
   <div id="tab-summary" class="tab-pane active">
     <h2>Curve Fit Summary</h2>
     <p style="font-size:12px;color:#555;margin:-8px 0 12px;"><strong>LLOQ Method:</strong> {lloq_method_label}</p>
+    <div class="filter-row">
+      <input class="filter-input" type="search" placeholder="🔍  Filter summary…"
+             oninput="filterTable(this.value,'summaryTable')">
+    </div>
     <div class="table-wrap">
     <table id="summaryTable" class="data-table">
       <thead><tr>
@@ -2670,6 +2731,10 @@ def generate_html_report(results, html_path, msd_path, units=None,
 
   <div id="tab-unknowns" class="tab-pane">
     <h2>All Unknowns</h2>
+    <div class="filter-row">
+      <input class="filter-input" type="search" placeholder="🔍  Filter unknowns…"
+             oninput="filterTable(this.value,'unkTable')">
+    </div>
     <div class="table-wrap">
     <table id="unkTable" class="data-table">
       <thead>{unk_hdr_row}</thead>
@@ -4090,13 +4155,11 @@ def run_analysis(msd_path, platemap_path, output_path, spots_override=None, unit
     create_output(results, output_path, msd_path, raw_plate_blocks, units, cv_threshold, plate_dilution_factors, lloq_method, total_protein_map, qc_dilution_factors, qc_expected_concentrations, group_dilution_factors=group_dilution_factors)
     print("Done!")
 
-    # Generate and open interactive HTML report (Excel is opened from within HTML)
-    # Write to system temp dir to avoid macOS Desktop-folder TCC permission prompt.
-    # The "Open Excel" link inside the HTML still uses the full Desktop path,
-    # which the browser can follow without involving this app.
-    import tempfile
+    # Generate and open interactive HTML report (co-located with the Excel file so
+    # that the "Open Excel" button works via a same-directory relative href, and
+    # plotly.min.js is written there once too — no cross-directory file:// issues).
     html_basename = os.path.splitext(os.path.basename(output_path))[0] + '.html'
-    html_path = os.path.join(tempfile.gettempdir(), html_basename)
+    html_path = os.path.join(os.path.dirname(os.path.abspath(output_path)), html_basename)
     try:
         generate_html_report(results, html_path, msd_path, units,
                              qc_dilution_factors, qc_expected_concentrations,
