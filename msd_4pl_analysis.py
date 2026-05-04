@@ -250,7 +250,7 @@ def inverse_4pl(y, a, b, c, d):
     if abs(b) < 1e-9:          # degenerate Hill slope → undefined inverse
         return np.nan
     denom = y - d
-    if denom == 0:
+    if abs(denom) < 1e-9:   # near-zero: signal ≈ upper asymptote, inversion undefined
         return np.nan
     ratio = (a - d) / denom - 1.0
     if ratio <= 0:
@@ -674,9 +674,12 @@ def parse_msd_file(filepath):
                     try:
                         vals.append(float(p))
                     except ValueError:
-                        pass
+                        # OFL / Error / non-numeric flags from the instrument:
+                        # append NaN to preserve column alignment rather than
+                        # silently dropping the token and shifting subsequent values.
+                        vals.append(np.nan)
 
-            if not vals:
+            if not vals or all(np.isnan(v) for v in vals):
                 continue
 
             for ci, v in enumerate(vals):
@@ -1224,7 +1227,7 @@ def create_output(results, output_path, msd_path, raw_plate_blocks, units=None, 
         for sg in sorted(std_groups.values(), key=lambda x: x['conc'], reverse=True):
             mean_sig = np.mean(sg['signals'])
             fitted = four_pl(sg['conc'], *res['params']) if res['params'] is not None else None
-            recovery = (fitted / mean_sig * 100) if fitted and mean_sig != 0 else None
+            recovery = (mean_sig / fitted * 100) if fitted and fitted != 0 else None
 
             ws.cell(row=row, column=1, value=', '.join(sg['wells']))
             ws.cell(row=row, column=2, value=sg['conc'])
@@ -1347,42 +1350,44 @@ def create_output(results, output_path, msd_path, raw_plate_blocks, units=None, 
     # Track how many TP values have been consumed per (animal, tissue) key
     tp_index = defaultdict(int)
 
-    # Collect all standards for uloq/lloq
-    all_std_concs = set()
-    for res in results:
-        for s in res.get('standards', []):
-            if s['conc'] > 0:
-                all_std_concs.add(s['conc'])
-    uloq = max(all_std_concs) if all_std_concs else None
-    lloq = min(all_std_concs) if all_std_concs else None
-
-    # Use pre-computed LLOQ signals; take the mean across all spots as a global threshold
-    cached_lloq_sigs = [r['lloq_sig'] for r in results if r.get('lloq_sig') is not None]
-    all_lloq_sig = float(np.mean(cached_lloq_sigs)) if cached_lloq_sigs else None
-
-    # Group unknowns by (sample_name, group, plate)
-    unknown_groups = defaultdict(list)
+    # Group unknowns by (sample_name, group, plate); carry per-curve LLOQ/ULOQ
+    # so each sample is flagged against the curve it was actually measured on.
+    unknown_groups = defaultdict(lambda: {'wells': [], 'signals': [], 'concs': [],
+                                          'lloq_sig': None, 'uloq': None, 'lloq': None})
     for res in results:
         curve_group = res.get('group', '')
         plate = res['plate']
+        std_concs = [s['conc'] for s in res.get('standards', []) if s['conc'] > 0]
+        res_uloq = max(std_concs) if std_concs else None
+        res_lloq = min(std_concs) if std_concs else None
+        res_lloq_sig = res.get('lloq_sig')
         for unk in res.get('unknowns', []):
             sample_name = unk.get('sample_name', '')
             key = (sample_name, curve_group, plate)
-            unknown_groups[key].append({
-                'well': unk['well'],
-                'signal': unk['signal'],
-                'interp_conc': unk['interp_conc']
-            })
+            d = unknown_groups[key]
+            d['wells'].append(unk['well'])
+            d['signals'].append(unk['signal'])
+            d['concs'].append(unk['interp_conc'])
+            # Take first non-None per-curve threshold encountered for this key
+            if d['lloq_sig'] is None:
+                d['lloq_sig'] = res_lloq_sig
+            if d['uloq'] is None:
+                d['uloq'] = res_uloq
+            if d['lloq'] is None:
+                d['lloq'] = res_lloq
 
     for (sample_name, curve_group, plate) in sorted(unknown_groups.keys()):
         if _identify_qc_level(sample_name):
             continue  # QC samples reported in Summary sheet QC Recovery table
-        group = unknown_groups[(sample_name, curve_group, plate)]
-        signals = [g['signal'] for g in group if np.isfinite(g['signal'])]
-        concs = [g['interp_conc'] for g in group if np.isfinite(g['interp_conc'])]
+        grp_data = unknown_groups[(sample_name, curve_group, plate)]
+        signals = [s for s in grp_data['signals'] if np.isfinite(s)]
+        concs   = [c for c in grp_data['concs']   if np.isfinite(c)]
         avg_signal = np.mean(signals) if signals else np.nan
-        avg_conc = np.mean(concs) if concs else np.nan
-        wells = ', '.join(sorted(g['well'] for g in group))
+        avg_conc   = np.mean(concs)   if concs   else np.nan
+        wells = ', '.join(sorted(grp_data['wells']))
+        uloq     = grp_data['uloq']
+        lloq     = grp_data['lloq']
+        all_lloq_sig = grp_data['lloq_sig']
 
         # Determine dilution factor: QC > group > plate
         factor = _resolve_dilution_factor(
@@ -3853,7 +3858,9 @@ def run_analysis(msd_path, platemap_path, output_path, spots_override=None, unit
                     'lloq_sig': lloq_sig_cached
                 })
 
-    missing = [r for r in results if r.get('no_standards')]
+    # Only raise for spots that have unknowns but no curve to interpolate them.
+    # Spots with no standards AND no unknowns are silently empty — not an error.
+    missing = [r for r in results if r.get('no_standards') and r.get('unknowns')]
     if missing:
         labels = []
         for r in missing:
@@ -3861,7 +3868,7 @@ def run_analysis(msd_path, platemap_path, output_path, spots_override=None, unit
             if r.get('group'):
                 lbl += f", Group {r['group']}"
             labels.append(lbl)
-        msg = "Standards are missing for: " + "; ".join(labels)
+        msg = "Standards are missing for spots that have unknowns: " + "; ".join(labels)
         print(f"Error: {msg}")
         raise RuntimeError(msg)
 
