@@ -128,7 +128,7 @@ The Excel workbook contains:
 import re, sys, argparse, os, tempfile, json, subprocess, platform, functools, multiprocessing
 import threading, urllib.request
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 
 # ── Auto-update check ─────────────────────────────────────────────────────────
 _GITHUB_REPO  = "aomer92/msd-4pl-analysis"
