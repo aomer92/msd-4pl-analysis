@@ -2244,8 +2244,14 @@ def generate_html_report(results, html_path, msd_path, units=None,
         for label, div_html in curve_divs
     )
 
-    # ── Plotly JS bundle (self-contained) ─────────────────────────────────────
-    plotly_js = poff.get_plotlyjs()
+    # ── Plotly JS bundle — write once alongside HTML, reference by relative path ─
+    # This avoids embedding ~3.5 MB of JS in every report. Both files live in the
+    # same temp directory so a relative src= works in any browser.
+    _html_dir = os.path.dirname(os.path.abspath(html_path))
+    _plotly_js_path = os.path.join(_html_dir, 'plotly.min.js')
+    if not os.path.exists(_plotly_js_path):
+        with open(_plotly_js_path, 'w', encoding='utf-8') as _pf:
+            _pf.write(poff.get_plotlyjs())
 
     msd_basename = os.path.basename(msd_path)
     excel_basename = os.path.basename(excel_path) if excel_path else None
@@ -2284,7 +2290,7 @@ def generate_html_report(results, html_path, msd_path, units=None,
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>MSD 4PL Analysis Report</title>
-<script>{plotly_js}</script>
+<script src="plotly.min.js"></script>
 <style>
   * {{ box-sizing: border-box; margin: 0; padding: 0; }}
   body {{ font-family: Arial, sans-serif; font-size: 13px; background: #f0f2f5; color: #222; }}
