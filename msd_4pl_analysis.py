@@ -126,6 +126,37 @@ The Excel workbook contains:
 """
 
 import re, sys, argparse, os, tempfile, json, subprocess, platform, functools, multiprocessing
+import threading, urllib.request
+
+__version__ = "1.1.0"
+
+# ── Auto-update check ─────────────────────────────────────────────────────────
+_GITHUB_REPO  = "aomer92/msd-4pl-analysis"
+_RELEASES_URL = f"https://api.github.com/repos/{_GITHUB_REPO}/releases/latest"
+_DOWNLOAD_URL = f"https://github.com/{_GITHUB_REPO}/releases/latest"
+
+def _parse_version(v):
+    """'1.2.3' → (1, 2, 3).  Returns (0,) on bad input."""
+    try:
+        return tuple(int(x) for x in str(v).lstrip('v').split('.'))
+    except Exception:
+        return (0,)
+
+def _fetch_latest_version():
+    """Return (tag_str, download_url) or (None, None) on any failure."""
+    try:
+        req = urllib.request.Request(
+            _RELEASES_URL,
+            headers={"Accept": "application/vnd.github+json",
+                     "User-Agent": f"MSD-4PL-Analysis/{__version__}"},
+        )
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            data = json.loads(resp.read().decode())
+        tag = data.get("tag_name", "")
+        html_url = data.get("html_url", _DOWNLOAD_URL)
+        return tag, html_url
+    except Exception:
+        return None, None
 
 LAST_RUN_PATH = os.path.join(os.path.expanduser('~'), '.msd_4pl_last_run.json')
 MAX_RUN_HISTORY = 5
@@ -4324,9 +4355,54 @@ def run_interactive():
     header_canvas.create_text(18, 42, anchor='w',
                               text='4-Parameter Logistic Curve Fitting  ·  Quantitative Analysis',
                               fill=SLATE_LIGHT, font=('Helvetica', 10))
+    # Version label (right-aligned in header)
+    header_canvas.create_text(header_canvas.winfo_reqwidth() or 860, 42, anchor='e',
+                              text=f'v{__version__}',
+                              fill=SLATE_LIGHT, font=('Helvetica', 9), tags='ver_lbl')
+    def _reposition_ver(*_):
+        w = header_canvas.winfo_width()
+        header_canvas.coords('ver_lbl', w - 12, 42)
+    header_canvas.bind('<Configure>', _reposition_ver)
 
     # Thin accent rule below header
     tk.Canvas(root, height=2, bg='#7ba7bc', highlightthickness=0).pack(fill=tk.X)
+
+    # ── Update-available banner (hidden until update checker fires) ──────
+    _update_bar = tk.Frame(root, bg='#e8a020', cursor='hand2')
+    _update_lbl = tk.Label(_update_bar, text='', bg='#e8a020', fg='white',
+                           font=('Helvetica', 10), anchor='w', padx=10)
+    _update_lbl.pack(side=tk.LEFT, fill=tk.X, expand=True)
+    _update_dismiss = tk.Label(_update_bar, text='✕', bg='#e8a020', fg='white',
+                               font=('Helvetica', 11, 'bold'), padx=10, cursor='hand2')
+    _update_dismiss.pack(side=tk.RIGHT)
+    _update_link = ''
+
+    def _open_release_page(_e=None):
+        if _update_link:
+            import webbrowser
+            webbrowser.open(_update_link)
+
+    def _dismiss_update(_e=None):
+        _update_bar.pack_forget()
+
+    _update_bar.bind('<Button-1>', _open_release_page)
+    _update_lbl.bind('<Button-1>', _open_release_page)
+    _update_dismiss.bind('<Button-1>', _dismiss_update)
+
+    def _show_update_banner(tag, url):
+        nonlocal _update_link
+        _update_link = url
+        _update_lbl.config(
+            text=f'  ⬆  New version {tag} available — click to download')
+        # Insert just below the accent rule (before the scrollable content)
+        _update_bar.pack(fill=tk.X, before=_bottom)
+
+    def _run_update_check():
+        tag, url = _fetch_latest_version()
+        if tag and _parse_version(tag) > _parse_version(__version__):
+            root.after(0, lambda: _show_update_banner(tag, url))
+
+    threading.Thread(target=_run_update_check, daemon=True).start()
 
     # ── Fixed bottom action bar (always visible, packed before scroll area) ──
     _bottom = ttk.Frame(root, padding='6 4 12 8')
