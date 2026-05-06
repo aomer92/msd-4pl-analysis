@@ -128,7 +128,7 @@ The Excel workbook contains:
 import re, sys, argparse, os, tempfile, json, subprocess, platform, functools, multiprocessing
 import threading, urllib.request
 
-__version__ = "1.3.0"
+__version__ = "1.3.1"
 
 # ── Auto-update check ─────────────────────────────────────────────────────────
 _GITHUB_REPO  = "aomer92/msd-4pl-analysis"
@@ -1159,6 +1159,29 @@ def _extract_animal_tissue(sample_name):
 
 
 
+def _xv(val, fallback="N/A"):
+    """Convert a value to a Python-native type safe for openpyxl cells.
+
+    openpyxl cannot serialise numpy scalars, numpy.nan, numpy.inf, or
+    Python float('nan') / float('inf') — they produce corrupt XML that
+    Excel must 'repair' on open.  This helper:
+      • Returns the value unchanged if it is already a str/int/bool/None.
+      • Converts numpy scalars and Python floats to native float, then
+        returns ``fallback`` for NaN or ±Inf so the cell gets a clean
+        "N/A" (or whatever string/None the caller passes) instead of a
+        bad float literal.
+    """
+    if val is None:
+        return fallback
+    if isinstance(val, (str, bool)):
+        return val
+    try:
+        f = float(val)
+        return f if (f == f and abs(f) != float('inf')) else fallback
+    except (TypeError, ValueError):
+        return fallback
+
+
 def _style_row(ws, row, max_col, fill=None, font=None):
     if font is None:
         font = DATA_FONT
@@ -1441,7 +1464,12 @@ def create_output(results, output_path, msd_path, raw_plate_blocks, units=None, 
         vals = [res['plate'], res['spot'], res.get('group', '')]
         if res['params'] is not None:
             a, b, c, d = res['params']
-            vals += [round(a, 2), round(b, 4), round(c, 4), round(d, 2)]
+            vals += [
+                _xv(round(float(a), 2) if np.isfinite(a) else a),
+                _xv(round(float(b), 4) if np.isfinite(b) else b),
+                _xv(round(float(c), 4) if np.isfinite(c) else c),
+                _xv(round(float(d), 2) if np.isfinite(d) else d),
+            ]
         else:
             vals += ["N/A"] * 4
 
@@ -1449,24 +1477,24 @@ def create_output(results, output_path, msd_path, raw_plate_blocks, units=None, 
         lloq_sig_val = "N/A"
         lloq_conc_val = "N/A"
         lloq_sig = res.get('lloq_sig')
-        if lloq_sig is not None:
-            lloq_sig_val = round(lloq_sig, 1)
+        if lloq_sig is not None and np.isfinite(lloq_sig):
+            lloq_sig_val = round(float(lloq_sig), 1)
             if res['params'] is not None:
                 try:
                     lloq_conc = inverse_4pl(lloq_sig, *res['params'])
                     if np.isfinite(lloq_conc) and lloq_conc > 0:
-                        lloq_conc_val = round(lloq_conc, 4)
+                        lloq_conc_val = round(float(lloq_conc), 4)
                 except (ValueError, ZeroDivisionError, OverflowError):
                     pass
         vals.append(lloq_sig_val)
         vals.append(lloq_conc_val)
 
         if res['params'] is not None:
-            vals += [round(res['r2'], 6)]
+            r2_raw = res['r2']
+            vals += [round(float(r2_raw), 6) if np.isfinite(r2_raw) else "N/A"]
             flag_text = "No standards" if res.get('no_standards') else ""
             vals.append(flag_text)
-            r2v = res['r2']
-            vals.append("Good" if r2v >= R2_GOOD else ("Acceptable" if r2v >= R2_ACCEPTABLE else ("Negative R²" if r2v < 0 else "Poor")))
+            vals.append("Good" if r2_raw >= R2_GOOD else ("Acceptable" if r2_raw >= R2_ACCEPTABLE else ("Negative R²" if r2_raw < 0 else "Poor")))
         else:
             vals += ["N/A", "", "Failed"]
 
@@ -1545,7 +1573,7 @@ def create_output(results, output_path, msd_path, raw_plate_blocks, units=None, 
             ws.cell(row=row, column=1).border = THIN_BORDER
             if res['params'] is not None:
                 val = res['params'][i] if i < 4 else res['r2']
-                ws.cell(row=row, column=2, value=round(val, 6))
+                ws.cell(row=row, column=2, value=_xv(round(float(val), 6) if np.isfinite(val) else val))
             else:
                 ws.cell(row=row, column=2, value="N/A")
             ws.cell(row=row, column=2).font = DATA_FONT
@@ -1569,19 +1597,23 @@ def create_output(results, output_path, msd_path, raw_plate_blocks, units=None, 
             std_groups[key]['signals'].append(s['signal'])
 
         for sg in sorted(std_groups.values(), key=lambda x: x['conc'], reverse=True):
-            mean_sig = np.mean(sg['signals'])
+            # Filter NaN signals (OFL/Error flags) before computing mean so we
+            # never pass numpy.nan into an openpyxl cell (produces corrupt XML).
+            finite_sigs = [s for s in sg['signals'] if np.isfinite(s)]
+            mean_sig = np.mean(finite_sigs) if finite_sigs else np.nan
             fitted = four_pl(sg['conc'], *res['params']) if res['params'] is not None else None
-            recovery = (mean_sig / fitted * 100) if fitted and fitted != 0 else None
+            mean_finite = np.isfinite(mean_sig)
+            recovery = (mean_sig / fitted * 100) if (mean_finite and fitted and fitted != 0) else None
 
             ws.cell(row=row, column=1, value=', '.join(sg['wells']))
             ws.cell(row=row, column=2, value=sg['conc'])
             ws.cell(row=row, column=2).number_format = '#,##0.00'
-            ws.cell(row=row, column=3, value=round(mean_sig, 1))
+            ws.cell(row=row, column=3, value=round(float(mean_sig), 1) if mean_finite else "N/A")
             ws.cell(row=row, column=3).number_format = '#,##0.0'
-            ws.cell(row=row, column=4, value=round(fitted, 1) if fitted else "N/A")
+            ws.cell(row=row, column=4, value=round(float(fitted), 1) if (fitted is not None and np.isfinite(fitted)) else "N/A")
             ws.cell(row=row, column=4).number_format = '#,##0.0'
-            if recovery:
-                ws.cell(row=row, column=5, value=round(recovery, 1))
+            if recovery is not None and np.isfinite(recovery):
+                ws.cell(row=row, column=5, value=round(float(recovery), 1))
                 ws.cell(row=row, column=5).number_format = '0.0'
             _style_row(ws, row, 5, fill=STD_FILL)
             row += 1
@@ -1598,8 +1630,8 @@ def create_output(results, output_path, msd_path, raw_plate_blocks, units=None, 
                 ws.cell(row=irow, column=8, value=s['signal'])
                 if res['params'] is not None:
                     fitted_val = four_pl(s['conc'], *res['params'])
-                    if fitted_val > 0:
-                        ws.cell(row=irow, column=9, value=round(fitted_val, 1))
+                    if np.isfinite(fitted_val) and fitted_val > 0:
+                        ws.cell(row=irow, column=9, value=round(float(fitted_val), 1))
                 irow += 1
 
         # Blanks
@@ -1612,7 +1644,8 @@ def create_output(results, output_path, msd_path, raw_plate_blocks, units=None, 
             for bl in res['blanks']:
                 ws.cell(row=row, column=1, value=bl['well'])
                 ws.cell(row=row, column=2, value=bl.get('sample_name', ''))
-                ws.cell(row=row, column=3, value=bl['signal'])
+                ws.cell(row=row, column=3, value=_xv(bl['signal']))
+                ws.cell(row=row, column=3).number_format = '#,##0'
                 _style_row(ws, row, 3, fill=BLANK_FILL)
                 row += 1
 
@@ -1633,11 +1666,11 @@ def create_output(results, output_path, msd_path, raw_plate_blocks, units=None, 
         for unk in res.get('unknowns', []):
             ws.cell(row=row, column=1, value=unk['well'])
             ws.cell(row=row, column=2, value=unk.get('sample_name', ''))
-            ws.cell(row=row, column=3, value=unk['signal'])
+            ws.cell(row=row, column=3, value=_xv(unk['signal']))
             ws.cell(row=row, column=3).number_format = '#,##0'
             c_val = unk['interp_conc']
             if c_val is not None and np.isfinite(c_val):
-                ws.cell(row=row, column=4, value=round(c_val, 4))
+                ws.cell(row=row, column=4, value=round(float(c_val), 4))
                 ws.cell(row=row, column=4).number_format = '#,##0.0000'
                 # Check signal against LLOQ signal threshold first
                 if lloq_sig and unk['signal'] < lloq_sig:
@@ -1776,7 +1809,7 @@ def create_output(results, output_path, msd_path, raw_plate_blocks, units=None, 
             if idx < len(tp_list):
                 tp_val = tp_list[idx]
                 tp_index[tp_key] += 1
-                tp_cell.value = round(tp_val, 4)
+                tp_cell.value = _xv(round(float(tp_val), 4) if np.isfinite(float(tp_val)) else tp_val)
                 tp_cell.number_format = '0.0000'
         # Normalized Protein Concentration (col 13)
         norm_cell = ws_all.cell(row=arow, column=13)
