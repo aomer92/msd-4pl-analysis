@@ -1159,25 +1159,56 @@ def _extract_animal_tissue(sample_name):
 
 
 
+# Characters illegal in XML 1.0 (the format used by .xlsx).
+# Plate-reader exports sometimes embed null bytes or other control chars
+# that pass through Python string I/O but cause openpyxl to emit invalid
+# XML — Excel then shows a "repair" prompt when opening the file.
+# Illegal ranges: U+0000–U+0008, U+000B, U+000C, U+000E–U+001F, U+FFFE, U+FFFF
+_XML_ILLEGAL = re.compile(r'[\x00-\x08\x0b\x0c\x0e-\x1f￾￿]')
+
+def _safe_str(s):
+    """Strip XML-1.0-illegal characters from a string before writing to a cell."""
+    if not isinstance(s, str):
+        s = str(s)
+    return _XML_ILLEGAL.sub('', s)
+
+
 def _xv(val, fallback="N/A"):
     """Convert a value to a Python-native type safe for openpyxl cells.
 
-    openpyxl cannot serialise numpy scalars, numpy.nan, numpy.inf, or
-    Python float('nan') / float('inf') — they produce corrupt XML that
-    Excel must 'repair' on open.  This helper:
-      • Returns the value unchanged if it is already a str/int/bool/None.
-      • Converts numpy scalars and Python floats to native float, then
-        returns ``fallback`` for NaN or ±Inf so the cell gets a clean
-        "N/A" (or whatever string/None the caller passes) instead of a
-        bad float literal.
+    openpyxl serialises cell values as XML 1.0.  Three classes of value
+    corrupt that XML:
+
+      1. numpy.nan / float('nan') / numpy.inf — written as the literal
+         string "nan" or "inf" which is invalid for numeric cell types.
+      2. numpy scalar types (numpy.float64, numpy.int64, …) — some
+         openpyxl versions do not recognise these as numbers and write
+         them as strings or fail entirely.
+      3. Strings containing XML-1.0-illegal characters (null bytes,
+         control characters \x00-\x08, \x0b, \x0c, \x0e-\x1f) which
+         appear in raw plate-reader export files.
+
+    This function:
+      • For None      → returns ``fallback``
+      • For bool      → returns the bool unchanged (True/False are valid)
+      • For str       → strips XML-illegal characters and returns the str
+      • For numerics  → converts to Python-native float; returns
+                        ``fallback`` for NaN, ±Inf
     """
     if val is None:
         return fallback
-    if isinstance(val, (str, bool)):
+    if isinstance(val, bool):
         return val
+    if isinstance(val, str):
+        return _safe_str(val)
     try:
         f = float(val)
-        return f if (f == f and abs(f) != float('inf')) else fallback
+        if f != f or abs(f) == float('inf'):   # NaN or ±Inf
+            return fallback
+        # Return as Python int when it is a whole number (cleaner Excel display)
+        if f == int(f) and abs(f) < 2**53:
+            return int(f)
+        return f
     except (TypeError, ValueError):
         return fallback
 
@@ -1517,23 +1548,23 @@ def create_output(results, output_path, msd_path, raw_plate_blocks, units=None, 
         _header_row(ws, next_row, qc_h)
         next_row += 1
         for qr in qc_summary_rows:
-            ws.cell(row=next_row, column=1, value=qr['sample_name'])
-            ws.cell(row=next_row, column=2, value=qr['level'])
-            ws.cell(row=next_row, column=3, value=qr['plate'])
-            ws.cell(row=next_row, column=4, value=qr['group'] or "")
+            ws.cell(row=next_row, column=1, value=_safe_str(qr['sample_name']))
+            ws.cell(row=next_row, column=2, value=_safe_str(str(qr['level'])))
+            ws.cell(row=next_row, column=3, value=_safe_str(str(qr['plate'])))
+            ws.cell(row=next_row, column=4, value=_safe_str(str(qr['group'])) if qr['group'] else "")
             sig_cell = ws.cell(row=next_row, column=5,
-                               value=round(qr['avg_signal'], 1) if np.isfinite(qr['avg_signal']) else "N/A")
+                               value=round(float(qr['avg_signal']), 1) if np.isfinite(qr['avg_signal']) else "N/A")
             sig_cell.number_format = '#,##0'
             corr_cell = ws.cell(row=next_row, column=6,
-                                value=round(qr['corrected_conc'], 4) if np.isfinite(qr['corrected_conc']) else "N/A")
+                                value=round(float(qr['corrected_conc']), 4) if np.isfinite(qr['corrected_conc']) else "N/A")
             corr_cell.number_format = '#,##0.0000'
             exp_conc_val = (qc_expected_concentrations or {}).get(qr['group']) if isinstance(qc_expected_concentrations, dict) else qc_expected_concentrations
-            exp_cell = ws.cell(row=next_row, column=7, value=exp_conc_val if exp_conc_val else "")
+            exp_cell = ws.cell(row=next_row, column=7, value=_xv(exp_conc_val) if exp_conc_val else "")
             if exp_conc_val:
                 exp_cell.number_format = '#,##0.0###'
             rec_cell = ws.cell(row=next_row, column=8)
             if np.isfinite(qr['recovery']):
-                rec_cell.value = round(qr['recovery'], 1)
+                rec_cell.value = round(float(qr['recovery']), 1)
                 rec_cell.number_format = '0.0'
                 rec_cell.font = PASS_FONT if QC_RECOVERY_LOW <= qr['recovery'] <= QC_RECOVERY_HIGH else FAIL_FONT
             else:
@@ -1605,8 +1636,8 @@ def create_output(results, output_path, msd_path, raw_plate_blocks, units=None, 
             mean_finite = np.isfinite(mean_sig)
             recovery = (mean_sig / fitted * 100) if (mean_finite and fitted and fitted != 0) else None
 
-            ws.cell(row=row, column=1, value=', '.join(sg['wells']))
-            ws.cell(row=row, column=2, value=sg['conc'])
+            ws.cell(row=row, column=1, value=_safe_str(', '.join(sg['wells'])))
+            ws.cell(row=row, column=2, value=_xv(sg['conc']))
             ws.cell(row=row, column=2).number_format = '#,##0.00'
             ws.cell(row=row, column=3, value=round(float(mean_sig), 1) if mean_finite else "N/A")
             ws.cell(row=row, column=3).number_format = '#,##0.0'
@@ -1642,8 +1673,8 @@ def create_output(results, output_path, msd_path, raw_plate_blocks, units=None, 
             _header_row(ws, row, ["Well", "Sample Name", "Signal"])
             row += 1
             for bl in res['blanks']:
-                ws.cell(row=row, column=1, value=bl['well'])
-                ws.cell(row=row, column=2, value=bl.get('sample_name', ''))
+                ws.cell(row=row, column=1, value=_safe_str(bl['well']))
+                ws.cell(row=row, column=2, value=_safe_str(bl.get('sample_name', '')))
                 ws.cell(row=row, column=3, value=_xv(bl['signal']))
                 ws.cell(row=row, column=3).number_format = '#,##0'
                 _style_row(ws, row, 3, fill=BLANK_FILL)
@@ -1664,8 +1695,8 @@ def create_output(results, output_path, msd_path, raw_plate_blocks, units=None, 
         lloq_sig = res.get('lloq_sig')
 
         for unk in res.get('unknowns', []):
-            ws.cell(row=row, column=1, value=unk['well'])
-            ws.cell(row=row, column=2, value=unk.get('sample_name', ''))
+            ws.cell(row=row, column=1, value=_safe_str(unk['well']))
+            ws.cell(row=row, column=2, value=_safe_str(unk.get('sample_name', '')))
             ws.cell(row=row, column=3, value=_xv(unk['signal']))
             ws.cell(row=row, column=3).number_format = '#,##0'
             c_val = unk['interp_conc']
@@ -1710,7 +1741,7 @@ def create_output(results, output_path, msd_path, raw_plate_blocks, units=None, 
             for ri, line in enumerate(block_lines, 1):
                 parts = line.strip().split(',')
                 for ci, part in enumerate(parts, 1):
-                    ws.cell(row=row + ri - 1, column=ci, value=part.strip())
+                    ws.cell(row=row + ri - 1, column=ci, value=_safe_str(part.strip()))
             # Adjust row counter
             row += len(block_lines)
             added_plates.add(plate)
@@ -1770,18 +1801,18 @@ def create_output(results, output_path, msd_path, raw_plate_blocks, units=None, 
             cv = np.std(concs, ddof=1) / avg_conc * 100
 
         animal, tissue = _extract_animal_tissue(sample_name)
-        ws_all.cell(row=arow, column=1, value=sample_name)
-        ws_all.cell(row=arow, column=2, value=animal or "")
-        ws_all.cell(row=arow, column=3, value=tissue or "")
-        ws_all.cell(row=arow, column=4, value=plate)
-        ws_all.cell(row=arow, column=5, value=wells)
-        ws_all.cell(row=arow, column=6, value=round(avg_signal, 1) if np.isfinite(avg_signal) else "N/A")
+        ws_all.cell(row=arow, column=1, value=_safe_str(sample_name))
+        ws_all.cell(row=arow, column=2, value=_safe_str(animal) if animal else "")
+        ws_all.cell(row=arow, column=3, value=_safe_str(tissue) if tissue else "")
+        ws_all.cell(row=arow, column=4, value=_safe_str(str(plate)))
+        ws_all.cell(row=arow, column=5, value=_safe_str(wells))
+        ws_all.cell(row=arow, column=6, value=round(float(avg_signal), 1) if np.isfinite(avg_signal) else "N/A")
         ws_all.cell(row=arow, column=6).number_format = '#,##0'
-        ws_all.cell(row=arow, column=7, value=round(avg_conc, 4) if np.isfinite(avg_conc) else "N/A")
+        ws_all.cell(row=arow, column=7, value=round(float(avg_conc), 4) if np.isfinite(avg_conc) else "N/A")
         ws_all.cell(row=arow, column=7).number_format = '#,##0.0000'
         # %CV (col 8)
         cv_cell = ws_all.cell(row=arow, column=8)
-        cv_cell.value = round(cv, 1) if np.isfinite(cv) else "N/A"
+        cv_cell.value = round(float(cv), 1) if np.isfinite(cv) else "N/A"
         cv_cell.number_format = '0.0'
         if np.isfinite(cv):
             cv_cell.fill = CV_BAD_FILL if cv > cv_threshold else CV_GOOD_FILL
@@ -1792,12 +1823,12 @@ def create_output(results, output_path, msd_path, raw_plate_blocks, units=None, 
         # Dilution Factor (col 10)
         df_cell = ws_all.cell(row=arow, column=10)
         has_factor = is_qc_factor or (plate in plate_dilution_factors)
-        df_cell.value = factor if has_factor else ""
+        df_cell.value = _xv(factor) if has_factor else ""
         if has_factor:
             df_cell.number_format = '0.###'
         # Corrected Avg Interp. Conc. (col 11)
         corrected_cell = ws_all.cell(row=arow, column=11)
-        corrected_cell.value = round(corrected_conc, 4) if np.isfinite(corrected_conc) else "N/A"
+        corrected_cell.value = round(float(corrected_conc), 4) if np.isfinite(corrected_conc) else "N/A"
         corrected_cell.number_format = '#,##0.0000'
         # Total Protein (col 12) — consume values in order of appearance per (animal, tissue)
         tp_val = None
@@ -1809,12 +1840,12 @@ def create_output(results, output_path, msd_path, raw_plate_blocks, units=None, 
             if idx < len(tp_list):
                 tp_val = tp_list[idx]
                 tp_index[tp_key] += 1
-                tp_cell.value = _xv(round(float(tp_val), 4) if np.isfinite(float(tp_val)) else tp_val)
+                tp_cell.value = _xv(tp_val)
                 tp_cell.number_format = '0.0000'
         # Normalized Protein Concentration (col 13)
         norm_cell = ws_all.cell(row=arow, column=13)
-        if tp_val is not None and np.isfinite(corrected_conc) and tp_val != 0:
-            norm_cell.value = round(corrected_conc / tp_val, 6)
+        if tp_val is not None and np.isfinite(corrected_conc) and float(tp_val) != 0:
+            norm_cell.value = round(float(corrected_conc) / float(tp_val), 6)
             norm_cell.number_format = '0.000000'
         _style_row(ws_all, arow, len(all_h))
         arow += 1
@@ -1831,7 +1862,7 @@ def create_output(results, output_path, msd_path, raw_plate_blocks, units=None, 
         fields = line.rstrip('\n').split('\t')
         max_cols = max(max_cols, len(fields))
         for c_idx, val in enumerate(fields, start=1):
-            ws_msd.cell(row=r_idx, column=c_idx, value=val)
+            ws_msd.cell(row=r_idx, column=c_idx, value=_safe_str(val))
     # Auto-size first column (usually widest — contains row labels)
     ws_msd.column_dimensions['A'].width = 40
     for col_letter in [chr(ord('A') + i) for i in range(1, min(max_cols, 25))]:
