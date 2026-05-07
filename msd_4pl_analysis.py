@@ -1167,10 +1167,18 @@ def _extract_animal_tissue(sample_name):
 _XML_ILLEGAL = re.compile(r'[\x00-\x08\x0b\x0c\x0e-\x1f￾￿]')
 
 def _safe_str(s):
-    """Strip XML-1.0-illegal characters from a string before writing to a cell."""
+    """Strip XML-1.0-illegal characters from a string before writing to a cell.
+
+    Returns None (not empty string) when the result would be empty.
+    openpyxl writes empty-string values as ``<c t="inlineStr" />`` — a cell
+    that claims inline-string type but carries no ``<is>`` child.  That
+    violates the OOXML schema and triggers Excel's 'repair' dialog.
+    Returning None causes openpyxl to emit a plain empty cell instead.
+    """
     if not isinstance(s, str):
         s = str(s)
-    return _XML_ILLEGAL.sub('', s)
+    cleaned = _XML_ILLEGAL.sub('', s)
+    return cleaned if cleaned else None
 
 
 def _xv(val, fallback="N/A"):
@@ -1492,7 +1500,8 @@ def create_output(results, output_path, msd_path, raw_plate_blocks, units=None, 
     _header_row(ws, 2, headers)
 
     for ri, res in enumerate(results, 3):
-        vals = [res['plate'], res['spot'], res.get('group', '')]
+        _grp = res.get('group', '')
+        vals = [res['plate'], res['spot'], _grp if _grp else None]
         if res['params'] is not None:
             a, b, c, d = res['params']
             vals += [
@@ -1523,13 +1532,16 @@ def create_output(results, output_path, msd_path, raw_plate_blocks, units=None, 
         if res['params'] is not None:
             r2_raw = res['r2']
             vals += [round(float(r2_raw), 6) if np.isfinite(r2_raw) else "N/A"]
-            flag_text = "No standards" if res.get('no_standards') else ""
+            flag_text = "No standards" if res.get('no_standards') else None
             vals.append(flag_text)
             vals.append("Good" if r2_raw >= R2_GOOD else ("Acceptable" if r2_raw >= R2_ACCEPTABLE else ("Negative R²" if r2_raw < 0 else "Poor")))
         else:
-            vals += ["N/A", "", "Failed"]
+            vals += ["N/A", None, "Failed"]
 
         for ci, v in enumerate(vals, 1):
+            # Never write bare empty strings — they produce invalid inlineStr cells
+            if v == '':
+                v = None
             ws.cell(row=ri, column=ci, value=v)
         status = ws.cell(row=ri, column=12)
         status.font = PASS_FONT if status.value == "Good" else (WARN_FONT if status.value == "Acceptable" else FAIL_FONT)
@@ -1551,7 +1563,7 @@ def create_output(results, output_path, msd_path, raw_plate_blocks, units=None, 
             ws.cell(row=next_row, column=1, value=_safe_str(qr['sample_name']))
             ws.cell(row=next_row, column=2, value=_safe_str(str(qr['level'])))
             ws.cell(row=next_row, column=3, value=_safe_str(str(qr['plate'])))
-            ws.cell(row=next_row, column=4, value=_safe_str(str(qr['group'])) if qr['group'] else "")
+            ws.cell(row=next_row, column=4, value=_safe_str(str(qr['group'])) if qr['group'] else None)
             sig_cell = ws.cell(row=next_row, column=5,
                                value=round(float(qr['avg_signal']), 1) if np.isfinite(qr['avg_signal']) else "N/A")
             sig_cell.number_format = '#,##0'
@@ -1559,7 +1571,7 @@ def create_output(results, output_path, msd_path, raw_plate_blocks, units=None, 
                                 value=round(float(qr['corrected_conc']), 4) if np.isfinite(qr['corrected_conc']) else "N/A")
             corr_cell.number_format = '#,##0.0000'
             exp_conc_val = (qc_expected_concentrations or {}).get(qr['group']) if isinstance(qc_expected_concentrations, dict) else qc_expected_concentrations
-            exp_cell = ws.cell(row=next_row, column=7, value=_xv(exp_conc_val) if exp_conc_val else "")
+            exp_cell = ws.cell(row=next_row, column=7, value=_xv(exp_conc_val) if exp_conc_val else None)
             if exp_conc_val:
                 exp_cell.number_format = '#,##0.0###'
             rec_cell = ws.cell(row=next_row, column=8)
@@ -1802,8 +1814,8 @@ def create_output(results, output_path, msd_path, raw_plate_blocks, units=None, 
 
         animal, tissue = _extract_animal_tissue(sample_name)
         ws_all.cell(row=arow, column=1, value=_safe_str(sample_name))
-        ws_all.cell(row=arow, column=2, value=_safe_str(animal) if animal else "")
-        ws_all.cell(row=arow, column=3, value=_safe_str(tissue) if tissue else "")
+        ws_all.cell(row=arow, column=2, value=_safe_str(animal) if animal else None)
+        ws_all.cell(row=arow, column=3, value=_safe_str(tissue) if tissue else None)
         ws_all.cell(row=arow, column=4, value=_safe_str(str(plate)))
         ws_all.cell(row=arow, column=5, value=_safe_str(wells))
         ws_all.cell(row=arow, column=6, value=round(float(avg_signal), 1) if np.isfinite(avg_signal) else "N/A")
@@ -1823,7 +1835,7 @@ def create_output(results, output_path, msd_path, raw_plate_blocks, units=None, 
         # Dilution Factor (col 10)
         df_cell = ws_all.cell(row=arow, column=10)
         has_factor = is_qc_factor or (plate in plate_dilution_factors)
-        df_cell.value = _xv(factor) if has_factor else ""
+        df_cell.value = _xv(factor) if has_factor else None
         if has_factor:
             df_cell.number_format = '0.###'
         # Corrected Avg Interp. Conc. (col 11)
@@ -1862,11 +1874,24 @@ def create_output(results, output_path, msd_path, raw_plate_blocks, units=None, 
         fields = line.rstrip('\n').split('\t')
         max_cols = max(max_cols, len(fields))
         for c_idx, val in enumerate(fields, start=1):
-            ws_msd.cell(row=r_idx, column=c_idx, value=_safe_str(val))
+            cleaned = _safe_str(val)
+            if cleaned is not None:   # skip empty fields — never write "" to a cell
+                ws_msd.cell(row=r_idx, column=c_idx, value=cleaned)
     # Auto-size first column (usually widest — contains row labels)
     ws_msd.column_dimensions['A'].width = 40
     for col_letter in [chr(ord('A') + i) for i in range(1, min(max_cols, 25))]:
         ws_msd.column_dimensions[col_letter].width = 18
+
+    # ── Final sanitisation: fix any cells openpyxl mis-classified as formulas ──
+    # openpyxl treats any string starting with '=' as an Excel formula and writes
+    # <f>...<v /> — an empty cached-value element that Excel flags as corrupt.
+    # This app never writes real formulas; force every such cell back to a plain
+    # string so it serialises as a valid <is><t>…</t></is> inlineStr cell.
+    for _ws in wb.worksheets:
+        for _row in _ws.iter_rows():
+            for _cell in _row:
+                if _cell.data_type == 'f':
+                    _cell.data_type = 's'
 
     wb.save(output_path)
     print(f"Saved: {output_path}")
