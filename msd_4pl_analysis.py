@@ -395,8 +395,6 @@ def _ensure_deps():
         from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
         g.update(Font=Font, PatternFill=PatternFill, Alignment=Alignment,
                  Border=Border, Side=Side)
-        from openpyxl.chart import ScatterChart, Reference, Series
-        g.update(ScatterChart=ScatterChart, Reference=Reference, Series=Series)
         from openpyxl.drawing.image import Image as XlImage; g['XlImage'] = XlImage
         from openpyxl.utils import get_column_letter; g['get_column_letter'] = get_column_letter
         import matplotlib; matplotlib.use('Agg'); g['matplotlib'] = matplotlib
@@ -518,7 +516,7 @@ def fit_4pl(conc, signal):
         popt, _ = curve_fit(
             four_pl, c_fit, s_fit,
             p0=[a0, b0, c0, d0],
-            sigma=s_fit,            # 1/y² weighting
+            sigma=np.clip(s_fit, 1e-3, None),   # 1/y² weighting; clamp avoids near-zero σ → ∞ weight instability
             absolute_sigma=False,   # σ defines relative weights, not true std-devs
             maxfev=5000,
             bounds=bounds,
@@ -570,8 +568,7 @@ def generate_std_curve_chart(res, tmp_dir, lloq_method='current', units=None):
     rep_sigs  = np.array([p[1] for p in std_pts])
 
     # Aggregate replicates per unique concentration → mean ± SD for error bars
-    from collections import defaultdict as _dd
-    _by_conc = _dd(list)
+    _by_conc = defaultdict(list)
     for c_val, s_val in std_pts:
         _by_conc[c_val].append(s_val)
     agg_concs = np.array(sorted(_by_conc))
@@ -1137,18 +1134,23 @@ def _extract_animal_tissue(sample_name):
     Flexible extraction of animal number and tissue from a sample name.
     - Strips any trailing _suffix (e.g. _P1, _rep2) before parsing
     - Splits by '-' and scans segments regardless of order or extras:
-        Animal → first purely numeric segment        (e.g. '1001')
-        Tissue → longest purely alphabetic segment   (e.g. 'fCtx' beats 'XX')
+        Animal → first segment that is purely numeric OR starts with optional
+                 letters followed by digits (e.g. '1001', 'M001', 'Animal12')
+        Tissue → longest remaining segment that starts with a letter and
+                 contains no digits  (e.g. 'fCtx' beats 'XX')
     - Returns (None, None) if no animal number found (e.g. HQC, Buffer Only)
     Handles any ordering or extra segments:
-        fCtx-1001_P1, 1001-fCtx, fCtx-XX-1001, 1001-XX-fCtx, etc.
+        fCtx-1001_P1, 1001-fCtx, fCtx-XX-1001, M001-fCtx, Animal12-Hp, etc.
     """
     base = sample_name.strip().split('_')[0]   # drop _P1, _rep2, etc.
     segments = base.split('-')
-    animal = next((s for s in segments if s.isdigit()), None)
+    # Animal: purely numeric OR optional leading letters + required trailing digits
+    _animal_pat = re.compile(r'^[A-Za-z]*\d+$')
+    animal = next((s for s in segments if _animal_pat.match(s)), None)
     if animal is None:
         return None, None   # no animal ID → QC or non-sample name
-    alpha_segs = [s for s in segments if s.isalpha()]
+    # Tissue: starts with a letter, no digits, exclude the animal segment itself
+    alpha_segs = [s for s in segments if s != animal and re.match(r'^[A-Za-z][A-Za-z]*$', s)]
     tissue = max(alpha_segs, key=len) if alpha_segs else None
     return animal, tissue
 
@@ -1531,10 +1533,13 @@ def create_output(results, output_path, msd_path, raw_plate_blocks, units=None, 
 
         if res['params'] is not None:
             r2_raw = res['r2']
-            vals += [round(float(r2_raw), 6) if np.isfinite(r2_raw) else "N/A"]
+            vals += [round(float(r2_raw), 6) if (r2_raw is not None and np.isfinite(r2_raw)) else "N/A"]
             flag_text = "No standards" if res.get('no_standards') else None
             vals.append(flag_text)
-            vals.append("Good" if r2_raw >= R2_GOOD else ("Acceptable" if r2_raw >= R2_ACCEPTABLE else ("Negative R²" if r2_raw < 0 else "Poor")))
+            if r2_raw is None or not np.isfinite(r2_raw):
+                vals.append("Poor")
+            else:
+                vals.append("Good" if r2_raw >= R2_GOOD else ("Acceptable" if r2_raw >= R2_ACCEPTABLE else ("Negative R²" if r2_raw < 0 else "Poor")))
         else:
             vals += ["N/A", None, "Failed"]
 
@@ -1616,7 +1621,7 @@ def create_output(results, output_path, msd_path, raw_plate_blocks, units=None, 
             ws.cell(row=row, column=1).border = THIN_BORDER
             if res['params'] is not None:
                 val = res['params'][i] if i < 4 else res['r2']
-                ws.cell(row=row, column=2, value=_xv(round(float(val), 6) if np.isfinite(val) else val))
+                ws.cell(row=row, column=2, value=_xv(round(float(val), 6) if (val is not None and np.isfinite(val)) else val))
             else:
                 ws.cell(row=row, column=2, value="N/A")
             ws.cell(row=row, column=2).font = DATA_FONT
@@ -2382,12 +2387,15 @@ def generate_html_report(results, html_path, msd_path, units=None,
         a = b = c = d = r2 = lloq_sig_disp = lloq_conc_disp = status = flags = 'N/A'
         if res['params'] is not None:
             a, b, c, d = [f"{v:.4g}" for v in res['params']]
-            r2 = f"{res['r2']:.6f}"
             r2_val = res['r2']
-            status = ('Good' if r2_val >= R2_GOOD
-                      else 'Acceptable' if r2_val >= R2_ACCEPTABLE
-                      else 'Negative R²' if r2_val < 0
-                      else 'Poor')
+            r2 = f"{r2_val:.6f}" if (r2_val is not None and np.isfinite(r2_val)) else 'N/A'
+            if r2_val is None or not np.isfinite(r2_val):
+                status = 'Poor'
+            else:
+                status = ('Good' if r2_val >= R2_GOOD
+                          else 'Acceptable' if r2_val >= R2_ACCEPTABLE
+                          else 'Negative R²' if r2_val < 0
+                          else 'Poor')
             flags = ''
         else:
             status = 'Failed'
@@ -2515,7 +2523,7 @@ def generate_html_report(results, html_path, msd_path, units=None,
 
         flag_class = ('status-good' if flag == 'In Range'
                       else 'status-warn' if flag in ('> ULOQ', '< LLOQ') else '')
-        cv_class = 'cv-bad' if np.isfinite(cv) and cv > cv_threshold else ''
+        cv_class = 'cv-bad' if (cv_threshold is not None and np.isfinite(cv) and cv > cv_threshold) else ''
         avg_sig_str  = f"{avg_sig:,.1f}" if np.isfinite(avg_sig) else 'N/A'
         avg_conc_str = f"{avg_conc:.4g}" if np.isfinite(avg_conc) else 'N/A'
         cv_str       = f"{cv:.1f}" if np.isfinite(cv) else 'N/A'
