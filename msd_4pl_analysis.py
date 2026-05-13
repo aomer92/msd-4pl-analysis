@@ -1168,10 +1168,22 @@ def calculate_lloq_signal(signals, lloq_method='current'):
 
 
 def parse_total_protein_csv(filepath):
-    """
-    Parse a total protein CSV file. Expects columns:
-      'External Animal Number', 'Tissue Type', 'Total Protein Result'
-    Multiple rows with the same (animal, tissue) are kept in order of appearance.
+    """Parse a total protein CSV file.
+
+    Accepts two formats:
+
+    Simple (3-column minimum):
+        External Animal Number, Tissue Type, Total Protein Result
+
+    ELISA Results export (superset — extra columns are ignored):
+        In Vivo Study, Animal Sample Lookup, Lysate, External Animal Number,
+        Group Number, Tissue Type, Total Protein Result, Final ELISA
+        Concentration, ELISA Result, ...
+
+    Rows with non-numeric or blank Total Protein Result are skipped.
+    Multiple rows with the same (animal, tissue) are stored in order of
+    appearance — _P1 uses index 0, _P2 uses index 1, etc.
+
     Returns dict {(animal_str, tissue_str): [val1, val2, ...]}
     """
     df = pd.read_csv(filepath, dtype=str)
@@ -1179,20 +1191,37 @@ def parse_total_protein_csv(filepath):
     required = {'External Animal Number', 'Tissue Type', 'Total Protein Result'}
     missing = required - set(df.columns)
     if missing:
-        raise ValueError(f"Total protein CSV missing columns: {missing}")
+        raise ValueError(
+            f"Total protein CSV missing required columns: {missing}\n"
+            f"Found columns: {list(df.columns)}")
     tp_map = {}
     for _, row in df.iterrows():
         animal = str(row['External Animal Number']).strip()
         tissue = str(row['Tissue Type']).strip()
+        if not animal or animal.lower() in ('nan', ''):
+            continue
         try:
             val = float(row['Total Protein Result'])
         except (ValueError, TypeError):
-            continue
+            continue   # blank, #VALUE!, or non-numeric — skip row
         key = (animal, tissue)
         if key not in tp_map:
             tp_map[key] = []
         tp_map[key].append(val)
     return tp_map
+
+
+def _extract_replicate_index(sample_name):
+    """Return the 0-based replicate index from a _P{n} / _R{n} suffix, or None.
+
+    Examples:
+        'fCtx-1001_P1'  → 0
+        'fCtx-1001_P2'  → 1
+        'fCtx-1001_R3'  → 2
+        'fCtx-1001'     → None  (no suffix — caller falls back to sequential counter)
+    """
+    m = re.search(r'_[PpRr](\d+)$', sample_name.strip())
+    return int(m.group(1)) - 1 if m else None
 
 
 def _extract_animal_tissue(sample_name):
@@ -1937,16 +1966,26 @@ def _create_output_inner(wb, tmp_dir, results, output_path, msd_path, raw_plate_
         corrected_cell = ws_all.cell(row=arow, column=13)
         corrected_cell.value = round(float(corrected_conc), 4) if np.isfinite(corrected_conc) else "N/A"
         corrected_cell.number_format = '#,##0.0000'
-        # Total Protein (col 14) — consume values in order of appearance per (animal, tissue)
+        # Total Protein (col 14)
+        # Use _P{n}/_R{n} replicate suffix as direct 0-based index into the
+        # TP list when present (sample replicates).  Fall back to a sequential
+        # counter for names without a suffix (technical replicates / single
+        # samples where ordering is deterministic).
         tp_val = None
         tp_cell = ws_all.cell(row=arow, column=14)
         if total_protein_map and animal:
             tp_key = (animal, tissue)
             tp_list = total_protein_map.get(tp_key, [])
-            idx = tp_index[tp_key]
-            if idx < len(tp_list):
-                tp_val = tp_list[idx]
-                tp_index[tp_key] += 1
+            rep_idx = _extract_replicate_index(sample_name)
+            if rep_idx is not None:
+                if rep_idx < len(tp_list):
+                    tp_val = tp_list[rep_idx]
+            else:
+                idx = tp_index[tp_key]
+                if idx < len(tp_list):
+                    tp_val = tp_list[idx]
+                    tp_index[tp_key] += 1
+            if tp_val is not None:
                 tp_cell.value = _xv(tp_val)
                 tp_cell.number_format = '0.0000'
         # Normalized Protein Concentration (col 15)
@@ -2590,16 +2629,21 @@ def generate_html_report(results, html_path, msd_path, units=None,
             sname, group, plate,
             qc_dilution_factors, group_dilution_factors, plate_dilution_factors)
         corrected = avg_conc * factor if np.isfinite(avg_conc) else np.nan
-        # Total protein & normalized (same in-order assignment as create_output)
+        # Total protein & normalized — same replicate-index logic as create_output
         animal, tissue = _extract_animal_tissue(sname)
         tp_val = None
         if total_protein_map and animal:
             tp_key = (animal, tissue)
             tp_list = total_protein_map.get(tp_key, [])
-            idx = tp_index[tp_key]
-            if idx < len(tp_list):
-                tp_val = tp_list[idx]
-                tp_index[tp_key] += 1
+            rep_idx = _extract_replicate_index(sname)
+            if rep_idx is not None:
+                if rep_idx < len(tp_list):
+                    tp_val = tp_list[rep_idx]
+            else:
+                idx = tp_index[tp_key]
+                if idx < len(tp_list):
+                    tp_val = tp_list[idx]
+                    tp_index[tp_key] += 1
         norm_val = (corrected / tp_val
                     if tp_val is not None and np.isfinite(corrected) and tp_val != 0
                     else None)
