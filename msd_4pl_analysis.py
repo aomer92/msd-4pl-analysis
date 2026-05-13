@@ -444,6 +444,71 @@ def _identify_qc_level(sample_name):
     return None
 
 
+def _parse_groups_only(filepath):
+    """Lightweight stdlib-only group + QC detection from a plate map CSV.
+
+    Returns (groups_found, grp_qc_levels) without importing pandas/numpy:
+      groups_found  : set of group name strings (excludes '_default')
+      grp_qc_levels : dict {group: set_of_qc_level_strings}
+    """
+    import csv as _csv
+    groups_found = set()
+    grp_qc = {}   # {group: set()}
+
+    _BLANK_VALS = {'buffer only', 'blank', 'buffer', 'bg', 'background', '0'}
+
+    try:
+        with open(filepath, 'r', encoding='utf-8-sig') as f:
+            reader = _csv.reader(f)
+            for row in reader:
+                # Skip blank rows and header rows (first cell empty = column-number row)
+                if not row or all(c.strip() == '' for c in row):
+                    continue
+                for cell in row[1:]:   # column 0 is the row-letter index
+                    cell = cell.strip()
+                    if not cell:
+                        continue
+
+                    # Parse group prefix  e.g. "TreatA&TreatB:SampleX" or "Group1:800000"
+                    raw_val = cell
+                    cell_groups = ['_default']
+                    if ':' in cell:
+                        prefix, rest = cell.split(':', 1)
+                        prefix = prefix.strip()
+                        rest   = rest.strip()
+                        if rest and len(prefix) <= 40 and prefix:
+                            sub = [g.strip() for g in prefix.split('&') if g.strip()]
+                            if sub:
+                                cell_groups = sub
+                                raw_val = rest
+
+                    # Determine sample type from the value
+                    is_blank   = raw_val.lower() in _BLANK_VALS
+                    is_numeric = False
+                    try:
+                        float(raw_val.replace(',', ''))
+                        is_numeric = True
+                    except ValueError:
+                        pass
+                    sample_name = '' if (is_blank or is_numeric) else raw_val
+
+                    for g in cell_groups:
+                        if g == '_default':
+                            continue
+                        groups_found.add(g)
+                        if g not in grp_qc:
+                            grp_qc[g] = set()
+                        if sample_name:
+                            level = _identify_qc_level(sample_name)
+                            if level:
+                                grp_qc[g].add(level)
+
+    except Exception:
+        pass   # caller handles empty result gracefully
+
+    return groups_found, grp_qc
+
+
 def four_pl(x, a, b, c, d):
     """4PL: a=min asymptote, b=Hill slope, c=inflection (EC50), d=max asymptote"""
     return d + (a - d) / (1.0 + (x / c) ** b)
@@ -5039,25 +5104,20 @@ def run_interactive():
     grp_rows_frame.grid(row=2, column=0, columnspan=6, sticky=tk.EW)
 
     def _detect_groups():
-        """Parse the platemap and create one dilution-factor row per group."""
+        """Parse the platemap and create one dilution-factor row per group.
+
+        Uses the lightweight stdlib-only _parse_groups_only() so that heavy
+        deps (pandas / numpy) are never needed just for group detection.
+        """
         pm_path = platemap_var.get().strip()
         if not pm_path or not os.path.exists(pm_path):
             messagebox.showwarning("No Plate Map", "Please select a valid plate map CSV first.")
             return
         try:
-            _ensure_deps()   # pandas / numpy needed by the parser
-            plate_maps, _ = parse_plate_map_grid(pm_path)
+            found, grp_qc_levels = _parse_groups_only(pm_path)
         except Exception as exc:
             messagebox.showerror("Parse Error", f"Could not read plate map:\n{exc}")
             return
-
-        # Collect all unique non-default groups across all plate maps
-        found = set()
-        for entries in plate_maps.values():
-            for e in entries:
-                g = e.get('group', '_default')
-                if g and g != '_default':
-                    found.add(g)
 
         # Destroy old rows
         for w in grp_rows_frame.winfo_children():
@@ -5069,17 +5129,6 @@ def run_interactive():
                       foreground='grey').grid(row=0, column=0, columnspan=6, sticky=tk.W)
             group_df_vars.clear()
             return
-
-        # Find QC levels per group
-        grp_qc_levels = {g: set() for g in found}
-        for entries in plate_maps.values():
-            for e in entries:
-                g = e.get('group', '_default')
-                if g not in grp_qc_levels:
-                    continue
-                level = _identify_qc_level(e.get('sample_name', ''))
-                if level:
-                    grp_qc_levels[g].add(level)
 
         # All QC levels seen across all groups (for column headers)
         all_qc_cols = [lvl for lvl in QC_LEVELS if any(lvl in grp_qc_levels[g] for g in found)]
@@ -5196,6 +5245,10 @@ def run_interactive():
     # Notification button — left side of the bar
     ttk.Button(_btn_row, text='🔔  Get Update Notifications',
                command=_show_notify_dialog).pack(side=tk.LEFT)
+
+    # Preload heavy deps in the background so the first Run Analysis is snappier.
+    # This is fire-and-forget — _ensure_deps() guards against double-loading.
+    threading.Thread(target=_ensure_deps, daemon=True).start()
 
     root.mainloop()
 
