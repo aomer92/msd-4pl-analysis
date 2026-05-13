@@ -125,8 +125,9 @@ The Excel workbook contains:
     by sample name, with averaged signals and concentrations.
 """
 
-import re, sys, argparse, os, tempfile, json, subprocess, platform, functools, multiprocessing
+import re, sys, argparse, os, tempfile, json, subprocess, platform, functools, multiprocessing, shutil
 import threading, urllib.request
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 
 __version__ = "1.3.1"
 
@@ -182,7 +183,7 @@ def _fetch_latest_version():
     return None, None
 
 # ── Auto-install update ───────────────────────────────────────────────────────
-import zipfile
+
 
 def _platform_asset_key():
     """Return 'windows' or 'macos' based on current OS."""
@@ -1305,7 +1306,7 @@ def _chart_worker(args):
 def _aggregate_unknowns(results):
     """Single-pass aggregation of all unknown wells across every result.
 
-    Returns two dicts, both keyed by (sample_name, group, plate):
+    Returns two dicts, both keyed by (sample_name, group, plate, spot):
 
     unk_data  — non-QC samples:
         wells, signals (finite), concs (finite interp), spot, group, plate,
@@ -1315,6 +1316,7 @@ def _aggregate_unknowns(results):
         wells, signals (finite), concs (finite interp), spot, group, plate
 
     Computing both in a single pass avoids iterating over results twice.
+    The key includes spot so that multiplex plates keep analytes separate.
     """
     unk_data = defaultdict(lambda: {
         'wells': [], 'signals': [], 'concs': [],
@@ -1345,7 +1347,7 @@ def _aggregate_unknowns(results):
 
         for unk in res.get('unknowns', []):
             sname = unk['sample_name']
-            key   = (sname, group, plate)
+            key   = (sname, group, plate, spot)   # spot in key keeps analytes separate on multiplex plates
             if _identify_qc_level(sname):
                 d = qc_data[key]
                 d['spot'] = spot; d['group'] = group; d['plate'] = plate
@@ -1353,7 +1355,7 @@ def _aggregate_unknowns(results):
                 d = unk_data[key]
                 d['spot'] = spot; d['group'] = group; d['plate'] = plate
                 # Per-curve thresholds — first non-None wins (all unknowns in the
-                # same (sample, group, plate) share the same curve)
+                # same (sample, group, plate, spot) share the same curve)
                 if d['lloq_sig']  is None: d['lloq_sig']  = lloq_sig
                 if d['uloq_conc'] is None: d['uloq_conc'] = uloq_conc
                 if d['lloq_conc'] is None: d['lloq_conc'] = lloq_conc
@@ -1452,6 +1454,16 @@ def create_output(results, output_path, msd_path, raw_plate_blocks, units=None, 
     wb = Workbook()
     wb.remove(wb.active)
     tmp_dir = tempfile.mkdtemp(prefix='msd_charts_')
+    try:
+        _create_output_inner(wb, tmp_dir, results, output_path, msd_path, raw_plate_blocks,
+                             units, cv_threshold, plate_dilution_factors, lloq_method,
+                             total_protein_map, qc_dilution_factors, qc_expected_concentrations,
+                             group_dilution_factors)
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+def _create_output_inner(wb, tmp_dir, results, output_path, msd_path, raw_plate_blocks, units=None, cv_threshold=25, plate_dilution_factors=None, lloq_method='current', total_protein_map=None, qc_dilution_factors=None, qc_expected_concentrations=None, group_dilution_factors=None):
 
     # Pre-collect QC overlay points (corrected conc + signal) for overlay chart
     qc_summary_rows, qc_overlay_points = _compute_qc_summary(
@@ -1470,7 +1482,6 @@ def create_output(results, output_path, msd_path, raw_plate_blocks, units=None, 
     _chart_args = [(res, tmp_dir, lloq_method, units) for res in results]
     _key = lambda r: (r['plate'], r['spot'], r.get('group', ''))
     try:
-        from concurrent.futures import ProcessPoolExecutor
         # Use physical cores (not hyperthreads) — chart rendering is CPU-bound
         # and hyperthreads add context-switch overhead without throughput gain.
         # Cap at 8 to avoid excessive memory pressure on large-core machines.
@@ -1607,6 +1618,14 @@ def create_output(results, output_path, msd_path, raw_plate_blocks, units=None, 
         group = res.get('group', '')
         g_suffix = f"_{group}" if group else ""
         sname = f"P{plate}_S{spot}{g_suffix}"[:31]
+        # Guard against duplicate sheet names after truncation
+        existing = {ws.title for ws in wb.worksheets}
+        if sname in existing:
+            base = sname[:28]
+            n = 2
+            while f"{base}_{n}" in existing:
+                n += 1
+            sname = f"{base}_{n}"
         ws = wb.create_sheet(sname)
         row = 1
 
@@ -1721,7 +1740,7 @@ def create_output(results, output_path, msd_path, raw_plate_blocks, units=None, 
                 ws.cell(row=row, column=4, value=round(float(c_val), 4))
                 ws.cell(row=row, column=4).number_format = '#,##0.0000'
                 # Check signal against LLOQ signal threshold first
-                if lloq_sig and unk['signal'] < lloq_sig:
+                if lloq_sig is not None and unk['signal'] < lloq_sig:
                     ws.cell(row=row, column=5, value="< LLOQ")
                     ws.cell(row=row, column=5).font = WARN_FONT
                 elif uloq and c_val > uloq:
@@ -1768,8 +1787,10 @@ def create_output(results, output_path, msd_path, raw_plate_blocks, units=None, 
 
     # ── All Unknowns Combined ─────────────────────────────────────────
     ws_all = wb.create_sheet("All Unknowns")
-    all_h = ["Sample Name", "Animal", "Tissue", "Plate", "Wells", "Avg Signal", avg_interp_header,
-             "%CV", "Flag", "Dilution Factor", corrected_header, "Total Protein", "Normalized Protein Concentration"]
+    all_h = ["Sample Name", "Animal", "Tissue", "Plate", "Spot", "Group", "Wells",
+             "Avg Signal", avg_interp_header,
+             "%CV", "Flag", "Dilution Factor", corrected_header, "Total Protein",
+             "Normalized Protein Concentration"]
     _header_row(ws_all, 1, all_h)
     arow = 2
     # Track how many TP values have been consumed per (animal, tissue) key
@@ -1779,13 +1800,15 @@ def create_output(results, output_path, msd_path, raw_plate_blocks, units=None, 
     # in generate_html_report which calls the same function independently).
     _unk_data, _qc_data_xl = _aggregate_unknowns(results)
 
-    for (sample_name, curve_group, plate) in sorted(_unk_data.keys()):
-        grp_data = _unk_data[(sample_name, curve_group, plate)]
+    for (sample_name, curve_group, plate, spot_key) in sorted(_unk_data.keys()):
+        grp_data = _unk_data[(sample_name, curve_group, plate, spot_key)]
         signals = grp_data['signals']   # already finite-filtered by helper
         concs   = grp_data['concs']     # already finite-filtered by helper
         avg_signal = np.mean(signals) if signals else np.nan
         avg_conc   = np.mean(concs)   if concs   else np.nan
-        wells = ', '.join(sorted(grp_data['wells']))
+        # Natural well sort: A1, A2, A9, A10, B1, … instead of A1, A10, A2
+        wells = ', '.join(sorted(grp_data['wells'],
+                                 key=lambda w: (w[0], int(re.search(r'\d+', w).group()))))
         uloq_conc    = grp_data['uloq_conc']
         lloq_conc    = grp_data['lloq_conc']
         all_lloq_sig = grp_data['lloq_sig']
@@ -1801,12 +1824,12 @@ def create_output(results, output_path, msd_path, raw_plate_blocks, units=None, 
         corrected_conc = avg_conc * factor if np.isfinite(avg_conc) else np.nan
 
         flag = ""
-        if np.isfinite(avg_signal) and all_lloq_sig and avg_signal < all_lloq_sig:
+        if np.isfinite(avg_signal) and all_lloq_sig is not None and avg_signal < all_lloq_sig:
             flag = "< LLOQ"
         elif np.isfinite(avg_conc):
-            if uloq_conc and avg_conc > uloq_conc:
+            if uloq_conc is not None and avg_conc > uloq_conc:
                 flag = "> ULOQ"
-            elif lloq_conc and avg_conc < lloq_conc:
+            elif lloq_conc is not None and avg_conc < lloq_conc:
                 flag = "< LLOQ"
             else:
                 flag = "In Range"
@@ -1818,38 +1841,40 @@ def create_output(results, output_path, msd_path, raw_plate_blocks, units=None, 
             cv = np.std(concs, ddof=1) / avg_conc * 100
 
         animal, tissue = _extract_animal_tissue(sample_name)
-        ws_all.cell(row=arow, column=1, value=_safe_str(sample_name))
-        ws_all.cell(row=arow, column=2, value=_safe_str(animal) if animal else None)
-        ws_all.cell(row=arow, column=3, value=_safe_str(tissue) if tissue else None)
-        ws_all.cell(row=arow, column=4, value=_safe_str(str(plate)))
-        ws_all.cell(row=arow, column=5, value=_safe_str(wells))
-        ws_all.cell(row=arow, column=6, value=round(float(avg_signal), 1) if np.isfinite(avg_signal) else "N/A")
-        ws_all.cell(row=arow, column=6).number_format = '#,##0'
-        ws_all.cell(row=arow, column=7, value=round(float(avg_conc), 4) if np.isfinite(avg_conc) else "N/A")
-        ws_all.cell(row=arow, column=7).number_format = '#,##0.0000'
-        # %CV (col 8)
-        cv_cell = ws_all.cell(row=arow, column=8)
+        ws_all.cell(row=arow, column=1,  value=_safe_str(sample_name))
+        ws_all.cell(row=arow, column=2,  value=_safe_str(animal) if animal else None)
+        ws_all.cell(row=arow, column=3,  value=_safe_str(tissue) if tissue else None)
+        ws_all.cell(row=arow, column=4,  value=_safe_str(str(plate)))
+        ws_all.cell(row=arow, column=5,  value=_safe_str(str(spot_key)))
+        ws_all.cell(row=arow, column=6,  value=_safe_str(curve_group) if curve_group else None)
+        ws_all.cell(row=arow, column=7,  value=_safe_str(wells))
+        ws_all.cell(row=arow, column=8,  value=round(float(avg_signal), 1) if np.isfinite(avg_signal) else "N/A")
+        ws_all.cell(row=arow, column=8).number_format = '#,##0'
+        ws_all.cell(row=arow, column=9,  value=round(float(avg_conc), 4) if np.isfinite(avg_conc) else "N/A")
+        ws_all.cell(row=arow, column=9).number_format = '#,##0.0000'
+        # %CV (col 10)
+        cv_cell = ws_all.cell(row=arow, column=10)
         cv_cell.value = round(float(cv), 1) if np.isfinite(cv) else "N/A"
         cv_cell.number_format = '0.0'
-        if np.isfinite(cv):
+        if np.isfinite(cv) and cv_threshold is not None:
             cv_cell.fill = CV_BAD_FILL if cv > cv_threshold else CV_GOOD_FILL
-        # Flag (col 9)
-        ws_all.cell(row=arow, column=9, value=flag)
-        cell_flag = ws_all.cell(row=arow, column=9)
+        # Flag (col 11)
+        ws_all.cell(row=arow, column=11, value=flag)
+        cell_flag = ws_all.cell(row=arow, column=11)
         cell_flag.font = PASS_FONT if flag == "In Range" else (WARN_FONT if flag in ["> ULOQ", "< LLOQ"] else FAIL_FONT)
-        # Dilution Factor (col 10)
-        df_cell = ws_all.cell(row=arow, column=10)
+        # Dilution Factor (col 12)
+        df_cell = ws_all.cell(row=arow, column=12)
         has_factor = is_qc_factor or (plate in plate_dilution_factors)
         df_cell.value = _xv(factor) if has_factor else None
         if has_factor:
             df_cell.number_format = '0.###'
-        # Corrected Avg Interp. Conc. (col 11)
-        corrected_cell = ws_all.cell(row=arow, column=11)
+        # Corrected Avg Interp. Conc. (col 13)
+        corrected_cell = ws_all.cell(row=arow, column=13)
         corrected_cell.value = round(float(corrected_conc), 4) if np.isfinite(corrected_conc) else "N/A"
         corrected_cell.number_format = '#,##0.0000'
-        # Total Protein (col 12) — consume values in order of appearance per (animal, tissue)
+        # Total Protein (col 14) — consume values in order of appearance per (animal, tissue)
         tp_val = None
-        tp_cell = ws_all.cell(row=arow, column=12)
+        tp_cell = ws_all.cell(row=arow, column=14)
         if total_protein_map and animal:
             tp_key = (animal, tissue)
             tp_list = total_protein_map.get(tp_key, [])
@@ -1859,8 +1884,8 @@ def create_output(results, output_path, msd_path, raw_plate_blocks, units=None, 
                 tp_index[tp_key] += 1
                 tp_cell.value = _xv(tp_val)
                 tp_cell.number_format = '0.0000'
-        # Normalized Protein Concentration (col 13)
-        norm_cell = ws_all.cell(row=arow, column=13)
+        # Normalized Protein Concentration (col 15)
+        norm_cell = ws_all.cell(row=arow, column=15)
         if tp_val is not None and np.isfinite(corrected_conc) and float(tp_val) != 0:
             norm_cell.value = round(float(corrected_conc) / float(tp_val), 6)
             norm_cell.number_format = '0.000000'
@@ -2073,7 +2098,6 @@ def generate_html_report(results, html_path, msd_path, units=None,
             chart_html = btn + chart_html
         return (label, chart_html)
 
-    from concurrent.futures import ThreadPoolExecutor
     with ThreadPoolExecutor() as _pool:
         curve_divs = list(_pool.map(_build_curve_div, results))
 
@@ -2471,7 +2495,7 @@ def generate_html_report(results, html_path, msd_path, units=None,
     _sp_entries = []
     tp_index = defaultdict(int)
     unk_rows_html = []
-    for (sname, group, plate), data in sorted(all_unk_groups.items()):
+    for (sname, group, plate, spot_key), data in sorted(all_unk_groups.items()):
         spot         = data['spot']
         lloq_sig     = data['lloq_sig']
         uloq_conc    = data['uloq_conc']
@@ -2573,7 +2597,7 @@ def generate_html_report(results, html_path, msd_path, units=None,
 
     # ── QC plot JSON (uses qc_data from the same _aggregate_unknowns call) ──────
     _qp_entries = []
-    for (sname, group, plate), data in sorted(all_qc_groups_pre.items()):
+    for (sname, group, plate, _sp), data in sorted(all_qc_groups_pre.items()):
         avg_conc = np.mean(data['concs']) if data['concs'] else np.nan
         if not np.isfinite(avg_conc):
             continue
@@ -3108,15 +3132,15 @@ function spRenderGroupPanel() {{
   var gc = document.getElementById('sp-groups-container');
   if (!gc) return;
   gc.innerHTML = '';
-  spGroups.forEach(function(g) {{
+  spGroups.forEach(function(g, gi) {{
     var block = document.createElement('div');
     block.className = 'sp-group-block';
     // Header
     var hdr = document.createElement('div');
     hdr.className = 'sp-group-header';
     hdr.style.background = g.color;
-    var isFirst = (spGroups.indexOf(g) === 0);
-    var isLast  = (spGroups.indexOf(g) === spGroups.length - 1);
+    var isFirst = (gi === 0);
+    var isLast  = (gi === spGroups.length - 1);
     var btnStyle = 'background:rgba(255,255,255,0.25);color:white;border-color:rgba(255,255,255,0.4);';
     var btnDisabled = 'background:rgba(255,255,255,0.08);color:rgba(255,255,255,0.3);border-color:rgba(255,255,255,0.15);cursor:default;';
     hdr.innerHTML =
@@ -3355,21 +3379,20 @@ function spRenderChart() {{
   // Build ordered list of {{sname, color, groupName}} segments
   var segments = [];  // [{{groupName, color, items:[sampleName]}}]
 
+  // P2-3: pre-build a name→datum Map so sort comparators are O(1) not O(n)
+  var spDataMap = new Map(allData.map(function(d) {{ return [d.name, d]; }}));
+
   spGroups.forEach(function(g) {{
     if (!g.visible) return;
-    var items = g.samples.filter(function(s) {{
-      return allData.some(function(d) {{ return d.name === s; }});
-    }});
+    var items = g.samples.filter(function(s) {{ return spDataMap.has(s); }});
     if (spSortMode === 'asc') {{
       items.sort(function(a, b) {{
-        var da = allData.find(function(d) {{ return d.name === a; }});
-        var db = allData.find(function(d) {{ return d.name === b; }});
+        var da = spDataMap.get(a), db = spDataMap.get(b);
         return (da ? spGetVals(da).mean : 0) - (db ? spGetVals(db).mean : 0);
       }});
     }} else if (spSortMode === 'desc') {{
       items.sort(function(a, b) {{
-        var da = allData.find(function(d) {{ return d.name === a; }});
-        var db = allData.find(function(d) {{ return d.name === b; }});
+        var da = spDataMap.get(a), db = spDataMap.get(b);
         return (db ? spGetVals(db).mean : 0) - (da ? spGetVals(da).mean : 0);
       }});
     }}
@@ -3377,18 +3400,16 @@ function spRenderChart() {{
   }});
 
   var unassignedItems = showUnassigned
-    ? spUnassigned.filter(function(s) {{ return allData.some(function(d) {{ return d.name === s; }}); }})
+    ? spUnassigned.filter(function(s) {{ return spDataMap.has(s); }})
     : [];
   if (spSortMode === 'asc') {{
     unassignedItems.sort(function(a, b) {{
-      var da = allData.find(function(d) {{ return d.name === a; }});
-      var db = allData.find(function(d) {{ return d.name === b; }});
+      var da = spDataMap.get(a), db = spDataMap.get(b);
       return (da ? spGetVals(da).mean : 0) - (db ? spGetVals(db).mean : 0);
     }});
   }} else if (spSortMode === 'desc') {{
     unassignedItems.sort(function(a, b) {{
-      var da = allData.find(function(d) {{ return d.name === a; }});
-      var db = allData.find(function(d) {{ return d.name === b; }});
+      var da = spDataMap.get(a), db = spDataMap.get(b);
       return (db ? spGetVals(db).mean : 0) - (da ? spGetVals(da).mean : 0);
     }});
   }}
@@ -3652,14 +3673,14 @@ function qpRenderGroupPanel() {{
   var gc = document.getElementById('qp-groups-container');
   if (!gc) return;
   gc.innerHTML = '';
-  qpGroups.forEach(function(g) {{
+  qpGroups.forEach(function(g, gi) {{
     var block = document.createElement('div');
     block.className = 'sp-group-block';
     var hdr = document.createElement('div');
     hdr.className = 'sp-group-header';
     hdr.style.background = g.color;
-    var isFirst = (qpGroups.indexOf(g) === 0);
-    var isLast  = (qpGroups.indexOf(g) === qpGroups.length - 1);
+    var isFirst = (gi === 0);
+    var isLast  = (gi === qpGroups.length - 1);
     var btnStyle = 'background:rgba(255,255,255,0.25);color:white;border-color:rgba(255,255,255,0.4);';
     var btnDisabled = 'background:rgba(255,255,255,0.08);color:rgba(255,255,255,0.3);border-color:rgba(255,255,255,0.15);cursor:default;';
     hdr.innerHTML =
@@ -3873,21 +3894,20 @@ function qpRenderChart() {{
 
   var segments = [];
 
+  // P2-3: pre-build a name→datum Map so sort comparators are O(1) not O(n)
+  var qpDataMap = new Map(allData.map(function(d) {{ return [d.name, d]; }}));
+
   qpGroups.forEach(function(g) {{
     if (!g.visible) return;
-    var items = g.samples.filter(function(s) {{
-      return allData.some(function(d) {{ return d.name === s; }});
-    }});
+    var items = g.samples.filter(function(s) {{ return qpDataMap.has(s); }});
     if (qpSortMode === 'asc') {{
       items.sort(function(a, b) {{
-        var da = allData.find(function(d) {{ return d.name === a; }});
-        var db = allData.find(function(d) {{ return d.name === b; }});
+        var da = qpDataMap.get(a), db = qpDataMap.get(b);
         return (da ? da.mean : 0) - (db ? db.mean : 0);
       }});
     }} else if (qpSortMode === 'desc') {{
       items.sort(function(a, b) {{
-        var da = allData.find(function(d) {{ return d.name === a; }});
-        var db = allData.find(function(d) {{ return d.name === b; }});
+        var da = qpDataMap.get(a), db = qpDataMap.get(b);
         return (db ? db.mean : 0) - (da ? da.mean : 0);
       }});
     }}
@@ -3895,18 +3915,16 @@ function qpRenderChart() {{
   }});
 
   var unassignedItems = showUnassigned
-    ? qpUnassigned.filter(function(s) {{ return allData.some(function(d) {{ return d.name === s; }}); }})
+    ? qpUnassigned.filter(function(s) {{ return qpDataMap.has(s); }})
     : [];
   if (qpSortMode === 'asc') {{
     unassignedItems.sort(function(a, b) {{
-      var da = allData.find(function(d) {{ return d.name === a; }});
-      var db = allData.find(function(d) {{ return d.name === b; }});
+      var da = qpDataMap.get(a), db = qpDataMap.get(b);
       return (da ? da.mean : 0) - (db ? db.mean : 0);
     }});
   }} else if (qpSortMode === 'desc') {{
     unassignedItems.sort(function(a, b) {{
-      var da = allData.find(function(d) {{ return d.name === a; }});
-      var db = allData.find(function(d) {{ return d.name === b; }});
+      var da = qpDataMap.get(a), db = qpDataMap.get(b);
       return (db ? db.mean : 0) - (da ? da.mean : 0);
     }});
   }}
@@ -4099,9 +4117,10 @@ def run_analysis(msd_path, platemap_path, output_path, spots_override=None, unit
     n_plate_maps = len(plate_maps)
     print(f"  Found {n_plate_maps} plate map(s)")
 
-    if len(plates) != n_plate_maps:
+    if n_plate_maps > 1 and len(plates) != n_plate_maps:
         msg = (f"MSD file contains {len(plates)} plate(s), but plate map contains "
-               f"{n_plate_maps} plate map(s). They must match.")
+               f"{n_plate_maps} plate map(s). Provide one map (applied to all plates) "
+               f"or one map per plate.")
         print(f"Error: {msg}")
         raise RuntimeError(msg)
 
@@ -4294,8 +4313,6 @@ def run_interactive():
     """Launch a single-page GUI for configuring all analysis options."""
     import tkinter as tk
     from tkinter import ttk, filedialog, messagebox
-    import json
-    import os
 
     def browse_file(var, title, filetypes):
         filename = filedialog.askopenfilename(title=title, filetypes=filetypes)
