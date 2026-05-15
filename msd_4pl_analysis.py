@@ -1225,41 +1225,73 @@ def parse_total_protein_csv(filepath):
 
 
 def _extract_replicate_index(sample_name):
-    """Return the 0-based replicate index from a _P{n} / _R{n} suffix, or None.
+    """Return the 0-based replicate index from a replicate suffix, or None.
 
-    Examples:
-        'fCtx-1001_P1'  → 0
-        'fCtx-1001_P2'  → 1
-        'fCtx-1001_R3'  → 2
-        'fCtx-1001'     → None  (no suffix — caller falls back to sequential counter)
+    Recognised formats (1-based in name → 0-based return):
+        'fCtx-1001_P1'           → 0   (_P{n} / _R{n} old format)
+        'fCtx-1001_P2'           → 1
+        '185-008-1001-fCtx-1'    → 0   (trailing -{n} after non-digit, new format)
+        '185-008-1001-SC-C-2'    → 1
+        'fCtx-1001'              → None  (no suffix — fall back to sequential counter)
+
+    The lookbehind (?<![0-9]) prevents matching the animal number itself
+    (e.g. the -1001 in 'fCtx-1001' is preceded by a digit so it won't fire).
     """
-    m = re.search(r'_[PpRr](\d+)$', sample_name.strip())
-    return int(m.group(1)) - 1 if m else None
+    s = sample_name.strip()
+    # Old format: _P1, _R2 etc.
+    m = re.search(r'_[PpRr](\d+)$', s)
+    if m:
+        return int(m.group(1)) - 1
+    # New format: trailing -1 or -2 after a non-digit character (e.g. tissue letter)
+    m = re.search(r'(?<![0-9])-([0-9]{1,2})$', s)
+    if m:
+        return int(m.group(1)) - 1
+    return None
 
 
 def _extract_animal_tissue(sample_name):
+    """Flexible extraction of animal number and tissue from a sample name.
+
+    Supported formats:
+        fCtx-1001_P1                 → ('1001', 'fCtx')      old simple format
+        1001-fCtx                    → ('1001', 'fCtx')
+        185-008-1001-fCtx-1          → ('1001', 'fCtx')      new study-prefixed format
+        185-008-1001-SC-C-1          → ('1001', 'SC-C')      compound tissue
+        185-008-7001-SC-T-2          → ('7001', 'SC-T')
+        185-008-1001-SC-L-1          → ('1001', 'SC-L')
+
+    Strategy:
+      1. Strip trailing replicate suffix (_P1/_R1 or -1/-2 after a non-digit).
+      2. Split by '-'; find all purely-numeric segments.
+      3. Animal = LONGEST purely-numeric segment (disambiguates study prefix
+         '185' from animal '1001' — animal numbers are typically 4 digits).
+      4. Tissue = all non-numeric segments that follow the animal segment,
+         joined with '-'.  If none follow, use segments that precede it
+         (backward compat with 'fCtx-1001' ordering).
+
+    Returns (None, None) if no purely-numeric segment found (QC, blanks, etc.).
     """
-    Flexible extraction of animal number and tissue from a sample name.
-    - Strips any trailing _suffix (e.g. _P1, _rep2) before parsing
-    - Splits by '-' and scans segments regardless of order or extras:
-        Animal → first segment that is purely numeric OR starts with optional
-                 letters followed by digits (e.g. '1001', 'M001', 'Animal12')
-        Tissue → longest remaining segment that starts with a letter and
-                 contains no digits  (e.g. 'fCtx' beats 'XX')
-    - Returns (None, None) if no animal number found (e.g. HQC, Buffer Only)
-    Handles any ordering or extra segments:
-        fCtx-1001_P1, 1001-fCtx, fCtx-XX-1001, M001-fCtx, Animal12-Hp, etc.
-    """
-    base = sample_name.strip().split('_')[0]   # drop _P1, _rep2, etc.
-    segments = base.split('-')
-    # Animal: purely numeric OR optional leading letters + required trailing digits
-    _animal_pat = re.compile(r'^[A-Za-z]*\d+$')
-    animal = next((s for s in segments if _animal_pat.match(s)), None)
-    if animal is None:
+    s = sample_name.strip()
+    # Strip trailing replicate suffix before splitting
+    s = re.sub(r'_[PpRr]\d+$', '', s)                   # _P1, _R2 etc.
+    s = re.sub(r'(?<![0-9])-([0-9]{1,2})$', '', s)      # -1, -2 after tissue letter
+
+    segments = s.split('-')
+    _num_pat = re.compile(r'^\d+$')
+
+    num_segs = [(i, seg) for i, seg in enumerate(segments) if _num_pat.match(seg)]
+    if not num_segs:
         return None, None   # no animal ID → QC or non-sample name
-    # Tissue: starts with a letter, no digits, exclude the animal segment itself
-    alpha_segs = [s for s in segments if s != animal and re.match(r'^[A-Za-z][A-Za-z]*$', s)]
-    tissue = max(alpha_segs, key=len) if alpha_segs else None
+
+    # Longest purely-numeric segment = animal number
+    animal_idx, animal = max(num_segs, key=lambda x: len(x[1]))
+
+    # Tissue: non-numeric segments after the animal; fall back to before it
+    after  = [seg for i, seg in enumerate(segments) if i > animal_idx and not _num_pat.match(seg)]
+    before = [seg for i, seg in enumerate(segments) if i < animal_idx and not _num_pat.match(seg)]
+    tissue_parts = after if after else before
+    tissue = '-'.join(tissue_parts) if tissue_parts else None
+
     return animal, tissue
 
 
