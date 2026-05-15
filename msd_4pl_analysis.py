@@ -1277,14 +1277,22 @@ def _extract_animal_tissue(sample_name):
     s = re.sub(r'(?<![0-9])-([0-9]{1,2})$', '', s)      # -1, -2 after tissue letter
 
     segments = s.split('-')
-    _num_pat = re.compile(r'^\d+$')
+    _num_pat      = re.compile(r'^\d+$')           # purely numeric: 1001, 185
+    _alphanum_pat = re.compile(r'^[A-Za-z]+\d+$')  # letters then digits: M001, F1234
 
-    num_segs = [(i, seg) for i, seg in enumerate(segments) if _num_pat.match(seg)]
-    if not num_segs:
+    # Alphanumeric-ending segments are the strongest animal-ID signal —
+    # tissue names are always pure-alpha and study prefixes are pure-numeric.
+    alphadigit_segs = [(i, seg) for i, seg in enumerate(segments) if _alphanum_pat.match(seg)]
+    num_segs        = [(i, seg) for i, seg in enumerate(segments) if _num_pat.match(seg)]
+
+    if alphadigit_segs:
+        # Prefer the longest letters+digits segment (e.g. M001 beats G1)
+        animal_idx, animal = max(alphadigit_segs, key=lambda x: len(x[1]))
+    elif num_segs:
+        # Fall back to longest purely-numeric (1001 beats study prefix 185)
+        animal_idx, animal = max(num_segs, key=lambda x: len(x[1]))
+    else:
         return None, None   # no animal ID → QC or non-sample name
-
-    # Longest purely-numeric segment = animal number
-    animal_idx, animal = max(num_segs, key=lambda x: len(x[1]))
 
     # Tissue: non-numeric segments after the animal; fall back to before it
     after  = [seg for i, seg in enumerate(segments) if i > animal_idx and not _num_pat.match(seg)]
