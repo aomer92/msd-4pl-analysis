@@ -1277,28 +1277,39 @@ def _extract_animal_tissue(sample_name):
     s = re.sub(r'(?<![0-9])-([0-9]{1,2})$', '', s)      # -1, -2 after tissue letter
 
     segments = s.split('-')
-    _num_pat      = re.compile(r'^\d+$')           # purely numeric: 1001, 185
-    _alphanum_pat = re.compile(r'^[A-Za-z]+\d+$')  # letters then digits: M001, F1234
 
-    # Alphanumeric-ending segments are the strongest animal-ID signal —
-    # tissue names are always pure-alpha and study prefixes are pure-numeric.
-    alphadigit_segs = [(i, seg) for i, seg in enumerate(segments) if _alphanum_pat.match(seg)]
-    num_segs        = [(i, seg) for i, seg in enumerate(segments) if _num_pat.match(seg)]
+    # ID-like: purely numeric (1001, 185) OR optional leading letters + digits (M001, F1234)
+    _id_pat = re.compile(r'^[A-Za-z]*\d+$')
 
-    if alphadigit_segs:
-        # Prefer the longest letters+digits segment (e.g. M001 beats G1)
-        animal_idx, animal = max(alphadigit_segs, key=lambda x: len(x[1]))
-    elif num_segs:
-        # Fall back to longest purely-numeric (1001 beats study prefix 185)
-        animal_idx, animal = max(num_segs, key=lambda x: len(x[1]))
+    # Primary rule: animal ID immediately precedes the first pure-alpha tissue segment.
+    # e.g. [185, 008, 1001, fCtx, ...]  → first alpha at index 3, animal = segments[2]
+    #      [185, 008, M001, SC,   ...]  → first alpha at index 3, animal = segments[2]
+    first_alpha_idx = next(
+        (i for i, seg in enumerate(segments) if re.match(r'^[A-Za-z]+$', seg)),
+        None
+    )
+
+    if first_alpha_idx is not None and first_alpha_idx > 0:
+        # Animal is the segment immediately before the first tissue segment
+        animal = segments[first_alpha_idx - 1]
+        if not _id_pat.match(animal):
+            return None, None   # unexpected segment type
+        tissue_parts = segments[first_alpha_idx:]
+        tissue = '-'.join(tissue_parts) if tissue_parts else None
+
+    elif first_alpha_idx == 0:
+        # Old / reversed format: tissue comes first, animal follows
+        # e.g. fCtx-1001, fCtx-M001
+        id_segs = [(i, seg) for i, seg in enumerate(segments)
+                   if i > 0 and _id_pat.match(seg)]
+        if not id_segs:
+            return None, None
+        animal_idx, animal = id_segs[0]   # first ID-like segment after the tissue
+        before = [seg for i, seg in enumerate(segments) if i < animal_idx]
+        tissue = '-'.join(before) if before else None
+
     else:
-        return None, None   # no animal ID → QC or non-sample name
-
-    # Tissue: non-numeric segments after the animal; fall back to before it
-    after  = [seg for i, seg in enumerate(segments) if i > animal_idx and not _num_pat.match(seg)]
-    before = [seg for i, seg in enumerate(segments) if i < animal_idx and not _num_pat.match(seg)]
-    tissue_parts = after if after else before
-    tissue = '-'.join(tissue_parts) if tissue_parts else None
+        return None, None   # no pure-alpha tissue segment found
 
     return animal, tissue
 
