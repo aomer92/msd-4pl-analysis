@@ -1309,7 +1309,11 @@ def _extract_animal_tissue(sample_name):
         tissue = '-'.join(before) if before else None
 
     else:
-        return None, None   # no pure-alpha tissue segment found
+        # No pure-alpha tissue segment — the whole name may be just an animal ID
+        # e.g. 'Rn2541' (alphanumeric ID, no tissue encoded in sample name)
+        if len(segments) == 1 and _id_pat.match(segments[0]):
+            return segments[0], None   # animal=Rn2541, tissue=None
+        return None, None   # truly unrecognised (QC labels, blanks, etc.)
 
     return animal, tissue
 
@@ -2032,22 +2036,32 @@ def _create_output_inner(wb, tmp_dir, results, output_path, msd_path, raw_plate_
         corrected_cell.number_format = '#,##0.0000'
         # Total Protein (col 14)
         # tp_map structure: {(animal, tissue): {sample_num_int: float}}
-        # _P1/_R1 suffix → sample_num 1, _P2/_R2 → 2, etc.
-        # No suffix → consume keys in ascending order via tp_index counter.
+        # _P1/_R1 / -1/-2 suffix → direct sample_num lookup.
+        # No suffix → sequential counter (or first value for tissue-less names).
+        # tissue=None → animal-only lookup (sample name encodes no tissue, e.g. Rn2541).
         tp_val = None
         tp_cell = ws_all.cell(row=arow, column=14)
         if total_protein_map and animal:
             tp_key = (animal, tissue)
-            tp_dict = total_protein_map.get(tp_key, {})
-            rep_idx = _extract_replicate_index(sample_name)
-            if rep_idx is not None:
-                tp_val = tp_dict.get(rep_idx + 1)   # convert 0-based → 1-based sample num
-            else:
-                sorted_keys = sorted(tp_dict.keys())
-                idx = tp_index[tp_key]
-                if idx < len(sorted_keys):
-                    tp_val = tp_dict[sorted_keys[idx]]
-                    tp_index[tp_key] += 1
+            tp_dict = total_protein_map.get(tp_key)
+            if tp_dict is None and tissue is None:
+                # Animal-only sample name: find first TP entry for this animal
+                tp_dict = next(
+                    (v for (a, _t), v in total_protein_map.items() if a == animal),
+                    None)
+            if tp_dict:
+                rep_idx = _extract_replicate_index(sample_name)
+                if rep_idx is not None:
+                    tp_val = tp_dict.get(rep_idx + 1)
+                elif tissue is None:
+                    # No tissue in name → technical duplicates all share one TP value
+                    tp_val = next(iter(sorted(tp_dict.items())))[1]
+                else:
+                    sorted_keys = sorted(tp_dict.keys())
+                    idx = tp_index[tp_key]
+                    if idx < len(sorted_keys):
+                        tp_val = tp_dict[sorted_keys[idx]]
+                        tp_index[tp_key] += 1
             if tp_val is not None:
                 tp_cell.value = _xv(tp_val)
                 tp_cell.number_format = '0.0000'
@@ -2692,21 +2706,28 @@ def generate_html_report(results, html_path, msd_path, units=None,
             sname, group, plate,
             qc_dilution_factors, group_dilution_factors, plate_dilution_factors)
         corrected = avg_conc * factor if np.isfinite(avg_conc) else np.nan
-        # Total protein & normalized — same replicate-index logic as create_output
+        # Total protein & normalized — same logic as create_output
         animal, tissue = _extract_animal_tissue(sname)
         tp_val = None
         if total_protein_map and animal:
             tp_key = (animal, tissue)
-            tp_dict = total_protein_map.get(tp_key, {})
-            rep_idx = _extract_replicate_index(sname)
-            if rep_idx is not None:
-                tp_val = tp_dict.get(rep_idx + 1)
-            else:
-                sorted_keys = sorted(tp_dict.keys())
-                idx = tp_index[tp_key]
-                if idx < len(sorted_keys):
-                    tp_val = tp_dict[sorted_keys[idx]]
-                    tp_index[tp_key] += 1
+            tp_dict = total_protein_map.get(tp_key)
+            if tp_dict is None and tissue is None:
+                tp_dict = next(
+                    (v for (a, _t), v in total_protein_map.items() if a == animal),
+                    None)
+            if tp_dict:
+                rep_idx = _extract_replicate_index(sname)
+                if rep_idx is not None:
+                    tp_val = tp_dict.get(rep_idx + 1)
+                elif tissue is None:
+                    tp_val = next(iter(sorted(tp_dict.items())))[1]
+                else:
+                    sorted_keys = sorted(tp_dict.keys())
+                    idx = tp_index[tp_key]
+                    if idx < len(sorted_keys):
+                        tp_val = tp_dict[sorted_keys[idx]]
+                        tp_index[tp_key] += 1
         norm_val = (corrected / tp_val
                     if tp_val is not None and np.isfinite(corrected) and tp_val != 0
                     else None)
