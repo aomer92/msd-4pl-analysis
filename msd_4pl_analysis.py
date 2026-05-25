@@ -129,7 +129,7 @@ import re, sys, argparse, os, tempfile, json, subprocess, platform, functools, m
 import threading, urllib.request
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 
-__version__ = "1.4.0"
+__version__ = "1.4.1"
 
 # ── Auto-update check ─────────────────────────────────────────────────────────
 _GITHUB_REPO  = "aomer92/msd-4pl-analysis"
@@ -1221,7 +1221,16 @@ def parse_total_protein_csv(filepath):
             snum = position_counter.get(key, 1)
             position_counter[key] = snum + 1
         tp_map[key][snum] = val
-    return tp_map
+    # Build a secondary map: animal → tissue (from CSV's Tissue Type column).
+    # Used to enrich display tissue and TP-key lookup for samples whose names
+    # contain no tissue suffix (e.g. 'Rn2541' style).
+    # First occurrence per animal wins (deterministic for the common case where
+    # each animal appears under exactly one tissue type).
+    animal_tissue_map: dict[str, str] = {}
+    for (ani, tis) in tp_map:
+        if ani not in animal_tissue_map and tis:
+            animal_tissue_map[ani] = tis
+    return tp_map, animal_tissue_map
 
 
 def _extract_replicate_index(sample_name):
@@ -1612,7 +1621,7 @@ def _compute_qc_summary(results, qc_dilution_factors, qc_expected_concentrations
     return qc_summary_rows, qc_overlay_points
 
 
-def create_output(results, output_path, msd_path, raw_plate_blocks, units=None, cv_threshold=25, plate_dilution_factors=None, lloq_method='current', total_protein_map=None, qc_dilution_factors=None, qc_expected_concentrations=None, group_dilution_factors=None):
+def create_output(results, output_path, msd_path, raw_plate_blocks, units=None, cv_threshold=25, plate_dilution_factors=None, lloq_method='current', total_protein_map=None, qc_dilution_factors=None, qc_expected_concentrations=None, group_dilution_factors=None, animal_tissue_map=None):
     wb = Workbook()
     wb.remove(wb.active)
     tmp_dir = tempfile.mkdtemp(prefix='msd_charts_')
@@ -1620,12 +1629,12 @@ def create_output(results, output_path, msd_path, raw_plate_blocks, units=None, 
         _create_output_inner(wb, tmp_dir, results, output_path, msd_path, raw_plate_blocks,
                              units, cv_threshold, plate_dilution_factors, lloq_method,
                              total_protein_map, qc_dilution_factors, qc_expected_concentrations,
-                             group_dilution_factors)
+                             group_dilution_factors, animal_tissue_map=animal_tissue_map)
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
-def _create_output_inner(wb, tmp_dir, results, output_path, msd_path, raw_plate_blocks, units=None, cv_threshold=25, plate_dilution_factors=None, lloq_method='current', total_protein_map=None, qc_dilution_factors=None, qc_expected_concentrations=None, group_dilution_factors=None):
+def _create_output_inner(wb, tmp_dir, results, output_path, msd_path, raw_plate_blocks, units=None, cv_threshold=25, plate_dilution_factors=None, lloq_method='current', total_protein_map=None, qc_dilution_factors=None, qc_expected_concentrations=None, group_dilution_factors=None, animal_tissue_map=None):
 
     # Pre-collect QC overlay points (corrected conc + signal) for overlay chart
     qc_summary_rows, qc_overlay_points = _compute_qc_summary(
@@ -2003,6 +2012,9 @@ def _create_output_inner(wb, tmp_dir, results, output_path, msd_path, raw_plate_
             cv = np.std(concs, ddof=1) / avg_conc * 100
 
         animal, tissue = _extract_animal_tissue(sample_name)
+        # Enrich tissue from TP CSV's Tissue Type column when sample name has none
+        if animal and tissue is None and animal_tissue_map:
+            tissue = animal_tissue_map.get(animal)
         ws_all.cell(row=arow, column=1,  value=_safe_str(sample_name))
         ws_all.cell(row=arow, column=2,  value=_safe_str(animal) if animal else None)
         ws_all.cell(row=arow, column=3,  value=_safe_str(tissue) if tissue else None)
@@ -2036,27 +2048,31 @@ def _create_output_inner(wb, tmp_dir, results, output_path, msd_path, raw_plate_
         corrected_cell.number_format = '#,##0.0000'
         # Total Protein (col 14)
         # tp_map structure: {(animal, tissue): {sample_num_int: float}}
+        # tissue may be enriched from the TP CSV's Tissue Type column (see above).
         # _P1/_R1 / -1/-2 suffix → direct sample_num lookup.
-        # No suffix → sequential counter (or first value for tissue-less names).
-        # tissue=None → animal-only lookup (sample name encodes no tissue, e.g. Rn2541).
+        # No suffix + tissue present → sequential counter (one TP value per replicate row).
+        # tissue still None after enrichment → animal-only fallback lookup.
         tp_val = None
         tp_cell = ws_all.cell(row=arow, column=14)
         if total_protein_map and animal:
             tp_key = (animal, tissue)
             tp_dict = total_protein_map.get(tp_key)
             if tp_dict is None and tissue is None:
-                # Animal-only sample name: find first TP entry for this animal
+                # Last-resort: animal-only fallback (no tissue in name or CSV)
                 tp_dict = next(
                     (v for (a, _t), v in total_protein_map.items() if a == animal),
                     None)
             if tp_dict:
                 rep_idx = _extract_replicate_index(sample_name)
                 if rep_idx is not None:
+                    # Explicit replicate suffix (_P1 / -1) → direct sample number lookup
                     tp_val = tp_dict.get(rep_idx + 1)
-                elif tissue is None:
-                    # No tissue in name → technical duplicates all share one TP value
-                    tp_val = next(iter(sorted(tp_dict.items())))[1]
+                elif len(tp_dict) == 1:
+                    # Single TP value for this animal/tissue — use it for all rows
+                    # (covers Rn2541 technical duplicates and single-sample animals)
+                    tp_val = next(iter(tp_dict.values()))
                 else:
+                    # Multiple TP values without explicit suffix → consume sequentially
                     sorted_keys = sorted(tp_dict.keys())
                     idx = tp_index[tp_key]
                     if idx < len(sorted_keys):
@@ -2129,7 +2145,8 @@ def generate_html_report(results, html_path, msd_path, units=None,
                           qc_dilution_factors=None, qc_expected_concentrations=None,
                           plate_dilution_factors=None, lloq_method='current',
                           total_protein_map=None, excel_path=None,
-                          group_dilution_factors=None, cv_threshold=25):
+                          group_dilution_factors=None, cv_threshold=25,
+                          animal_tissue_map=None):
     """Generate a self-contained interactive HTML report alongside the Excel output."""
     try:
         import plotly.graph_objects as go
@@ -2708,11 +2725,15 @@ def generate_html_report(results, html_path, msd_path, units=None,
         corrected = avg_conc * factor if np.isfinite(avg_conc) else np.nan
         # Total protein & normalized — same logic as create_output
         animal, tissue = _extract_animal_tissue(sname)
+        # Enrich tissue from TP CSV's Tissue Type column when not in sample name
+        if animal and tissue is None and animal_tissue_map:
+            tissue = animal_tissue_map.get(animal)
         tp_val = None
         if total_protein_map and animal:
             tp_key = (animal, tissue)
             tp_dict = total_protein_map.get(tp_key)
             if tp_dict is None and tissue is None:
+                # Last-resort: animal-only fallback (no tissue in name or CSV)
                 tp_dict = next(
                     (v for (a, _t), v in total_protein_map.items() if a == animal),
                     None)
@@ -2720,8 +2741,9 @@ def generate_html_report(results, html_path, msd_path, units=None,
                 rep_idx = _extract_replicate_index(sname)
                 if rep_idx is not None:
                     tp_val = tp_dict.get(rep_idx + 1)
-                elif tissue is None:
-                    tp_val = next(iter(sorted(tp_dict.items())))[1]
+                elif len(tp_dict) == 1:
+                    # Single TP value → shared across all rows for this animal/tissue
+                    tp_val = next(iter(tp_dict.values()))
                 else:
                     sorted_keys = sorted(tp_dict.keys())
                     idx = tp_index[tp_key]
@@ -4452,16 +4474,17 @@ def run_analysis(msd_path, platemap_path, output_path, spots_override=None, unit
 
     # Parse total protein CSV if provided
     total_protein_map = None
+    animal_tissue_map = None
     if total_protein_path:
         try:
-            total_protein_map = parse_total_protein_csv(total_protein_path)
+            total_protein_map, animal_tissue_map = parse_total_protein_csv(total_protein_path)
             print(f"\nLoaded total protein data: {len(total_protein_map)} animal/tissue entries")
         except Exception as e:
             print(f"Warning: could not load total protein CSV: {e}")
 
     print(f"\n{'=' * 60}")
     print(f"Generating Excel: {output_path}")
-    create_output(results, output_path, msd_path, raw_plate_blocks, units, cv_threshold, plate_dilution_factors, lloq_method, total_protein_map, qc_dilution_factors, qc_expected_concentrations, group_dilution_factors=group_dilution_factors)
+    create_output(results, output_path, msd_path, raw_plate_blocks, units, cv_threshold, plate_dilution_factors, lloq_method, total_protein_map, qc_dilution_factors, qc_expected_concentrations, group_dilution_factors=group_dilution_factors, animal_tissue_map=animal_tissue_map)
     print("Done!")
 
     # Generate and open interactive HTML report (co-located with the Excel file so
@@ -4475,7 +4498,8 @@ def run_analysis(msd_path, platemap_path, output_path, spots_override=None, unit
                              plate_dilution_factors, lloq_method,
                              total_protein_map, output_path,
                              group_dilution_factors=group_dilution_factors,
-                             cv_threshold=cv_threshold)
+                             cv_threshold=cv_threshold,
+                             animal_tissue_map=animal_tissue_map)
         if os.path.exists(html_path):
             _open_file(html_path)
     except Exception as e:
