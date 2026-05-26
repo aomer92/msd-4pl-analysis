@@ -129,7 +129,7 @@ import re, sys, argparse, os, tempfile, json, subprocess, platform, functools, m
 import threading, urllib.request
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 
-__version__ = "1.4.2"
+__version__ = "1.4.3"
 
 # ── Auto-update check ─────────────────────────────────────────────────────────
 _GITHUB_REPO  = "aomer92/msd-4pl-analysis"
@@ -1468,6 +1468,10 @@ def _worker_init():
 
 def _chart_worker(args):
     """Module-level wrapper so ProcessPoolExecutor can pickle the call."""
+    # Subprocess workers get a fresh Python process — globals() is empty.
+    # _ensure_deps() injects numpy / matplotlib / etc. so chart functions
+    # can reference plt, np, etc. as module-level names.
+    _ensure_deps()
     res, tmp_dir, lloq_method, units = args
     path = generate_std_curve_chart(res, tmp_dir, lloq_method, units=units)
     # Return a stable key (not id(res) — memory addresses differ across processes)
