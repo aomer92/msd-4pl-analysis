@@ -129,7 +129,7 @@ import re, sys, argparse, os, tempfile, json, subprocess, platform, functools, m
 import threading, urllib.request
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 
-__version__ = "1.4.5"
+__version__ = "1.4.6"
 
 # ── Auto-update check ─────────────────────────────────────────────────────────
 _GITHUB_REPO  = "aomer92/msd-4pl-analysis"
@@ -3166,19 +3166,47 @@ def generate_html_report(results, html_path, msd_path, units=None,
 
     <!-- ── Collated panel (new) ── -->
     <div id="sp-collated-panel" style="display:none;">
+      <!-- Analyte/group checkboxes -->
       <div id="sp-collated-group-toggles" style="display:flex;gap:8px;align-items:center;margin-bottom:12px;flex-wrap:wrap;"></div>
-      <div style="display:flex;gap:8px;align-items:center;margin-bottom:10px;flex-wrap:wrap;">
-        <span style="font-size:12px;font-weight:600;color:#555;">Values:</span>
-        <button class="sp-btn sp-sort-btn sp-collated-val-btn sp-collated-val-active" id="sp-coll-val-corrected" onclick="spCollSetValueMode('corrected',this)">Corrected Conc.</button>
-        <button class="sp-btn sp-sort-btn sp-collated-val-btn" id="sp-coll-val-norm" onclick="spCollSetValueMode('normalized',this)" title="Requires total protein data">Normalized Protein</button>
+      <!-- 2-column layout matching Per Group -->
+      <div style="display:grid;grid-template-columns:280px 1fr;gap:16px;margin-bottom:16px;">
+        <div style="display:flex;flex-direction:column;gap:10px;">
+          <div class="sp-panel">
+            <div style="font-weight:600;font-size:13px;color:#3a506b;margin-bottom:8px;display:flex;align-items:center;justify-content:space-between;">
+              Unassigned Samples
+              <span style="display:flex;gap:8px;align-items:center;">
+                <button class="sp-btn sp-btn-icon" id="sp-coll-select-all-btn" onclick="spCollSelectAllUnassigned(this)" style="font-size:11px;">Select All</button>
+                <label style="font-weight:400;font-size:12px;cursor:pointer;">
+                  <input type="checkbox" id="sp-coll-show-unassigned" checked onchange="spRenderCollatedChart()"> Show
+                </label>
+              </span>
+            </div>
+            <div id="sp-coll-unassigned-pool" class="sp-drop-zone" ondragover="spCollDragOver(event)" ondrop="spCollDrop(event,'__unassigned__')"></div>
+            <div style="margin-top:8px;display:flex;gap:6px;align-items:center;flex-wrap:wrap;">
+              <button class="sp-btn sp-btn-primary" onclick="spCollAssignChecked()">Assign to Group &#x2192;</button>
+              <button class="sp-btn" onclick="spCollCreateGroup()">&#xFF0B; New Group</button>
+            </div>
+          </div>
+          <div class="sp-panel" style="flex:1;">
+            <div style="font-weight:600;font-size:13px;color:#3a506b;margin-bottom:8px;">Groups</div>
+            <div id="sp-coll-groups-container"></div>
+          </div>
+        </div>
+        <div>
+          <div style="display:flex;gap:8px;align-items:center;margin-bottom:10px;flex-wrap:wrap;">
+            <span style="font-size:12px;font-weight:600;color:#555;">Values:</span>
+            <button class="sp-btn sp-sort-btn sp-collated-val-btn active-sort" id="sp-coll-val-corrected" onclick="spCollSetValueMode('corrected',this)">Corrected Conc.</button>
+            <button class="sp-btn sp-sort-btn sp-collated-val-btn" id="sp-coll-val-norm" onclick="spCollSetValueMode('normalized',this)" title="Requires total protein data">Normalized Protein</button>
+          </div>
+          <div style="display:flex;gap:8px;align-items:center;margin-bottom:10px;flex-wrap:wrap;">
+            <span style="font-size:12px;font-weight:600;color:#555;">Sort:</span>
+            <button class="sp-btn sp-sort-btn sp-collated-sort-btn active-sort" id="sp-coll-sort-group" onclick="spCollSetSort('group',this)">By Group</button>
+            <button class="sp-btn sp-sort-btn sp-collated-sort-btn" id="sp-coll-sort-asc" onclick="spCollSetSort('asc',this)">Value &#x2191;</button>
+            <button class="sp-btn sp-sort-btn sp-collated-sort-btn" id="sp-coll-sort-desc" onclick="spCollSetSort('desc',this)">Value &#x2193;</button>
+          </div>
+          <div id="sp-collated-chart" style="width:100%;"></div>
+        </div>
       </div>
-      <div style="display:flex;gap:8px;align-items:center;margin-bottom:10px;flex-wrap:wrap;">
-        <span style="font-size:12px;font-weight:600;color:#555;">Sort:</span>
-        <button class="sp-btn sp-sort-btn sp-collated-sort-btn sp-collated-sort-active" id="sp-coll-sort-group" onclick="spCollSetSort('group',this)">By Group</button>
-        <button class="sp-btn sp-sort-btn sp-collated-sort-btn" id="sp-coll-sort-asc" onclick="spCollSetSort('asc',this)">Value &#x2191;</button>
-        <button class="sp-btn sp-sort-btn sp-collated-sort-btn" id="sp-coll-sort-desc" onclick="spCollSetSort('desc',this)">Value &#x2193;</button>
-      </div>
-      <div id="sp-collated-chart" style="width:100%;"></div>
     </div>
   </div>
 
@@ -4433,11 +4461,20 @@ function qpRenderChart() {{
 
 // ── Collated Sub-tab ─────────────────────────────────────────────────────────
 var spSubtab = 'single';
-var spCollatedActive = new Set();   // analytes currently shown in collated view
-var spCollValueMode = 'corrected';  // 'corrected' | 'normalized'
-var spCollSortMode  = 'group';      // 'group' | 'asc' | 'desc'
+var spCollatedActive  = new Set();
+var spCollValueMode   = 'corrected';
+var spCollSortMode    = 'group';
+var spCollGroups      = [];
+var spCollUnassigned  = [];
+var spCollGroupIdCounter = 0;
+var spCollDragPayload    = null;
+var spCollLastCheckedIdx = -1;
 var SP_COLL_PALETTE = ['#1f77b4','#ff7f0e','#2ca02c','#d62728','#9467bd',
                         '#8c564b','#e377c2','#17becf','#bcbd22','#7f7f7f'];
+
+function spCollNextColor() {{
+  return SP_COLL_PALETTE[spCollGroups.length % SP_COLL_PALETTE.length];
+}}
 
 function spSetSubtab(tab) {{
   spSubtab = tab;
@@ -4455,15 +4492,22 @@ function spInitCollated() {{
   var toggles = document.getElementById('sp-collated-group-toggles');
   if (!toggles || toggles.dataset.built) return;
   toggles.dataset.built = '1';
-  // Disable normalized button if no TP data
   var normBtn = document.getElementById('sp-coll-val-norm');
   if (normBtn && !SP_DATA.hasNorm) {{
-    normBtn.disabled = true; normBtn.style.opacity = '0.4'; normBtn.style.cursor = 'not-allowed';
-    normBtn.title = 'No total protein data loaded';
+    normBtn.disabled = true; normBtn.style.opacity = '0.4';
+    normBtn.style.cursor = 'not-allowed'; normBtn.title = 'No total protein data loaded';
   }}
   var analytes = SP_DATA.analytes || [];
-  spCollatedActive = new Set(analytes);   // all on by default
-  toggles.innerHTML = '<span style="font-size:12px;font-weight:600;color:#555;margin-right:4px;">Groups:</span>';
+  spCollatedActive = new Set(analytes);
+  // Populate unassigned with all unique sample names across all analytes
+  var seen = {{}};
+  analytes.forEach(function(a) {{
+    (SP_DATA.samples[a] || []).forEach(function(d) {{
+      if (!seen[d.name]) {{ seen[d.name] = true; spCollUnassigned.push(d.name); }}
+    }});
+  }});
+  // Build analyte toggle checkboxes
+  toggles.innerHTML = '<span style="font-size:12px;font-weight:600;color:#555;margin-right:4px;">Plates/Groups:</span>';
   analytes.forEach(function(a, i) {{
     var color = SP_COLL_PALETTE[i % SP_COLL_PALETTE.length];
     var lbl = document.createElement('label');
@@ -4481,139 +4525,318 @@ function spInitCollated() {{
     lbl.appendChild(document.createTextNode(a));
     toggles.appendChild(lbl);
   }});
+  spCollRenderGroupPanel();
 }}
 
+// ── Group panel (mirrors spRenderGroupPanel) ──────────────────────────────────
+function spCollRenderGroupPanel() {{
+  spCollLastCheckedIdx = -1;
+  var pool = document.getElementById('sp-coll-unassigned-pool');
+  if (pool) {{
+    pool.innerHTML = '';
+    spCollUnassigned.forEach(function(sname) {{ pool.appendChild(spCollMakeChip(sname, '__unassigned__')); }});
+  }}
+  var gc = document.getElementById('sp-coll-groups-container');
+  if (!gc) return;
+  gc.innerHTML = '';
+  spCollGroups.forEach(function(g, gi) {{
+    var block = document.createElement('div');
+    block.className = 'sp-group-block';
+    var hdr = document.createElement('div');
+    hdr.className = 'sp-group-header';
+    hdr.style.background = g.color;
+    var isFirst = (gi === 0), isLast = (gi === spCollGroups.length - 1);
+    var bs = 'background:rgba(255,255,255,0.25);color:white;border-color:rgba(255,255,255,0.4);';
+    var bd = 'background:rgba(255,255,255,0.08);color:rgba(255,255,255,0.3);border-color:rgba(255,255,255,0.15);cursor:default;';
+    hdr.innerHTML =
+      '<span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="' + g.name + '">' + g.name + '</span>' +
+      '<button class="sp-btn sp-btn-icon" style="' + (isFirst ? bd : bs) + '" ' + (isFirst ? 'disabled ' : 'onclick="spCollMoveGroup(' + g.id + ',-1)" ') + 'title="Move up">&#x25B4;</button>' +
+      '<button class="sp-btn sp-btn-icon" style="' + (isLast  ? bd : bs) + '" ' + (isLast  ? 'disabled ' : 'onclick="spCollMoveGroup(' + g.id + ',1)" ')  + 'title="Move down">&#x25BE;</button>' +
+      '<button class="sp-btn sp-btn-icon" style="' + bs + '" onclick="spCollRenameGroup(' + g.id + ')" title="Rename">&#x270F;</button>' +
+      '<button class="sp-btn sp-btn-icon" style="' + bs + '" onclick="spCollToggleGroup(' + g.id + ')" title="Show/hide">' + (g.visible ? '&#128065;' : '&#128564;') + '</button>' +
+      '<button class="sp-btn sp-btn-icon" style="' + bs + '" onclick="spCollDeleteGroup(' + g.id + ')" title="Delete">&#x2715;</button>';
+    block.appendChild(hdr);
+    var dz = document.createElement('div');
+    dz.className = 'sp-group-drop sp-drop-zone';
+    dz.setAttribute('ondragover', 'spCollDragOver(event)');
+    dz.setAttribute('ondrop', "spCollDrop(event,'" + g.id + "')");
+    g.samples.forEach(function(sname) {{ dz.appendChild(spCollMakeChip(sname, g.id)); }});
+    block.appendChild(dz);
+    gc.appendChild(block);
+  }});
+}}
+
+function spCollMakeChip(sname, groupId) {{
+  var span = document.createElement('span');
+  span.className = 'sp-chip';
+  span.draggable = true; span.title = sname;
+  if (groupId === '__unassigned__') {{
+    var cb = document.createElement('input');
+    cb.type = 'checkbox'; cb.setAttribute('data-sample', sname);
+    cb.onclick = function(e) {{
+      e.stopPropagation();
+      var idx = spCollUnassigned.indexOf(sname);
+      var allCbs = Array.from(document.querySelectorAll('#sp-coll-unassigned-pool input[type=checkbox]'));
+      if (e.shiftKey && spCollLastCheckedIdx >= 0 && idx !== spCollLastCheckedIdx) {{
+        var lo = Math.min(spCollLastCheckedIdx, idx), hi = Math.max(spCollLastCheckedIdx, idx);
+        var st = allCbs[idx].checked;
+        for (var i = lo; i <= hi; i++) {{ if (allCbs[i]) allCbs[i].checked = st; }}
+      }}
+      spCollLastCheckedIdx = idx;
+    }};
+    span.appendChild(cb);
+  }}
+  var txt = document.createElement('span');
+  txt.textContent = sname; txt.style.cssText = 'max-width:120px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;';
+  span.appendChild(txt);
+  span.addEventListener('dragstart', function(e) {{ spCollDragStart(e, sname, groupId); }});
+  span.addEventListener('dragend',   function(e) {{ spCollDragEnd(e); }});
+  return span;
+}}
+
+function spCollDragStart(e, name, fromGroup) {{
+  spCollDragPayload = {{name: name, fromGroup: fromGroup}};
+  e.dataTransfer.effectAllowed = 'move'; e.currentTarget.style.opacity = '0.4';
+}}
+function spCollDragEnd(e) {{
+  e.currentTarget.style.opacity = '1';
+  document.querySelectorAll('.sp-drop-zone').forEach(function(z) {{ z.classList.remove('drag-over'); }});
+}}
+function spCollDragOver(e) {{
+  e.preventDefault(); e.dataTransfer.dropEffect = 'move';
+  var zone = e.currentTarget.closest('.sp-drop-zone');
+  if (zone) zone.classList.add('drag-over');
+}}
+function spCollDrop(e, toGroupId) {{
+  e.preventDefault();
+  document.querySelectorAll('.sp-drop-zone').forEach(function(z) {{ z.classList.remove('drag-over'); }});
+  if (!spCollDragPayload) return;
+  var name = spCollDragPayload.name, from = spCollDragPayload.fromGroup;
+  spCollDragPayload = null;
+  if (from === toGroupId) return;
+  if (from === '__unassigned__') {{ spCollUnassigned = spCollUnassigned.filter(function(s) {{ return s !== name; }}); }}
+  else {{ var sg = spCollGroups.find(function(g) {{ return g.id == from; }}); if (sg) sg.samples = sg.samples.filter(function(s) {{ return s !== name; }}); }}
+  if (toGroupId === '__unassigned__') {{ if (spCollUnassigned.indexOf(name) === -1) spCollUnassigned.push(name); }}
+  else {{ var tg = spCollGroups.find(function(g) {{ return g.id == toGroupId; }}); if (tg && tg.samples.indexOf(name) === -1) tg.samples.push(name); }}
+  spCollRenderGroupPanel(); spRenderCollatedChart();
+}}
+
+function spCollCreateGroup() {{
+  var name = prompt('Group name:'); if (!name || !name.trim()) return;
+  spCollGroups.push({{id: ++spCollGroupIdCounter, name: name.trim(), color: spCollNextColor(), visible: true, samples: []}});
+  spCollRenderGroupPanel(); spRenderCollatedChart();
+}}
+function spCollAssignChecked() {{
+  var checked = [];
+  document.querySelectorAll('#sp-coll-unassigned-pool input[type=checkbox]:checked').forEach(function(cb) {{ checked.push(cb.getAttribute('data-sample')); }});
+  if (!checked.length) {{ alert('Check at least one sample first.'); return; }}
+  var name = prompt('Assign to group name:'); if (!name || !name.trim()) return;
+  name = name.trim();
+  var g = spCollGroups.find(function(x) {{ return x.name === name; }});
+  if (!g) {{ g = {{id: ++spCollGroupIdCounter, name: name, color: spCollNextColor(), visible: true, samples: []}}; spCollGroups.push(g); }}
+  checked.forEach(function(s) {{
+    spCollUnassigned = spCollUnassigned.filter(function(u) {{ return u !== s; }});
+    if (g.samples.indexOf(s) === -1) g.samples.push(s);
+  }});
+  spCollRenderGroupPanel(); spRenderCollatedChart();
+}}
+function spCollSelectAllUnassigned(btn) {{
+  var cbs = document.querySelectorAll('#sp-coll-unassigned-pool input[type=checkbox]');
+  var allChecked = Array.from(cbs).every(function(cb) {{ return cb.checked; }});
+  cbs.forEach(function(cb) {{ cb.checked = !allChecked; }});
+  btn.textContent = allChecked ? 'Select All' : 'Deselect All';
+  spCollLastCheckedIdx = -1;
+}}
+function spCollMoveGroup(id, dir) {{
+  var idx = spCollGroups.findIndex(function(x) {{ return x.id == id; }}); var ni = idx + dir;
+  if (ni < 0 || ni >= spCollGroups.length) return;
+  var tmp = spCollGroups[idx]; spCollGroups[idx] = spCollGroups[ni]; spCollGroups[ni] = tmp;
+  spCollRenderGroupPanel(); spRenderCollatedChart();
+}}
+function spCollRenameGroup(id) {{
+  var g = spCollGroups.find(function(x) {{ return x.id == id; }}); if (!g) return;
+  var n = prompt('Rename group:', g.name); if (!n || !n.trim()) return;
+  g.name = n.trim(); spCollRenderGroupPanel(); spRenderCollatedChart();
+}}
+function spCollDeleteGroup(id) {{
+  var g = spCollGroups.find(function(x) {{ return x.id == id; }}); if (!g) return;
+  g.samples.forEach(function(s) {{ if (spCollUnassigned.indexOf(s) === -1) spCollUnassigned.push(s); }});
+  spCollGroups = spCollGroups.filter(function(x) {{ return x.id != id; }});
+  spCollRenderGroupPanel(); spRenderCollatedChart();
+}}
+function spCollToggleGroup(id) {{
+  var g = spCollGroups.find(function(x) {{ return x.id == id; }}); if (!g) return;
+  g.visible = !g.visible; spCollRenderGroupPanel(); spRenderCollatedChart();
+}}
+
+// ── Value / sort controls ─────────────────────────────────────────────────────
 function spCollSetValueMode(mode, btn) {{
   spCollValueMode = mode;
-  document.querySelectorAll('.sp-collated-val-btn').forEach(function(b) {{
-    b.classList.toggle('active-sort', b === btn);
-  }});
+  document.querySelectorAll('.sp-collated-val-btn').forEach(function(b) {{ b.classList.toggle('active-sort', b === btn); }});
   spRenderCollatedChart();
 }}
-
 function spCollSetSort(mode, btn) {{
   spCollSortMode = mode;
-  document.querySelectorAll('.sp-collated-sort-btn').forEach(function(b) {{
-    b.classList.toggle('active-sort', b === btn);
-  }});
+  document.querySelectorAll('.sp-collated-sort-btn').forEach(function(b) {{ b.classList.toggle('active-sort', b === btn); }});
   spRenderCollatedChart();
 }}
-
 function spCollGetVals(d) {{
-  if (spCollValueMode === 'normalized' && d.normMean !== null && d.normMean !== undefined) {{
+  if (spCollValueMode === 'normalized' && d.normMean !== null && d.normMean !== undefined)
     return {{ mean: d.normMean, sd: d.normSd || 0, values: d.normValues || [] }};
-  }}
   return {{ mean: d.mean, sd: d.sd || 0, values: d.values || [] }};
 }}
 
+// ── Chart rendering ───────────────────────────────────────────────────────────
 function spRenderCollatedChart() {{
-  var chartDiv = document.getElementById('sp-collated-chart');
-  if (!chartDiv) return;
+  if (!document.getElementById('sp-collated-chart')) return;
   var analytes = (SP_DATA.analytes || []).filter(function(a) {{ return spCollatedActive.has(a); }});
   if (!analytes.length) {{ Plotly.purge('sp-collated-chart'); return; }}
+  var showUnassigned = document.getElementById('sp-coll-show-unassigned') ? document.getElementById('sp-coll-show-unassigned').checked : true;
 
-  // Collect all (sample, analyte) entries across selected analytes
-  var entries = [];  // {{name, analyte, analyteIdx, mean, sd, values, normMean, normSd, normValues, anyFlagged}}
+  // --- Build segments (assigned groups + unassigned), mirroring spRenderChart ---
+  // For groups: one collapsed bar = mean of all samples in the group across active analytes
+  // For unassigned: individual bar per (sample, analyte) colored by analyte
+
+  // Map: name → [{entry, analyte, analyteIdx}] for active analytes
+  var nameEntries = {{}};
   analytes.forEach(function(a, ai) {{
     (SP_DATA.samples[a] || []).forEach(function(d) {{
-      entries.push(Object.assign({{}}, d, {{analyte: a, analyteIdx: ai}}));
+      if (!nameEntries[d.name]) nameEntries[d.name] = [];
+      nameEntries[d.name].push({{d: d, analyte: a, analyteIdx: ai}});
     }});
   }});
 
-  if (!entries.length) {{ Plotly.purge('sp-collated-chart'); return; }}
+  // Analyte color map
+  var analyteColor = {{}};
+  analytes.forEach(function(a, ai) {{ analyteColor[a] = SP_COLL_PALETTE[ai % SP_COLL_PALETTE.length]; }});
 
-  // Disambiguate display labels: add [group] suffix when same sample name appears in multiple groups
-  var _nameAnalyteCount = {{}};
-  entries.forEach(function(e) {{
-    if (!_nameAnalyteCount[e.name]) _nameAnalyteCount[e.name] = new Set();
-    _nameAnalyteCount[e.name].add(e.analyte);
-  }});
-  entries.forEach(function(e) {{
-    e.displayLabel = _nameAnalyteCount[e.name].size > 1
-      ? e.name + ' [' + e.analyte + ']'
-      : e.name;
-  }});
-
-  // Sort entries
-  if (spCollSortMode === 'asc') {{
-    entries.sort(function(a, b) {{ return spCollGetVals(a).mean - spCollGetVals(b).mean; }});
-  }} else if (spCollSortMode === 'desc') {{
-    entries.sort(function(a, b) {{ return spCollGetVals(b).mean - spCollGetVals(a).mean; }});
-  }} else {{
-    // By group: group analytes together, within each analyte sort by name
-    entries.sort(function(a, b) {{
-      if (a.analyteIdx !== b.analyteIdx) return a.analyteIdx - b.analyteIdx;
-      return a.name < b.name ? -1 : a.name > b.name ? 1 : 0;
-    }});
-  }}
-
-  var orderedLabels = entries.map(function(e) {{ return e.displayLabel; }});
   var units = SP_DATA.units || '';
   var yTitle = spCollValueMode === 'normalized'
     ? 'Normalized Concentration'
     : 'Concentration' + (units ? ' (' + units + ')' : '');
 
-  // Build one trace per analyte so each gets its own legend entry + colour
-  var traces = [];
-  var shapes = [];
-  analytes.forEach(function(a, ai) {{
-    var color = SP_COLL_PALETTE[ai % SP_COLL_PALETTE.length];
-    var aEntries = entries.filter(function(e) {{ return e.analyte === a; }});
-    if (!aEntries.length) return;
-    var xVals = aEntries.map(function(e) {{ return e.displayLabel; }});
-    var vList = aEntries.map(spCollGetVals);
-    var yMeans = vList.map(function(v) {{ return v.mean; }});
-    var ySDs   = vList.map(function(v) {{ return v.sd; }});
-    var barColors = aEntries.map(function(e) {{
-      return e.anyFlagged ? 'rgba(200,50,50,0.8)' : color;
-    }});
-    traces.push({{
-      type: 'bar', name: a,
-      x: xVals, y: yMeans,
-      error_y: {{ type:'data', array:ySDs, visible:true, color:'#444', thickness:1.5, width:4 }},
-      marker: {{ color: barColors }},
-      showlegend: true, legendgroup: a,
-      hovertemplate: '<b>%{{x}}</b><br>Mean: %{{y:.4g}}<extra>' + a + '</extra>'
-    }});
-    // Scatter overlay for individual values
-    var scX = [], scY = [], scC = [], scT = [];
-    aEntries.forEach(function(e) {{
-      (spCollGetVals(e).values || []).forEach(function(v) {{
-        scX.push(e.displayLabel); scY.push(v);
-        scC.push(e.anyFlagged ? 'rgba(180,20,20,0.9)' : color);
-        scT.push(e.name);
+  var traces = []; var shapes = []; var xCursor = 0; var orderedNames = [];
+
+  // Helper: add collapsed group trace
+  function addGroupTrace(seg) {{
+    var xVals = [seg.groupName], anyFlagged = false;
+    var allVals = [], sampleMeans = [];
+    seg.items.forEach(function(sname) {{
+      var elist = nameEntries[sname] || [];
+      elist.forEach(function(ei) {{
+        if (ei.d.anyFlagged) anyFlagged = true;
+        var vals = spCollGetVals(ei.d);
+        sampleMeans.push(vals.mean);
+        vals.values.forEach(function(v) {{ allVals.push({{v: v, sname: sname, flagged: ei.d.anyFlagged}}); }});
       }});
     }});
-    if (scX.length) traces.push({{
-      type:'scatter', mode:'markers', name: a + ' pts',
-      x:scX, y:scY, text:scT,
-      marker:{{ color:scC, size:6, symbol:'circle', line:{{color:'rgba(0,0,0,0.4)',width:1}} }},
-      showlegend:false, legendgroup:a,
-      hovertemplate:'<b>%{{text}}</b><br>Value: %{{y:.4g}}<extra></extra>'
-    }});
-
-    // Dashed separator between analyte groups in 'by group' sort
-    if (spCollSortMode === 'group' && ai < analytes.length - 1) {{
-      var lastIdx = orderedLabels.lastIndexOf(aEntries[aEntries.length - 1].displayLabel);
-      if (lastIdx >= 0) {{
-        shapes.push({{
-          type:'line', xref:'x', yref:'paper',
-          x0: lastIdx + 0.5, x1: lastIdx + 0.5,
-          y0:0, y1:1,
-          line:{{ color:'#aaa', width:1, dash:'dot' }}
-        }});
-      }}
+    var grpMean = sampleMeans.length ? sampleMeans.reduce(function(a,b){{return a+b;}},0)/sampleMeans.length : 0;
+    var grpSD = 0;
+    if (allVals.length > 1) {{
+      var vm = allVals.reduce(function(a,b){{return a+b.v;}},0)/allVals.length;
+      grpSD = Math.sqrt(allVals.reduce(function(a,b){{return a+Math.pow(b.v-vm,2);}},0)/(allVals.length-1));
     }}
+    traces.push({{ type:'bar', name:seg.groupName, x:xVals, y:[grpMean],
+      error_y:{{type:'data',array:[grpSD],visible:true,color:'#444',thickness:1.5,width:4}},
+      marker:{{color:[anyFlagged?'rgba(200,50,50,0.8)':seg.color]}},
+      showlegend:true, legendgroup:seg.groupName,
+      hovertemplate:'<b>%{{x}}</b><br>Mean: %{{y:.4g}}<extra>'+seg.groupName+'</extra>'
+    }});
+    var scX=[],scY=[],scC=[],scT=[];
+    allVals.forEach(function(pt) {{ scX.push(seg.groupName);scY.push(pt.v);scC.push(pt.flagged?'rgba(180,20,20,0.9)':seg.color);scT.push(pt.sname); }});
+    if (scX.length) traces.push({{type:'scatter',mode:'markers',name:seg.groupName+' pts',x:scX,y:scY,text:scT,
+      marker:{{color:scC,size:6,symbol:'circle',line:{{color:'rgba(0,0,0,0.4)',width:1}}}},
+      showlegend:false,legendgroup:seg.groupName,hovertemplate:'<b>%{{text}}</b><br>Value: %{{y:.4g}}<extra></extra>'}});
+    orderedNames.push(seg.groupName); xCursor += 1;
+  }}
+
+  // Helper: add unassigned individual bars (one per sample per active analyte)
+  function addUnassignedTrace(items) {{
+    // Expand items → (displayLabel, entry, analyte, color)
+    var _nc = {{}};
+    items.forEach(function(sname) {{
+      (nameEntries[sname] || []).forEach(function(ei) {{
+        if (!_nc[sname]) _nc[sname] = 0; _nc[sname]++;
+      }});
+    }});
+    // Group by analyte for separate coloring
+    var byAnalyte = {{}};
+    analytes.forEach(function(a) {{ byAnalyte[a] = []; }});
+    items.forEach(function(sname) {{
+      (nameEntries[sname] || []).forEach(function(ei) {{
+        var lbl = _nc[sname] > 1 ? sname+' ['+ei.analyte+']' : sname;
+        byAnalyte[ei.analyte].push({{lbl:lbl, d:ei.d, sname:sname}});
+        orderedNames.push(lbl);
+      }});
+    }});
+    analytes.forEach(function(a) {{
+      var aItems = byAnalyte[a]; if (!aItems.length) return;
+      var color = analyteColor[a];
+      var xVals=[],yMeans=[],ySDs=[],barColors=[],scX=[],scY=[],scC=[],scT=[];
+      aItems.forEach(function(it) {{
+        var vals = spCollGetVals(it.d);
+        xVals.push(it.lbl); yMeans.push(vals.mean); ySDs.push(vals.sd);
+        barColors.push(it.d.anyFlagged?'rgba(200,50,50,0.8)':color);
+        vals.values.forEach(function(v) {{ scX.push(it.lbl);scY.push(v);scC.push(it.d.anyFlagged?'rgba(180,20,20,0.9)':color);scT.push(it.sname); }});
+      }});
+      traces.push({{type:'bar',name:a,x:xVals,y:yMeans,
+        error_y:{{type:'data',array:ySDs,visible:true,color:'#444',thickness:1.5,width:4}},
+        marker:{{color:barColors}},showlegend:true,legendgroup:a,
+        hovertemplate:'<b>%{{x}}</b><br>Mean: %{{y:.4g}}<extra>'+a+'</extra>'}});
+      if (scX.length) traces.push({{type:'scatter',mode:'markers',name:a+' pts',x:scX,y:scY,text:scT,
+        marker:{{color:scC,size:6,symbol:'circle',line:{{color:'rgba(0,0,0,0.4)',width:1}}}},
+        showlegend:false,legendgroup:a,hovertemplate:'<b>%{{text}}</b><br>Value: %{{y:.4g}}<extra></extra>'}});
+      xCursor += aItems.length;
+    }});
+  }}
+
+  // Build segments from assigned groups
+  spCollGroups.forEach(function(g, si) {{
+    if (!g.visible) return;
+    var items = g.samples.filter(function(s) {{ return nameEntries[s] && nameEntries[s].length; }});
+    if (spCollSortMode === 'asc') items.sort(function(a,b) {{
+      var ma = (nameEntries[a]||[]).reduce(function(s,e){{return s+spCollGetVals(e.d).mean;}},0)/(nameEntries[a]||[{{d:{{mean:0}}}}]).length;
+      var mb = (nameEntries[b]||[]).reduce(function(s,e){{return s+spCollGetVals(e.d).mean;}},0)/(nameEntries[b]||[{{d:{{mean:0}}}}]).length;
+      return ma - mb;
+    }});
+    else if (spCollSortMode === 'desc') items.sort(function(a,b) {{
+      var ma = (nameEntries[a]||[]).reduce(function(s,e){{return s+spCollGetVals(e.d).mean;}},0)/(nameEntries[a]||[{{d:{{mean:0}}}}]).length;
+      var mb = (nameEntries[b]||[]).reduce(function(s,e){{return s+spCollGetVals(e.d).mean;}},0)/(nameEntries[b]||[{{d:{{mean:0}}}}]).length;
+      return mb - ma;
+    }});
+    if (!items.length) return;
+    if (si > 0 && xCursor > 0) shapes.push({{type:'line',xref:'x',yref:'paper',x0:xCursor-0.5,x1:xCursor-0.5,y0:0,y1:1,line:{{color:'#aaa',width:1,dash:'dot'}}}});
+    addGroupTrace({{groupName:g.name,color:g.color,items:items}});
   }});
 
+  // Unassigned
+  if (showUnassigned) {{
+    var uItems = spCollUnassigned.filter(function(s) {{ return nameEntries[s] && nameEntries[s].length; }});
+    if (spCollSortMode === 'asc') uItems.sort(function(a,b) {{
+      var ma=(nameEntries[a]||[]).reduce(function(s,e){{return s+spCollGetVals(e.d).mean;}},0)/Math.max(1,(nameEntries[a]||[]).length);
+      var mb=(nameEntries[b]||[]).reduce(function(s,e){{return s+spCollGetVals(e.d).mean;}},0)/Math.max(1,(nameEntries[b]||[]).length);
+      return ma-mb;
+    }});
+    else if (spCollSortMode === 'desc') uItems.sort(function(a,b) {{
+      var ma=(nameEntries[a]||[]).reduce(function(s,e){{return s+spCollGetVals(e.d).mean;}},0)/Math.max(1,(nameEntries[a]||[]).length);
+      var mb=(nameEntries[b]||[]).reduce(function(s,e){{return s+spCollGetVals(e.d).mean;}},0)/Math.max(1,(nameEntries[b]||[]).length);
+      return mb-ma;
+    }});
+    if (uItems.length) {{
+      if (spCollGroups.some(function(g){{return g.visible && g.samples.some(function(s){{return nameEntries[s]&&nameEntries[s].length;}});}}) && xCursor > 0)
+        shapes.push({{type:'line',xref:'x',yref:'paper',x0:xCursor-0.5,x1:xCursor-0.5,y0:0,y1:1,line:{{color:'#aaa',width:1,dash:'dot'}}}});
+      addUnassignedTrace(uItems);
+    }}
+  }}
+
+  if (!orderedNames.length) {{ Plotly.purge('sp-collated-chart'); return; }}
+
   var layout = {{
-    barmode: 'overlay',
-    height: 480,
-    margin: {{ l:100, r:40, t:40, b:160 }},
-    xaxis: {{ tickangle:-40, automargin:true, categoryorder:'array', categoryarray:orderedLabels }},
-    yaxis: {{ title:{{ text:yTitle, standoff:12 }}, automargin:false, rangemode:'tozero' }},
-    shapes: shapes,
-    legend: {{ orientation:'h', x:0, y:1.08 }},
+    barmode:'group', height:480,
+    margin:{{l:100,r:40,t:40,b:160}},
+    xaxis:{{tickangle:-40,automargin:true,categoryorder:'array',categoryarray:orderedNames}},
+    yaxis:{{title:{{text:yTitle,standoff:12}},automargin:false,rangemode:'tozero'}},
+    shapes:shapes, legend:{{orientation:'h',x:0,y:1.08}},
     paper_bgcolor:'white', plot_bgcolor:'white'
   }};
   Plotly.react('sp-collated-chart', traces, layout, {{responsive:true}});
