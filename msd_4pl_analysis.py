@@ -129,7 +129,7 @@ import re, sys, argparse, os, tempfile, json, subprocess, platform, functools, m
 import threading, urllib.request
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 
-__version__ = "1.4.3"
+__version__ = "1.4.4"
 
 # ── Auto-update check ─────────────────────────────────────────────────────────
 _GITHUB_REPO  = "aomer92/msd-4pl-analysis"
@@ -3013,6 +3013,9 @@ def generate_html_report(results, html_path, msd_path, units=None,
   .active-sort {{ background:#2F5496 !important;color:white !important;border-color:#2F5496 !important; }}
   .sp-analyte-btn {{ padding:7px 18px;border:none;border-radius:4px;cursor:pointer;font-size:13px;font-weight:500;background:#dde3ec;color:#333; }}
   .sp-analyte-btn.active {{ background:#2F5496;color:white; }}
+  .sp-subtab-btn {{ padding:8px 20px;border:none;border-bottom:2px solid transparent;background:transparent;cursor:pointer;font-size:13px;font-weight:500;color:#666;margin-bottom:-2px; }}
+  .sp-subtab-btn:hover {{ color:#2F5496; }}
+  .sp-subtab-active {{ color:#2F5496 !important;border-bottom-color:#2F5496 !important;font-weight:600 !important; }}
 </style>
 </head>
 <body>
@@ -3094,45 +3097,71 @@ def generate_html_report(results, html_path, msd_path, units=None,
 
   <div id="tab-sampleplots" class="tab-pane">
     <h2>Sample Plots</h2>
-    <div id="sp-analyte-bar" style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:14px;"></div>
-    <div style="display:grid;grid-template-columns:280px 1fr;gap:16px;margin-bottom:16px;">
-      <div style="display:flex;flex-direction:column;gap:10px;">
-        <div class="sp-panel">
-          <div style="font-weight:600;font-size:13px;color:#3a506b;margin-bottom:8px;display:flex;align-items:center;justify-content:space-between;">
-            Unassigned Samples
-            <span style="display:flex;gap:8px;align-items:center;">
-              <button class="sp-btn sp-btn-icon" id="sp-select-all-btn" onclick="spSelectAllUnassigned(this)" style="font-size:11px;">Select All</button>
-              <label style="font-weight:400;font-size:12px;cursor:pointer;">
-                <input type="checkbox" id="sp-show-unassigned" checked onchange="spRenderChart()"> Show
-              </label>
-            </span>
+    <!-- Sub-tab bar -->
+    <div style="display:flex;gap:0;margin-bottom:16px;border-bottom:2px solid #2F5496;">
+      <button id="sp-subtab-single" class="sp-subtab-btn sp-subtab-active" onclick="spSetSubtab('single')">Per Group</button>
+      <button id="sp-subtab-collated" class="sp-subtab-btn" onclick="spSetSubtab('collated')">Collated</button>
+    </div>
+
+    <!-- ── Per-Group panel (existing) ── -->
+    <div id="sp-single-panel">
+      <div id="sp-analyte-bar" style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:14px;"></div>
+      <div style="display:grid;grid-template-columns:280px 1fr;gap:16px;margin-bottom:16px;">
+        <div style="display:flex;flex-direction:column;gap:10px;">
+          <div class="sp-panel">
+            <div style="font-weight:600;font-size:13px;color:#3a506b;margin-bottom:8px;display:flex;align-items:center;justify-content:space-between;">
+              Unassigned Samples
+              <span style="display:flex;gap:8px;align-items:center;">
+                <button class="sp-btn sp-btn-icon" id="sp-select-all-btn" onclick="spSelectAllUnassigned(this)" style="font-size:11px;">Select All</button>
+                <label style="font-weight:400;font-size:12px;cursor:pointer;">
+                  <input type="checkbox" id="sp-show-unassigned" checked onchange="spRenderChart()"> Show
+                </label>
+              </span>
+            </div>
+            <div id="sp-unassigned-pool" class="sp-drop-zone" ondragover="spDragOver(event)" ondrop="spDrop(event,'__unassigned__')"></div>
+            <div style="margin-top:8px;display:flex;gap:6px;align-items:center;flex-wrap:wrap;">
+              <button class="sp-btn sp-btn-primary" onclick="spAssignChecked()">Assign to Group &#x2192;</button>
+              <button class="sp-btn" onclick="spCreateGroup()">&#xFF0B; New Group</button>
+            </div>
           </div>
-          <div id="sp-unassigned-pool" class="sp-drop-zone" ondragover="spDragOver(event)" ondrop="spDrop(event,'__unassigned__')"></div>
-          <div style="margin-top:8px;display:flex;gap:6px;align-items:center;flex-wrap:wrap;">
-            <button class="sp-btn sp-btn-primary" onclick="spAssignChecked()">Assign to Group &#x2192;</button>
-            <button class="sp-btn" onclick="spCreateGroup()">&#xFF0B; New Group</button>
+          <div class="sp-panel" style="flex:1;">
+            <div style="font-weight:600;font-size:13px;color:#3a506b;margin-bottom:8px;">Groups</div>
+            <div id="sp-groups-container"></div>
           </div>
         </div>
-        <div class="sp-panel" style="flex:1;">
-          <div style="font-weight:600;font-size:13px;color:#3a506b;margin-bottom:8px;">Groups</div>
-          <div id="sp-groups-container"></div>
+        <div>
+          <div id="sp-value-toggle" style="display:flex;gap:8px;align-items:center;margin-bottom:10px;flex-wrap:wrap;">
+            <span style="font-size:12px;font-weight:600;color:#555;">Values:</span>
+            <button class="sp-btn sp-sort-btn active-sort" id="sp-val-corrected" onclick="spSetValueMode('corrected',this)">Corrected Conc.</button>
+            <button class="sp-btn sp-sort-btn" id="sp-val-norm" onclick="spSetValueMode('normalized',this)" title="Requires total protein data">Normalized Protein</button>
+          </div>
+          <div style="display:flex;gap:8px;align-items:center;margin-bottom:10px;flex-wrap:wrap;">
+            <span style="font-size:12px;font-weight:600;color:#555;">Sort:</span>
+            <button class="sp-btn sp-sort-btn active-sort" id="sp-sort-group" onclick="spSetSort('group',this)">By Group</button>
+            <button class="sp-btn sp-sort-btn" id="sp-sort-asc" onclick="spSetSort('asc',this)">Value &#x2191;</button>
+            <button class="sp-btn sp-sort-btn" id="sp-sort-desc" onclick="spSetSort('desc',this)">Value &#x2193;</button>
+          </div>
+          <div id="sp-plate-filter" style="display:flex;gap:6px;align-items:center;margin-bottom:10px;flex-wrap:wrap;"></div>
+          <div id="sp-chart" style="width:100%;"></div>
         </div>
       </div>
-      <div>
-        <div id="sp-value-toggle" style="display:flex;gap:8px;align-items:center;margin-bottom:10px;flex-wrap:wrap;">
-          <span style="font-size:12px;font-weight:600;color:#555;">Values:</span>
-          <button class="sp-btn sp-sort-btn active-sort" id="sp-val-corrected" onclick="spSetValueMode('corrected',this)">Corrected Conc.</button>
-          <button class="sp-btn sp-sort-btn" id="sp-val-norm" onclick="spSetValueMode('normalized',this)" title="Requires total protein data">Normalized Protein</button>
-        </div>
-        <div style="display:flex;gap:8px;align-items:center;margin-bottom:10px;flex-wrap:wrap;">
-          <span style="font-size:12px;font-weight:600;color:#555;">Sort:</span>
-          <button class="sp-btn sp-sort-btn active-sort" id="sp-sort-group" onclick="spSetSort('group',this)">By Group</button>
-          <button class="sp-btn sp-sort-btn" id="sp-sort-asc" onclick="spSetSort('asc',this)">Value &#x2191;</button>
-          <button class="sp-btn sp-sort-btn" id="sp-sort-desc" onclick="spSetSort('desc',this)">Value &#x2193;</button>
-        </div>
-        <div id="sp-plate-filter" style="display:flex;gap:6px;align-items:center;margin-bottom:10px;flex-wrap:wrap;"></div>
-        <div id="sp-chart" style="width:100%;"></div>
+    </div>
+
+    <!-- ── Collated panel (new) ── -->
+    <div id="sp-collated-panel" style="display:none;">
+      <div id="sp-collated-group-toggles" style="display:flex;gap:8px;align-items:center;margin-bottom:12px;flex-wrap:wrap;"></div>
+      <div style="display:flex;gap:8px;align-items:center;margin-bottom:10px;flex-wrap:wrap;">
+        <span style="font-size:12px;font-weight:600;color:#555;">Values:</span>
+        <button class="sp-btn sp-sort-btn sp-collated-val-btn sp-collated-val-active" id="sp-coll-val-corrected" onclick="spCollSetValueMode('corrected',this)">Corrected Conc.</button>
+        <button class="sp-btn sp-sort-btn sp-collated-val-btn" id="sp-coll-val-norm" onclick="spCollSetValueMode('normalized',this)" title="Requires total protein data">Normalized Protein</button>
       </div>
+      <div style="display:flex;gap:8px;align-items:center;margin-bottom:10px;flex-wrap:wrap;">
+        <span style="font-size:12px;font-weight:600;color:#555;">Sort:</span>
+        <button class="sp-btn sp-sort-btn sp-collated-sort-btn sp-collated-sort-active" id="sp-coll-sort-group" onclick="spCollSetSort('group',this)">By Group</button>
+        <button class="sp-btn sp-sort-btn sp-collated-sort-btn" id="sp-coll-sort-asc" onclick="spCollSetSort('asc',this)">Value &#x2191;</button>
+        <button class="sp-btn sp-sort-btn sp-collated-sort-btn" id="sp-coll-sort-desc" onclick="spCollSetSort('desc',this)">Value &#x2193;</button>
+      </div>
+      <div id="sp-collated-chart" style="width:100%;"></div>
     </div>
   </div>
 
@@ -4385,6 +4414,193 @@ function qpRenderChart() {{
 }}
 // ── End QC Plots Tab ──────────────────────────────────────────────────────────
 
+// ── Collated Sub-tab ─────────────────────────────────────────────────────────
+var spSubtab = 'single';
+var spCollatedActive = new Set();   // analytes currently shown in collated view
+var spCollValueMode = 'corrected';  // 'corrected' | 'normalized'
+var spCollSortMode  = 'group';      // 'group' | 'asc' | 'desc'
+var SP_COLL_PALETTE = ['#1f77b4','#ff7f0e','#2ca02c','#d62728','#9467bd',
+                        '#8c564b','#e377c2','#17becf','#bcbd22','#7f7f7f'];
+
+function spSetSubtab(tab) {{
+  spSubtab = tab;
+  document.getElementById('sp-single-panel').style.display   = tab === 'single'   ? '' : 'none';
+  document.getElementById('sp-collated-panel').style.display = tab === 'collated' ? '' : 'none';
+  document.getElementById('sp-subtab-single').className   = 'sp-subtab-btn' + (tab === 'single'   ? ' sp-subtab-active' : '');
+  document.getElementById('sp-subtab-collated').className = 'sp-subtab-btn' + (tab === 'collated' ? ' sp-subtab-active' : '');
+  if (tab === 'collated') {{
+    spInitCollated();
+    spRenderCollatedChart();
+  }}
+}}
+
+function spInitCollated() {{
+  var toggles = document.getElementById('sp-collated-group-toggles');
+  if (!toggles || toggles.dataset.built) return;
+  toggles.dataset.built = '1';
+  // Disable normalized button if no TP data
+  var normBtn = document.getElementById('sp-coll-val-norm');
+  if (normBtn && !SP_DATA.hasNorm) {{
+    normBtn.disabled = true; normBtn.style.opacity = '0.4'; normBtn.style.cursor = 'not-allowed';
+    normBtn.title = 'No total protein data loaded';
+  }}
+  var analytes = SP_DATA.analytes || [];
+  spCollatedActive = new Set(analytes);   // all on by default
+  toggles.innerHTML = '<span style="font-size:12px;font-weight:600;color:#555;margin-right:4px;">Groups:</span>';
+  analytes.forEach(function(a, i) {{
+    var color = SP_COLL_PALETTE[i % SP_COLL_PALETTE.length];
+    var lbl = document.createElement('label');
+    lbl.style.cssText = 'display:flex;align-items:center;gap:4px;font-size:12px;cursor:pointer;' +
+                        'padding:3px 8px;border-radius:4px;border:1px solid ' + color + ';';
+    var cb = document.createElement('input');
+    cb.type = 'checkbox'; cb.checked = true; cb.value = a;
+    cb.onchange = function() {{
+      if (cb.checked) {{ spCollatedActive.add(a); }} else {{ spCollatedActive.delete(a); }}
+      spRenderCollatedChart();
+    }};
+    var dot = document.createElement('span');
+    dot.style.cssText = 'display:inline-block;width:10px;height:10px;border-radius:50%;background:' + color + ';flex-shrink:0;';
+    lbl.appendChild(cb); lbl.appendChild(dot);
+    lbl.appendChild(document.createTextNode(a));
+    toggles.appendChild(lbl);
+  }});
+}}
+
+function spCollSetValueMode(mode, btn) {{
+  spCollValueMode = mode;
+  document.querySelectorAll('.sp-collated-val-btn').forEach(function(b) {{
+    b.classList.toggle('active-sort', b === btn);
+  }});
+  spRenderCollatedChart();
+}}
+
+function spCollSetSort(mode, btn) {{
+  spCollSortMode = mode;
+  document.querySelectorAll('.sp-collated-sort-btn').forEach(function(b) {{
+    b.classList.toggle('active-sort', b === btn);
+  }});
+  spRenderCollatedChart();
+}}
+
+function spCollGetVals(d) {{
+  if (spCollValueMode === 'normalized' && d.normMean !== null && d.normMean !== undefined) {{
+    return {{ mean: d.normMean, sd: d.normSd || 0, values: d.normValues || [] }};
+  }}
+  return {{ mean: d.mean, sd: d.sd || 0, values: d.values || [] }};
+}}
+
+function spRenderCollatedChart() {{
+  var chartDiv = document.getElementById('sp-collated-chart');
+  if (!chartDiv) return;
+  var analytes = (SP_DATA.analytes || []).filter(function(a) {{ return spCollatedActive.has(a); }});
+  if (!analytes.length) {{ Plotly.purge('sp-collated-chart'); return; }}
+
+  // Collect all (sample, analyte) entries across selected analytes
+  var entries = [];  // {{name, analyte, analyteIdx, mean, sd, values, normMean, normSd, normValues, anyFlagged}}
+  analytes.forEach(function(a, ai) {{
+    (SP_DATA.samples[a] || []).forEach(function(d) {{
+      entries.push(Object.assign({{}}, d, {{analyte: a, analyteIdx: ai}}));
+    }});
+  }});
+
+  if (!entries.length) {{ Plotly.purge('sp-collated-chart'); return; }}
+
+  // Disambiguate display labels: add [group] suffix when same sample name appears in multiple groups
+  var _nameAnalyteCount = {{}};
+  entries.forEach(function(e) {{
+    if (!_nameAnalyteCount[e.name]) _nameAnalyteCount[e.name] = new Set();
+    _nameAnalyteCount[e.name].add(e.analyte);
+  }});
+  entries.forEach(function(e) {{
+    e.displayLabel = _nameAnalyteCount[e.name].size > 1
+      ? e.name + ' [' + e.analyte + ']'
+      : e.name;
+  }});
+
+  // Sort entries
+  if (spCollSortMode === 'asc') {{
+    entries.sort(function(a, b) {{ return spCollGetVals(a).mean - spCollGetVals(b).mean; }});
+  }} else if (spCollSortMode === 'desc') {{
+    entries.sort(function(a, b) {{ return spCollGetVals(b).mean - spCollGetVals(a).mean; }});
+  }} else {{
+    // By group: group analytes together, within each analyte sort by name
+    entries.sort(function(a, b) {{
+      if (a.analyteIdx !== b.analyteIdx) return a.analyteIdx - b.analyteIdx;
+      return a.name < b.name ? -1 : a.name > b.name ? 1 : 0;
+    }});
+  }}
+
+  var orderedLabels = entries.map(function(e) {{ return e.displayLabel; }});
+  var units = SP_DATA.units || '';
+  var yTitle = spCollValueMode === 'normalized'
+    ? 'Normalized Concentration'
+    : 'Concentration' + (units ? ' (' + units + ')' : '');
+
+  // Build one trace per analyte so each gets its own legend entry + colour
+  var traces = [];
+  var shapes = [];
+  analytes.forEach(function(a, ai) {{
+    var color = SP_COLL_PALETTE[ai % SP_COLL_PALETTE.length];
+    var aEntries = entries.filter(function(e) {{ return e.analyte === a; }});
+    if (!aEntries.length) return;
+    var xVals = aEntries.map(function(e) {{ return e.displayLabel; }});
+    var vList = aEntries.map(spCollGetVals);
+    var yMeans = vList.map(function(v) {{ return v.mean; }});
+    var ySDs   = vList.map(function(v) {{ return v.sd; }});
+    var barColors = aEntries.map(function(e) {{
+      return e.anyFlagged ? 'rgba(200,50,50,0.8)' : color;
+    }});
+    traces.push({{
+      type: 'bar', name: a,
+      x: xVals, y: yMeans,
+      error_y: {{ type:'data', array:ySDs, visible:true, color:'#444', thickness:1.5, width:4 }},
+      marker: {{ color: barColors }},
+      showlegend: true, legendgroup: a,
+      hovertemplate: '<b>%{{x}}</b><br>Mean: %{{y:.4g}}<extra>' + a + '</extra>'
+    }});
+    // Scatter overlay for individual values
+    var scX = [], scY = [], scC = [], scT = [];
+    aEntries.forEach(function(e) {{
+      (spCollGetVals(e).values || []).forEach(function(v) {{
+        scX.push(e.displayLabel); scY.push(v);
+        scC.push(e.anyFlagged ? 'rgba(180,20,20,0.9)' : color);
+        scT.push(e.name);
+      }});
+    }});
+    if (scX.length) traces.push({{
+      type:'scatter', mode:'markers', name: a + ' pts',
+      x:scX, y:scY, text:scT,
+      marker:{{ color:scC, size:6, symbol:'circle', line:{{color:'rgba(0,0,0,0.4)',width:1}} }},
+      showlegend:false, legendgroup:a,
+      hovertemplate:'<b>%{{text}}</b><br>Value: %{{y:.4g}}<extra></extra>'
+    }});
+
+    // Dashed separator between analyte groups in 'by group' sort
+    if (spCollSortMode === 'group' && ai < analytes.length - 1) {{
+      var lastIdx = orderedLabels.lastIndexOf(aEntries[aEntries.length - 1].displayLabel);
+      if (lastIdx >= 0) {{
+        shapes.push({{
+          type:'line', xref:'x', yref:'paper',
+          x0: lastIdx + 0.5, x1: lastIdx + 0.5,
+          y0:0, y1:1,
+          line:{{ color:'#aaa', width:1, dash:'dot' }}
+        }});
+      }}
+    }}
+  }});
+
+  var layout = {{
+    barmode: 'overlay',
+    height: 480,
+    margin: {{ l:100, r:40, t:40, b:160 }},
+    xaxis: {{ tickangle:-40, automargin:true, categoryorder:'array', categoryarray:orderedLabels }},
+    yaxis: {{ title:{{ text:yTitle, standoff:12 }}, automargin:false, rangemode:'tozero' }},
+    shapes: shapes,
+    legend: {{ orientation:'h', x:0, y:1.08 }},
+    paper_bgcolor:'white', plot_bgcolor:'white'
+  }};
+  Plotly.react('sp-collated-chart', traces, layout, {{responsive:true}});
+}}
 // ── End Sample Plots Tab ─────────────────────────────────────────────────────
 </script>
 </body>
