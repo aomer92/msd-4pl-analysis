@@ -4697,7 +4697,7 @@ function spRenderCollatedChart() {{
   // For groups: one collapsed bar = mean of all samples in the group across active analytes
   // For unassigned: individual bar per (sample, analyte) colored by analyte
 
-  // Map: name → [{entry, analyte, analyteIdx}] for active analytes
+  // Map: name → [{{entry, analyte, analyteIdx}}] for active analytes
   var nameEntries = {{}};
   analytes.forEach(function(a, ai) {{
     (SP_DATA.samples[a] || []).forEach(function(d) {{
