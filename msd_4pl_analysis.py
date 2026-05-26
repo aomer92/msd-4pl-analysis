@@ -129,7 +129,7 @@ import re, sys, argparse, os, tempfile, json, subprocess, platform, functools, m
 import threading, urllib.request
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 
-__version__ = "1.4.1"
+__version__ = "1.4.2"
 
 # ── Auto-update check ─────────────────────────────────────────────────────────
 _GITHUB_REPO  = "aomer92/msd-4pl-analysis"
@@ -2783,18 +2783,26 @@ def generate_html_report(results, html_path, msd_path, units=None,
         )
 
     # ── Sample plot JSON ──────────────────────────────────────────────────────
+    # Group by (analyte, sample_name, plate) so each plate's measurement is a
+    # separate bar.  The JS layer applies plate-checkbox filtering at render time.
     _sp_by_analyte = defaultdict(lambda: defaultdict(list))
     for e in _sp_entries:
-        _sp_by_analyte[e['analyte']][e['sample']].append(
-            {'conc': e['conc'], 'norm': e.get('norm'), 'flag': e['flag'], 'plate': e['plate']})
+        _sp_by_analyte[e['analyte']][(e['sample'], e['plate'])].append(
+            {'conc': e['conc'], 'norm': e.get('norm'), 'flag': e['flag']})
 
     _sp_has_norm = any(e.get('norm') is not None for e in _sp_entries)
-    _sp_data = {'analytes': [], 'units': units or '', 'hasNorm': _sp_has_norm, 'samples': {}}
+    _sp_all_plates = sorted({e['plate'] for e in _sp_entries})
+    _sp_data = {
+        'analytes': [], 'units': units or '',
+        'hasNorm': _sp_has_norm,
+        'plates': _sp_all_plates,   # all plate numbers, for checkbox generation
+        'samples': {},
+    }
     for _sp_analyte in sorted(_sp_by_analyte.keys()):
         _sp_data['analytes'].append(_sp_analyte)
         _sp_data['samples'][_sp_analyte] = []
-        for _sp_sname in sorted(_sp_by_analyte[_sp_analyte].keys()):
-            _sp_elist = _sp_by_analyte[_sp_analyte][_sp_sname]
+        for (_sp_sname, _sp_plate) in sorted(_sp_by_analyte[_sp_analyte].keys()):
+            _sp_elist = _sp_by_analyte[_sp_analyte][(_sp_sname, _sp_plate)]
             _sp_concs = [_e['conc'] for _e in _sp_elist]
             _sp_norms = [_e['norm'] for _e in _sp_elist if _e.get('norm') is not None]
             _sp_flags = [_e['flag'] for _e in _sp_elist]
@@ -2804,7 +2812,8 @@ def generate_html_report(results, html_path, msd_path, units=None,
             _sp_norm_sd = float(np.std(_sp_norms, ddof=1)) if len(_sp_norms) > 1 else (0.0 if _sp_norms else None)
             _sp_any_flagged = any(f != 'In Range' for f in _sp_flags)
             _sp_data['samples'][_sp_analyte].append({
-                'name': _sp_sname, 'mean': _sp_mean, 'sd': _sp_sd, 'values': _sp_concs,
+                'name': _sp_sname, 'plate': _sp_plate,
+                'mean': _sp_mean, 'sd': _sp_sd, 'values': _sp_concs,
                 'normMean': _sp_norm_mean, 'normSd': _sp_norm_sd, 'normValues': _sp_norms,
                 'flags': _sp_flags, 'anyFlagged': _sp_any_flagged
             })
@@ -3117,6 +3126,7 @@ def generate_html_report(results, html_path, msd_path, units=None,
           <button class="sp-btn sp-sort-btn" id="sp-sort-asc" onclick="spSetSort('asc',this)">Value &#x2191;</button>
           <button class="sp-btn sp-sort-btn" id="sp-sort-desc" onclick="spSetSort('desc',this)">Value &#x2193;</button>
         </div>
+        <div id="sp-plate-filter" style="display:flex;gap:6px;align-items:center;margin-bottom:10px;flex-wrap:wrap;"></div>
         <div id="sp-chart" style="width:100%;"></div>
       </div>
     </div>
@@ -3254,6 +3264,7 @@ var spDragPayload = null;   // {{name, fromGroup}}
 var spLastCheckedIdx = -1;  // for shift+click range selection in unassigned pool
 var spValueMode = 'corrected';  // 'corrected' | 'normalized'
 var SP_PALETTE = ['#1f77b4','#ff7f0e','#2ca02c','#9467bd','#8c564b','#e377c2','#17becf','#bcbd22'];
+var spActivePlates = new Set();   // plates currently shown; empty = all shown
 
 var QP_DATA = {_qp_json};
 var qpInitialized = false;
@@ -3270,6 +3281,29 @@ function spNextColor() {{
   return SP_PALETTE[spGroups.length % SP_PALETTE.length];
 }}
 
+function spBuildPlateFilter() {{
+  var bar = document.getElementById('sp-plate-filter');
+  if (!bar) return;
+  var plates = SP_DATA.plates || [];
+  if (plates.length <= 1) {{ bar.style.display = 'none'; return; }}
+  bar.innerHTML = '<span style="font-size:12px;font-weight:600;color:#555;margin-right:2px;">Plates:</span>';
+  plates.forEach(function(p) {{
+    var lbl = document.createElement('label');
+    lbl.style.cssText = 'display:flex;align-items:center;gap:3px;font-size:12px;cursor:pointer;';
+    var cb = document.createElement('input');
+    cb.type = 'checkbox'; cb.checked = true; cb.value = p;
+    cb.onchange = function() {{
+      if (cb.checked) {{ spActivePlates.add(p); }} else {{ spActivePlates.delete(p); }}
+      spRenderChart();
+    }};
+    lbl.appendChild(cb);
+    lbl.appendChild(document.createTextNode('Plate ' + p));
+    bar.appendChild(lbl);
+  }});
+  // Initialise spActivePlates to all plates
+  spActivePlates = new Set(plates);
+}}
+
 function spInit() {{
   if (!spInitialized) {{
     spInitialized = true;
@@ -3279,11 +3313,19 @@ function spInit() {{
     spValueMode = 'corrected';
     var analytes = SP_DATA.analytes || [];
     spCurrentAnalyte = analytes.length > 0 ? analytes[0] : null;
-    // Populate unassigned with all samples for current analyte
-    spUnassigned = spCurrentAnalyte && SP_DATA.samples[spCurrentAnalyte]
-      ? SP_DATA.samples[spCurrentAnalyte].map(function(s) {{ return s.name; }})
-      : [];
+    // Unique sample names for group assignment (plate-agnostic)
+    var allNames = [];
+    if (spCurrentAnalyte && SP_DATA.samples[spCurrentAnalyte]) {{
+      var seen = {{}};
+      SP_DATA.samples[spCurrentAnalyte].forEach(function(s) {{
+        if (!seen[s.name]) {{ seen[s.name] = true; allNames.push(s.name); }}
+      }});
+    }}
+    spUnassigned = allNames;
     spBuildAnalyteBar();
+    spBuildPlateFilter();
+    // Initialise spActivePlates to all plates
+    spActivePlates = new Set(SP_DATA.plates || []);
     // Show value-mode toggle only when normalized data is available
     var normBtn = document.getElementById('sp-val-norm');
     if (normBtn && !SP_DATA.hasNorm) {{
@@ -3312,8 +3354,12 @@ function spBuildAnalyteBar() {{
 
 function spSelectAnalyte(name) {{
   spCurrentAnalyte = name;
-  // Update unassigned: samples in current analyte not already in a group
-  var allSamples = SP_DATA.samples[name] ? SP_DATA.samples[name].map(function(s) {{ return s.name; }}) : [];
+  // Update unassigned: unique sample names in current analyte not already in a group
+  var seen = {{}};
+  var allSamples = [];
+  (SP_DATA.samples[name] || []).forEach(function(s) {{
+    if (!seen[s.name]) {{ seen[s.name] = true; allSamples.push(s.name); }}
+  }});
   var inGroups = {{}};
   spGroups.forEach(function(g) {{ g.samples.forEach(function(s) {{ inGroups[s] = true; }}); }});
   spUnassigned = allSamples.filter(function(s) {{ return !inGroups[s]; }});
@@ -3591,15 +3637,42 @@ function spRenderChart() {{
     ? spCurrentAnalyte + ' Normalized Concentration'
     : spCurrentAnalyte + ' Concentration' + (units ? ' (' + units + ')' : '');
 
-  // Build ordered list of {{sname, color, groupName}} segments
-  var segments = [];  // [{{groupName, color, items:[sampleName]}}]
+  // ── Plate filtering ────────────────────────────────────────────────────────
+  var filtered = (spActivePlates && spActivePlates.size > 0)
+    ? allData.filter(function(d) {{ return spActivePlates.has(d.plate); }})
+    : allData;
 
-  // P2-3: pre-build a name→datum Map so sort comparators are O(1) not O(n)
-  var spDataMap = new Map(allData.map(function(d) {{ return [d.name, d]; }}));
+  // Disambiguate display labels: add [Px] only when same sample runs on multiple
+  // active plates so the x-axis clearly identifies each bar.
+  var _nameCounts = {{}};
+  filtered.forEach(function(d) {{ _nameCounts[d.name] = (_nameCounts[d.name] || 0) + 1; }});
+  var _labelled = filtered.map(function(d) {{
+    return Object.assign({{}}, d, {{
+      displayLabel: _nameCounts[d.name] > 1 ? d.name + ' [P' + d.plate + ']' : d.name
+    }});
+  }});
+
+  // raw name → array of displayLabels (for expanding group/unassigned assignments)
+  var _nameToLabels = {{}};
+  _labelled.forEach(function(d) {{
+    if (!_nameToLabels[d.name]) _nameToLabels[d.name] = [];
+    _nameToLabels[d.name].push(d.displayLabel);
+  }});
+
+  // Build ordered list of {{sname, color, groupName}} segments
+  var segments = [];  // [{{groupName, color, items:[displayLabel]}}]
+
+  // Pre-build a displayLabel→datum Map so sort comparators are O(1) not O(n)
+  var spDataMap = new Map(_labelled.map(function(d) {{ return [d.displayLabel, d]; }}));
 
   spGroups.forEach(function(g) {{
     if (!g.visible) return;
-    var items = g.samples.filter(function(s) {{ return spDataMap.has(s); }});
+    // Expand raw sample names → per-plate displayLabels that are currently visible
+    var items = [];
+    g.samples.forEach(function(rawName) {{
+      var labels = _nameToLabels[rawName] || [];
+      labels.forEach(function(lbl) {{ if (spDataMap.has(lbl)) items.push(lbl); }});
+    }});
     if (spSortMode === 'asc') {{
       items.sort(function(a, b) {{
         var da = spDataMap.get(a), db = spDataMap.get(b);
@@ -3614,9 +3687,13 @@ function spRenderChart() {{
     if (items.length) segments.push({{groupName: g.name, color: g.color, items: items, collapsed: true}});
   }});
 
-  var unassignedItems = showUnassigned
-    ? spUnassigned.filter(function(s) {{ return spDataMap.has(s); }})
-    : [];
+  var unassignedItems = [];
+  if (showUnassigned) {{
+    spUnassigned.forEach(function(rawName) {{
+      var labels = _nameToLabels[rawName] || [];
+      labels.forEach(function(lbl) {{ if (spDataMap.has(lbl)) unassignedItems.push(lbl); }});
+    }});
+  }}
   if (spSortMode === 'asc') {{
     unassignedItems.sort(function(a, b) {{
       var da = spDataMap.get(a), db = spDataMap.get(b);
@@ -3664,7 +3741,7 @@ function spRenderChart() {{
       // One bar for the entire group; individual points are all sample values
       var allVals = [], anyFlagged = false, sampleMeans = [];
       seg.items.forEach(function(sname) {{
-        var d = allData.find(function(x) {{ return x.name === sname; }});
+        var d = spDataMap.get(sname);
         if (!d) return;
         if (d.anyFlagged) anyFlagged = true;
         var vals = spGetVals(d);
@@ -3692,7 +3769,7 @@ function spRenderChart() {{
     }} else {{
       // Individual bar per sample (unassigned pool)
       seg.items.forEach(function(sname) {{
-        var d = allData.find(function(x) {{ return x.name === sname; }});
+        var d = spDataMap.get(sname);
         if (!d) return;
         var flagged = d.anyFlagged;
         var vals = spGetVals(d);
