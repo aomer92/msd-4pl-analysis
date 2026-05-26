@@ -129,7 +129,7 @@ import re, sys, argparse, os, tempfile, json, subprocess, platform, functools, m
 import threading, urllib.request
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 
-__version__ = "1.4.4"
+__version__ = "1.4.5"
 
 # ── Auto-update check ─────────────────────────────────────────────────────────
 _GITHUB_REPO  = "aomer92/msd-4pl-analysis"
@@ -382,11 +382,26 @@ def _run_label(entry):
 from io import StringIO
 from collections import defaultdict
 
+# Threading primitives for safe lazy dependency loading.
+# _deps_lock  — ensures only one thread performs the actual imports.
+# _deps_ready — set only after ALL imports and globals assignments are done;
+#               acts as the fast-path guard so concurrent callers never see
+#               a partially-initialised globals() (e.g. np present, Workbook absent).
+_deps_lock  = threading.Lock()
+_deps_ready = threading.Event()
+
 def _ensure_deps():
     """Lazy-load all heavy analysis dependencies the first time an analysis runs.
-    Keeps GUI startup near-instant (only stdlib loads at launch)."""
-    if 'np' in globals():
+    Keeps GUI startup near-instant (only stdlib loads at launch).
+
+    Thread-safe: uses double-checked locking so that a background preload thread
+    and the main analysis thread cannot race and leave globals() half-populated.
+    """
+    if _deps_ready.is_set():
         return
+    with _deps_lock:
+        if _deps_ready.is_set():   # another thread finished while we waited
+            return
     g = globals()
     try:
         import numpy as np;          g['np'] = np
@@ -426,6 +441,8 @@ def _ensure_deps():
     g['PASS_FONT']    = Font(name='Arial', size=10, color='006100')
     g['WARN_FONT']    = Font(name='Arial', size=10, color='9C5700')
     g['FAIL_FONT']    = Font(name='Arial', size=10, color='9C0006')
+    # Signal that ALL globals are now populated — unblocks any concurrent caller.
+    _deps_ready.set()
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
