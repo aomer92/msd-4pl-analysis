@@ -129,7 +129,7 @@ import re, sys, argparse, os, tempfile, json, subprocess, platform, functools, m
 import threading, urllib.request
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 
-__version__ = "1.4.6"
+__version__ = "1.4.8"
 
 # ── Auto-update check ─────────────────────────────────────────────────────────
 _GITHUB_REPO  = "aomer92/msd-4pl-analysis"
@@ -1302,46 +1302,52 @@ def _extract_animal_tissue(sample_name):
     s = re.sub(r'_[PpRr]\d+$', '', s)                   # _P1, _R2 etc.
     s = re.sub(r'(?<![0-9])-([0-9]{1,2})$', '', s)      # -1, -2 after tissue letter
 
-    segments = s.split('-')
-
-    # ID-like: purely numeric (1001, 185) OR optional leading letters + digits (M001, F1234)
+    # ID-like: purely numeric (1001, 185) OR optional leading letters + digits (M001, F1234, Rn1868)
     _id_pat = re.compile(r'^[A-Za-z]*\d+$')
 
-    # Primary rule: animal ID immediately precedes the first pure-alpha tissue segment.
-    # e.g. [185, 008, 1001, fCtx, ...]  → first alpha at index 3, animal = segments[2]
-    #      [185, 008, M001, SC,   ...]  → first alpha at index 3, animal = segments[2]
-    first_alpha_idx = next(
-        (i for i, seg in enumerate(segments) if re.match(r'^[A-Za-z]+$', seg)),
-        None
-    )
-
-    if first_alpha_idx is not None and first_alpha_idx > 0:
-        # Animal is the segment immediately before the first tissue segment
-        animal = segments[first_alpha_idx - 1]
-        if not _id_pat.match(animal):
-            return None, None   # unexpected segment type
-        tissue_parts = segments[first_alpha_idx:]
-        tissue = '-'.join(tissue_parts) if tissue_parts else None
-
-    elif first_alpha_idx == 0:
-        # Old / reversed format: tissue comes first, animal follows
-        # e.g. fCtx-1001, fCtx-M001
-        id_segs = [(i, seg) for i, seg in enumerate(segments)
-                   if i > 0 and _id_pat.match(seg)]
-        if not id_segs:
+    def _try_parse(segs, tissue_joiner='-'):
+        """Apply the same animal/tissue extraction logic to a list of segments."""
+        first_alpha_idx = next(
+            (i for i, seg in enumerate(segs) if re.match(r'^[A-Za-z]+$', seg)),
+            None
+        )
+        if first_alpha_idx is not None and first_alpha_idx > 0:
+            animal = segs[first_alpha_idx - 1]
+            if not _id_pat.match(animal):
+                return None, None
+            tissue_parts = segs[first_alpha_idx:]
+            tissue = tissue_joiner.join(tissue_parts) if tissue_parts else None
+            return animal, tissue
+        elif first_alpha_idx == 0:
+            id_segs = [(i, seg) for i, seg in enumerate(segs)
+                       if i > 0 and _id_pat.match(seg)]
+            if not id_segs:
+                return None, None
+            animal_idx, animal = id_segs[0]
+            before = [seg for i, seg in enumerate(segs) if i < animal_idx]
+            tissue = tissue_joiner.join(before) if before else None
+            return animal, tissue
+        else:
+            if len(segs) == 1 and _id_pat.match(segs[0]):
+                return segs[0], None   # plain animal ID, e.g. 'Rn2541'
             return None, None
-        animal_idx, animal = id_segs[0]   # first ID-like segment after the tissue
-        before = [seg for i, seg in enumerate(segments) if i < animal_idx]
-        tissue = '-'.join(before) if before else None
 
-    else:
-        # No pure-alpha tissue segment — the whole name may be just an animal ID
-        # e.g. 'Rn2541' (alphanumeric ID, no tissue encoded in sample name)
-        if len(segments) == 1 and _id_pat.match(segments[0]):
-            return segments[0], None   # animal=Rn2541, tissue=None
-        return None, None   # truly unrecognised (QC labels, blanks, etc.)
+    # First try hyphen-delimited (existing formats: 185-008-1001-fCtx, fCtx-1001, Rn2541)
+    segments = s.split('-')
+    animal, tissue = _try_parse(segments, tissue_joiner='-')
+    if animal is not None:
+        return animal, tissue
 
-    return animal, tissue
+    # Fall back to underscore-delimited (e.g. ATLAS163_Rn1868_fCtx → Rn1868, fCtx)
+    # Only attempt when there are multiple underscore-separated parts, so that a plain
+    # animal ID like 'Rn2541' (already handled above) isn't re-tried unnecessarily.
+    us_segments = s.split('_')
+    if len(us_segments) > 1:
+        animal, tissue = _try_parse(us_segments, tissue_joiner='_')
+        if animal is not None:
+            return animal, tissue
+
+    return None, None
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
