@@ -129,7 +129,7 @@ import re, sys, argparse, os, tempfile, json, subprocess, platform, functools, m
 import threading, urllib.request
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 
-__version__ = "1.4.8"
+__version__ = "1.5.0"
 
 # ── Auto-update check ─────────────────────────────────────────────────────────
 _GITHUB_REPO  = "aomer92/msd-4pl-analysis"
@@ -1203,8 +1203,11 @@ def parse_total_protein_csv(filepath):
 
     Rows with non-numeric or blank Total Protein Result are skipped.
 
-    Returns dict {(animal_str, tissue_str): {sample_num_int: float}}
-      where sample_num_int is 1-based (matches _P1, _P2, … suffixes).
+    Returns a 3-tuple:
+      tp_map           {(animal_str, tissue_str): {sample_num_int: float}}
+                         where sample_num_int is 1-based (matches _P1, _P2, …).
+      animal_tissue_map {animal_str: tissue_str}   first tissue seen per animal.
+      animal_group_map  {animal_str: group_str}    in-vivo 'Group Number' per animal.
     """
     df = pd.read_csv(filepath, dtype=str)
     df.columns = [c.strip() for c in df.columns]
@@ -1215,13 +1218,22 @@ def parse_total_protein_csv(filepath):
             f"Total protein CSV missing required columns: {missing}\n"
             f"Found columns: {list(df.columns)}")
     has_sample_num = 'Sample Number' in df.columns
+    has_group_num = 'Group Number' in df.columns
     tp_map = {}
+    animal_group_map: dict[str, str] = {}
     position_counter = {}   # {(animal, tissue): next_position} — used when no Sample Number col
     for _, row in df.iterrows():
         animal = str(row['External Animal Number']).strip()
         tissue = str(row['Tissue Type']).strip()
         if not animal or animal.lower() in ('nan', ''):
             continue
+        # Capture the in-vivo Group Number for this animal (first non-blank wins).
+        # Independent of Total Protein Result so group # is available even when
+        # the protein value is blank/#VALUE!.
+        if has_group_num and animal not in animal_group_map:
+            grp = str(row['Group Number']).strip()
+            if grp and grp.lower() not in ('nan', ''):
+                animal_group_map[animal] = grp
         try:
             val = float(row['Total Protein Result'])
         except (ValueError, TypeError):
@@ -1247,7 +1259,7 @@ def parse_total_protein_csv(filepath):
     for (ani, tis) in tp_map:
         if ani not in animal_tissue_map and tis:
             animal_tissue_map[ani] = tis
-    return tp_map, animal_tissue_map
+    return tp_map, animal_tissue_map, animal_group_map
 
 
 def _extract_replicate_index(sample_name):
@@ -1648,7 +1660,7 @@ def _compute_qc_summary(results, qc_dilution_factors, qc_expected_concentrations
     return qc_summary_rows, qc_overlay_points
 
 
-def create_output(results, output_path, msd_path, raw_plate_blocks, units=None, cv_threshold=25, plate_dilution_factors=None, lloq_method='current', total_protein_map=None, qc_dilution_factors=None, qc_expected_concentrations=None, group_dilution_factors=None, animal_tissue_map=None):
+def create_output(results, output_path, msd_path, raw_plate_blocks, units=None, cv_threshold=25, plate_dilution_factors=None, lloq_method='current', total_protein_map=None, qc_dilution_factors=None, qc_expected_concentrations=None, group_dilution_factors=None, animal_tissue_map=None, animal_group_map=None):
     wb = Workbook()
     wb.remove(wb.active)
     tmp_dir = tempfile.mkdtemp(prefix='msd_charts_')
@@ -1656,12 +1668,13 @@ def create_output(results, output_path, msd_path, raw_plate_blocks, units=None, 
         _create_output_inner(wb, tmp_dir, results, output_path, msd_path, raw_plate_blocks,
                              units, cv_threshold, plate_dilution_factors, lloq_method,
                              total_protein_map, qc_dilution_factors, qc_expected_concentrations,
-                             group_dilution_factors, animal_tissue_map=animal_tissue_map)
+                             group_dilution_factors, animal_tissue_map=animal_tissue_map,
+                             animal_group_map=animal_group_map)
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
-def _create_output_inner(wb, tmp_dir, results, output_path, msd_path, raw_plate_blocks, units=None, cv_threshold=25, plate_dilution_factors=None, lloq_method='current', total_protein_map=None, qc_dilution_factors=None, qc_expected_concentrations=None, group_dilution_factors=None, animal_tissue_map=None):
+def _create_output_inner(wb, tmp_dir, results, output_path, msd_path, raw_plate_blocks, units=None, cv_threshold=25, plate_dilution_factors=None, lloq_method='current', total_protein_map=None, qc_dilution_factors=None, qc_expected_concentrations=None, group_dilution_factors=None, animal_tissue_map=None, animal_group_map=None):
 
     # Pre-collect QC overlay points (corrected conc + signal) for overlay chart
     qc_summary_rows, qc_overlay_points = _compute_qc_summary(
@@ -1985,7 +1998,7 @@ def _create_output_inner(wb, tmp_dir, results, output_path, msd_path, raw_plate_
 
     # ── All Unknowns Combined ─────────────────────────────────────────
     ws_all = wb.create_sheet("All Unknowns")
-    all_h = ["Sample Name", "Animal", "Tissue", "Plate", "Spot", "Group", "Wells",
+    all_h = ["Sample Name", "Animal", "Tissue", "Study Group", "Plate", "Spot", "Group", "Wells",
              "Avg Signal", avg_interp_header,
              "%CV", "Flag", "Dilution Factor", corrected_header, "Total Protein",
              "Normalized Protein Concentration"]
@@ -2042,45 +2055,48 @@ def _create_output_inner(wb, tmp_dir, results, output_path, msd_path, raw_plate_
         # Enrich tissue from TP CSV's Tissue Type column when sample name has none
         if animal and tissue is None and animal_tissue_map:
             tissue = animal_tissue_map.get(animal)
+        # In-vivo Group Number from the ELISA/TP CSV (keyed by animal)
+        study_group = animal_group_map.get(animal) if (animal and animal_group_map) else None
         ws_all.cell(row=arow, column=1,  value=_safe_str(sample_name))
         ws_all.cell(row=arow, column=2,  value=_safe_str(animal) if animal else None)
         ws_all.cell(row=arow, column=3,  value=_safe_str(tissue) if tissue else None)
-        ws_all.cell(row=arow, column=4,  value=_safe_str(str(plate)))
-        ws_all.cell(row=arow, column=5,  value=_safe_str(str(spot_key)))
-        ws_all.cell(row=arow, column=6,  value=_safe_str(curve_group) if curve_group else None)
-        ws_all.cell(row=arow, column=7,  value=_safe_str(wells))
-        ws_all.cell(row=arow, column=8,  value=round(float(avg_signal), 1) if np.isfinite(avg_signal) else "N/A")
-        ws_all.cell(row=arow, column=8).number_format = '#,##0'
-        ws_all.cell(row=arow, column=9,  value=round(float(avg_conc), 4) if np.isfinite(avg_conc) else "N/A")
-        ws_all.cell(row=arow, column=9).number_format = '#,##0.0000'
-        # %CV (col 10)
-        cv_cell = ws_all.cell(row=arow, column=10)
+        ws_all.cell(row=arow, column=4,  value=_safe_str(study_group) if study_group else None)
+        ws_all.cell(row=arow, column=5,  value=_safe_str(str(plate)))
+        ws_all.cell(row=arow, column=6,  value=_safe_str(str(spot_key)))
+        ws_all.cell(row=arow, column=7,  value=_safe_str(curve_group) if curve_group else None)
+        ws_all.cell(row=arow, column=8,  value=_safe_str(wells))
+        ws_all.cell(row=arow, column=9,  value=round(float(avg_signal), 1) if np.isfinite(avg_signal) else "N/A")
+        ws_all.cell(row=arow, column=9).number_format = '#,##0'
+        ws_all.cell(row=arow, column=10, value=round(float(avg_conc), 4) if np.isfinite(avg_conc) else "N/A")
+        ws_all.cell(row=arow, column=10).number_format = '#,##0.0000'
+        # %CV (col 11)
+        cv_cell = ws_all.cell(row=arow, column=11)
         cv_cell.value = round(float(cv), 1) if np.isfinite(cv) else "N/A"
         cv_cell.number_format = '0.0'
         if np.isfinite(cv) and cv_threshold is not None:
             cv_cell.fill = CV_BAD_FILL if cv > cv_threshold else CV_GOOD_FILL
-        # Flag (col 11)
-        ws_all.cell(row=arow, column=11, value=flag)
-        cell_flag = ws_all.cell(row=arow, column=11)
+        # Flag (col 12)
+        ws_all.cell(row=arow, column=12, value=flag)
+        cell_flag = ws_all.cell(row=arow, column=12)
         cell_flag.font = PASS_FONT if flag == "In Range" else (WARN_FONT if flag in ["> ULOQ", "< LLOQ"] else FAIL_FONT)
-        # Dilution Factor (col 12)
-        df_cell = ws_all.cell(row=arow, column=12)
+        # Dilution Factor (col 13)
+        df_cell = ws_all.cell(row=arow, column=13)
         has_factor = is_qc_factor or (plate in plate_dilution_factors)
         df_cell.value = _xv(factor) if has_factor else None
         if has_factor:
             df_cell.number_format = '0.###'
-        # Corrected Avg Interp. Conc. (col 13)
-        corrected_cell = ws_all.cell(row=arow, column=13)
+        # Corrected Avg Interp. Conc. (col 14)
+        corrected_cell = ws_all.cell(row=arow, column=14)
         corrected_cell.value = round(float(corrected_conc), 4) if np.isfinite(corrected_conc) else "N/A"
         corrected_cell.number_format = '#,##0.0000'
-        # Total Protein (col 14)
+        # Total Protein (col 15)
         # tp_map structure: {(animal, tissue): {sample_num_int: float}}
         # tissue may be enriched from the TP CSV's Tissue Type column (see above).
         # _P1/_R1 / -1/-2 suffix → direct sample_num lookup.
         # No suffix + tissue present → sequential counter (one TP value per replicate row).
         # tissue still None after enrichment → animal-only fallback lookup.
         tp_val = None
-        tp_cell = ws_all.cell(row=arow, column=14)
+        tp_cell = ws_all.cell(row=arow, column=15)
         if total_protein_map and animal:
             tp_key = (animal, tissue)
             tp_dict = total_protein_map.get(tp_key)
@@ -2108,8 +2124,8 @@ def _create_output_inner(wb, tmp_dir, results, output_path, msd_path, raw_plate_
             if tp_val is not None:
                 tp_cell.value = _xv(tp_val)
                 tp_cell.number_format = '0.0000'
-        # Normalized Protein Concentration (col 15)
-        norm_cell = ws_all.cell(row=arow, column=15)
+        # Normalized Protein Concentration (col 16)
+        norm_cell = ws_all.cell(row=arow, column=16)
         if tp_val is not None and np.isfinite(corrected_conc) and float(tp_val) != 0:
             norm_cell.value = round(float(corrected_conc) / float(tp_val), 6)
             norm_cell.number_format = '0.000000'
@@ -2173,7 +2189,7 @@ def generate_html_report(results, html_path, msd_path, units=None,
                           plate_dilution_factors=None, lloq_method='current',
                           total_protein_map=None, excel_path=None,
                           group_dilution_factors=None, cv_threshold=25,
-                          animal_tissue_map=None):
+                          animal_tissue_map=None, animal_group_map=None):
     """Generate a self-contained interactive HTML report alongside the Excel output."""
     try:
         import plotly.graph_objects as go
@@ -2720,6 +2736,7 @@ def generate_html_report(results, html_path, msd_path, units=None,
     _sp_entries = []
     tp_index = defaultdict(int)
     unk_rows_html = []
+    has_group = bool(animal_group_map)   # show Study Group column only when ELISA group #s loaded
     for (sname, group, plate, spot_key), data in sorted(all_unk_groups.items()):
         spot         = data['spot']
         lloq_sig     = data['lloq_sig']
@@ -2755,6 +2772,8 @@ def generate_html_report(results, html_path, msd_path, units=None,
         # Enrich tissue from TP CSV's Tissue Type column when not in sample name
         if animal and tissue is None and animal_tissue_map:
             tissue = animal_tissue_map.get(animal)
+        # In-vivo Group Number from ELISA/TP CSV (keyed by animal)
+        study_group = animal_group_map.get(animal) if (animal and animal_group_map) else None
         tp_val = None
         if total_protein_map and animal:
             tp_key = (animal, tissue)
@@ -2785,7 +2804,8 @@ def generate_html_report(results, html_path, msd_path, units=None,
             _sp_entries.append({'analyte': group or 'Default', 'sample': sname,
                                 'conc': float(corrected),
                                 'norm': float(norm_val) if norm_val is not None else None,
-                                'flag': flag, 'plate': plate})
+                                'flag': flag, 'plate': plate,
+                                'tissue': tissue, 'groupNum': study_group})
 
         flag_class = ('status-good' if flag == 'In Range'
                       else 'status-warn' if flag in ('> ULOQ', '< LLOQ') else '')
@@ -2799,8 +2819,10 @@ def generate_html_report(results, html_path, msd_path, units=None,
         norm_str     = f"{norm_val:.6g}" if norm_val is not None else ''
         animal_str   = animal or ''
         tissue_str   = tissue or ''
+        group_td     = f"<td>{study_group or ''}</td>" if has_group else ''
         unk_rows_html.append(
             f"<tr><td>{sname}</td><td>{animal_str}</td><td>{tissue_str}</td>"
+            f"{group_td}"
             f"<td>{plate}</td><td>{spot}</td><td>{group}</td>"
             f"<td>{', '.join(data['wells'])}</td><td>{avg_sig_str}</td>"
             f"<td>{avg_conc_str}</td><td class='{cv_class}'>{cv_str}</td>"
@@ -2815,13 +2837,18 @@ def generate_html_report(results, html_path, msd_path, units=None,
     _sp_by_analyte = defaultdict(lambda: defaultdict(list))
     for e in _sp_entries:
         _sp_by_analyte[e['analyte']][(e['sample'], e['plate'])].append(
-            {'conc': e['conc'], 'norm': e.get('norm'), 'flag': e['flag']})
+            {'conc': e['conc'], 'norm': e.get('norm'), 'flag': e['flag'],
+             'tissue': e.get('tissue'), 'groupNum': e.get('groupNum')})
 
     _sp_has_norm = any(e.get('norm') is not None for e in _sp_entries)
+    _sp_has_group = any(e.get('groupNum') for e in _sp_entries)
+    _sp_has_tissue = any(e.get('tissue') for e in _sp_entries)
     _sp_all_plates = sorted({e['plate'] for e in _sp_entries})
     _sp_data = {
         'analytes': [], 'units': units or '',
         'hasNorm': _sp_has_norm,
+        'hasGroup': _sp_has_group,    # any in-vivo Group Number available
+        'hasTissue': _sp_has_tissue,  # any tissue available
         'plates': _sp_all_plates,   # all plate numbers, for checkbox generation
         'samples': {},
     }
@@ -2838,11 +2865,15 @@ def generate_html_report(results, html_path, msd_path, units=None,
             _sp_norm_mean = float(np.mean(_sp_norms)) if _sp_norms else None
             _sp_norm_sd = float(np.std(_sp_norms, ddof=1)) if len(_sp_norms) > 1 else (0.0 if _sp_norms else None)
             _sp_any_flagged = any(f != 'In Range' for f in _sp_flags)
+            # tissue / groupNum are constant per sample name — take first non-empty
+            _sp_tissue = next((_e.get('tissue') for _e in _sp_elist if _e.get('tissue')), None)
+            _sp_groupnum = next((_e.get('groupNum') for _e in _sp_elist if _e.get('groupNum')), None)
             _sp_data['samples'][_sp_analyte].append({
                 'name': _sp_sname, 'plate': _sp_plate,
                 'mean': _sp_mean, 'sd': _sp_sd, 'values': _sp_concs,
                 'normMean': _sp_norm_mean, 'normSd': _sp_norm_sd, 'normValues': _sp_norms,
-                'flags': _sp_flags, 'anyFlagged': _sp_any_flagged
+                'flags': _sp_flags, 'anyFlagged': _sp_any_flagged,
+                'tissue': _sp_tissue, 'groupNum': _sp_groupnum
             })
     _sp_json = _json.dumps(_sp_data)
 
@@ -2927,11 +2958,13 @@ def generate_html_report(results, html_path, msd_path, units=None,
         "<th onclick=\"sortTable(this)\">Total Protein</th>"
         "<th onclick=\"sortTable(this)\">Normalized Conc.</th>"
     ) if has_tp else ""
+    group_header = "<th onclick=\"sortTable(this)\">Study Group</th>" if has_group else ""
     unk_hdr_row = (
         "<tr>"
         "<th onclick=\"sortTable(this)\">Sample Name</th>"
         "<th onclick=\"sortTable(this)\">Animal</th>"
         "<th onclick=\"sortTable(this)\">Tissue</th>"
+        + group_header +
         "<th onclick=\"sortTable(this)\">Plate</th>"
         "<th onclick=\"sortTable(this)\">Spot</th>"
         "<th onclick=\"sortTable(this)\">Group</th>"
@@ -3039,6 +3072,12 @@ def generate_html_report(results, html_path, msd_path, units=None,
   .sp-subtab-btn {{ padding:8px 20px;border:none;border-bottom:2px solid transparent;background:transparent;cursor:pointer;font-size:13px;font-weight:500;color:#666;margin-bottom:-2px; }}
   .sp-subtab-btn:hover {{ color:#2F5496; }}
   .sp-subtab-active {{ color:#2F5496 !important;border-bottom-color:#2F5496 !important;font-weight:600 !important; }}
+  .sp-autogroup-bar {{ display:flex;gap:8px;align-items:center;margin-bottom:14px;flex-wrap:wrap;
+                       background:#f5f7fb;border:1px solid #e3e8f0;border-radius:6px;padding:8px 12px; }}
+  .sp-autogroup-sel {{ font-size:12px;padding:4px 8px;border:1px solid #c3ccda;border-radius:4px;
+                       background:white;color:#333;cursor:pointer; }}
+  .sp-autogroup-sel:disabled {{ opacity:0.45;cursor:not-allowed; }}
+  .sp-autogroup-sel option:disabled {{ color:#bbb; }}
 </style>
 </head>
 <body>
@@ -3129,6 +3168,20 @@ def generate_html_report(results, html_path, msd_path, units=None,
     <!-- ── Per-Group panel (existing) ── -->
     <div id="sp-single-panel">
       <div id="sp-analyte-bar" style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:14px;"></div>
+      <div class="sp-autogroup-bar">
+        <span style="font-size:12px;font-weight:600;color:#555;">Auto-group by:</span>
+        <select id="sp-autogroup-1" class="sp-autogroup-sel" onchange="spAutoGroup()">
+          <option value="">None (manual)</option>
+          <option value="group">Group Number</option>
+          <option value="tissue">Tissue Type</option>
+        </select>
+        <span style="font-size:12px;color:#888;">then</span>
+        <select id="sp-autogroup-2" class="sp-autogroup-sel" onchange="spAutoGroup()">
+          <option value="">&mdash; none &mdash;</option>
+          <option value="group">Group Number</option>
+          <option value="tissue">Tissue Type</option>
+        </select>
+      </div>
       <div style="display:grid;grid-template-columns:280px 1fr;gap:16px;margin-bottom:16px;">
         <div style="display:flex;flex-direction:column;gap:10px;">
           <div class="sp-panel">
@@ -3174,6 +3227,20 @@ def generate_html_report(results, html_path, msd_path, units=None,
     <div id="sp-collated-panel" style="display:none;">
       <!-- Analyte/group checkboxes -->
       <div id="sp-collated-group-toggles" style="display:flex;gap:8px;align-items:center;margin-bottom:12px;flex-wrap:wrap;"></div>
+      <div class="sp-autogroup-bar">
+        <span style="font-size:12px;font-weight:600;color:#555;">Auto-group by:</span>
+        <select id="sp-coll-autogroup-1" class="sp-autogroup-sel" onchange="spCollAutoGroup()">
+          <option value="">None (manual)</option>
+          <option value="group">Group Number</option>
+          <option value="tissue">Tissue Type</option>
+        </select>
+        <span style="font-size:12px;color:#888;">then</span>
+        <select id="sp-coll-autogroup-2" class="sp-autogroup-sel" onchange="spCollAutoGroup()">
+          <option value="">&mdash; none &mdash;</option>
+          <option value="group">Group Number</option>
+          <option value="tissue">Tissue Type</option>
+        </select>
+      </div>
       <!-- 2-column layout matching Per Group -->
       <div style="display:grid;grid-template-columns:280px 1fr;gap:16px;margin-bottom:16px;">
         <div style="display:flex;flex-direction:column;gap:10px;">
@@ -3418,6 +3485,7 @@ function spInit() {{
       normBtn.style.cursor = 'not-allowed';
       normBtn.title = 'No total protein data loaded';
     }}
+    spSetupAutogroupSelects('sp-autogroup-1', 'sp-autogroup-2');
   }}
   spRenderGroupPanel();
   spRenderChart();
@@ -3450,6 +3518,10 @@ function spSelectAnalyte(name) {{
   document.querySelectorAll('.sp-analyte-btn').forEach(function(b) {{
     b.classList.toggle('active', b.textContent === name);
   }});
+  // If an auto-group mode is active, recompute groups for the new analyte's samples
+  var _ag1 = document.getElementById('sp-autogroup-1');
+  var _ag2 = document.getElementById('sp-autogroup-2');
+  if ((_ag1 && _ag1.value) || (_ag2 && _ag2.value)) {{ spAutoGroup(); return; }}
   spRenderGroupPanel();
   spRenderChart();
 }}
@@ -3698,6 +3770,89 @@ function spSetValueMode(mode, btn) {{
     if (el) el.classList.remove('active-sort');
   }});
   if (btn) btn.classList.add('active-sort');
+  spRenderChart();
+}}
+
+// ── Auto-grouping by Group Number / Tissue Type (shared across Per Group & Collated) ──
+function spAutoKeyValue(d, mode) {{
+  if (!d) return null;
+  if (mode === 'group')  return (d.groupNum !== null && d.groupNum !== undefined && d.groupNum !== '') ? String(d.groupNum) : null;
+  if (mode === 'tissue') return (d.tissue) ? String(d.tissue) : null;
+  return null;
+}}
+function spAutoKeyLabel(mode, val) {{
+  return mode === 'group' ? ('Group ' + val) : val;
+}}
+// Natural compare so 'Group 2' sorts before 'Group 10'
+function spNaturalCmp(a, b) {{
+  var ax = String(a).match(/(\\d+|\\D+)/g) || [];
+  var bx = String(b).match(/(\\d+|\\D+)/g) || [];
+  for (var i = 0; i < Math.min(ax.length, bx.length); i++) {{
+    var an = parseInt(ax[i], 10), bn = parseInt(bx[i], 10);
+    if (!isNaN(an) && !isNaN(bn)) {{ if (an !== bn) return an - bn; }}
+    else if (ax[i] !== bx[i]) return ax[i] < bx[i] ? -1 : 1;
+  }}
+  return ax.length - bx.length;
+}}
+// Bucket `names` by the selected mode(s). A name must have ALL selected keys
+// present, otherwise it falls to unassigned. getMeta(name) → datum with groupNum/tissue.
+function spBuildAutoGroups(names, modes, getMeta) {{
+  var buckets = {{}}, order = [], unassigned = [];
+  names.forEach(function(sname) {{
+    var d = getMeta(sname);
+    var parts = [], ok = true;
+    modes.forEach(function(m) {{
+      var v = spAutoKeyValue(d, m);
+      if (v === null) {{ ok = false; }} else parts.push(spAutoKeyLabel(m, v));
+    }});
+    if (!ok || !parts.length) {{ unassigned.push(sname); return; }}
+    var label = parts.join(' \\u00B7 ');
+    if (!buckets[label]) {{ buckets[label] = []; order.push(label); }}
+    buckets[label].push(sname);
+  }});
+  order.sort(spNaturalCmp);
+  return {{ groups: order.map(function(l) {{ return {{name: l, samples: buckets[l]}}; }}), unassigned: unassigned }};
+}}
+// Disable Group/Tissue options when that metadata isn't available, and reset to manual.
+function spSetupAutogroupSelects(id1, id2) {{
+  [id1, id2].forEach(function(id) {{
+    var sel = document.getElementById(id);
+    if (!sel) return;
+    Array.from(sel.options).forEach(function(opt) {{
+      if (opt.value === 'group'  && !SP_DATA.hasGroup)  opt.disabled = true;
+      if (opt.value === 'tissue' && !SP_DATA.hasTissue) opt.disabled = true;
+    }});
+    sel.value = '';
+  }});
+}}
+function spReadAutoModes(id1, id2) {{
+  var m1 = document.getElementById(id1), m2 = document.getElementById(id2);
+  var modes = [];
+  if (m1 && m1.value) modes.push(m1.value);
+  if (m2 && m2.value && (!m1 || m2.value !== m1.value)) modes.push(m2.value);
+  return modes;
+}}
+
+function spAutoGroup() {{
+  var modes = spReadAutoModes('sp-autogroup-1', 'sp-autogroup-2');
+  // Universe = all unique sample names for the current analyte
+  var names = [], seen = {{}};
+  (SP_DATA.samples[spCurrentAnalyte] || []).forEach(function(s) {{
+    if (!seen[s.name]) {{ seen[s.name] = true; names.push(s.name); }}
+  }});
+  if (!modes.length) {{
+    spGroups = [];
+    spUnassigned = names;
+    spRenderGroupPanel();
+    spRenderChart();
+    return;
+  }}
+  var res = spBuildAutoGroups(names, modes, spGetSampleData);
+  spGroups = res.groups.map(function(g, i) {{
+    return {{ id: ++spGroupIdCounter, name: g.name, color: SP_PALETTE[i % SP_PALETTE.length], visible: true, samples: g.samples }};
+  }});
+  spUnassigned = res.unassigned;
+  spRenderGroupPanel();
   spRenderChart();
 }}
 
@@ -4523,7 +4678,9 @@ function spInitCollated() {{
     cb.type = 'checkbox'; cb.checked = true; cb.value = a;
     cb.onchange = function() {{
       if (cb.checked) {{ spCollatedActive.add(a); }} else {{ spCollatedActive.delete(a); }}
-      spRenderCollatedChart();
+      // If auto-grouping is active, recompute over the active analyte set
+      var modes = spReadAutoModes('sp-coll-autogroup-1', 'sp-coll-autogroup-2');
+      if (modes.length) {{ spCollAutoGroup(); }} else {{ spRenderCollatedChart(); }}
     }};
     var dot = document.createElement('span');
     dot.style.cssText = 'display:inline-block;width:10px;height:10px;border-radius:50%;background:' + color + ';flex-shrink:0;';
@@ -4531,7 +4688,47 @@ function spInitCollated() {{
     lbl.appendChild(document.createTextNode(a));
     toggles.appendChild(lbl);
   }});
+  spSetupAutogroupSelects('sp-coll-autogroup-1', 'sp-coll-autogroup-2');
   spCollRenderGroupPanel();
+}}
+
+// Metadata lookup for a sample name across active analytes (groupNum/tissue are
+// constant per name, so the first occurrence wins).
+function spCollGetMeta(sname) {{
+  var analytes = SP_DATA.analytes || [];
+  for (var i = 0; i < analytes.length; i++) {{
+    var arr = SP_DATA.samples[analytes[i]] || [];
+    for (var j = 0; j < arr.length; j++) {{
+      if (arr[j].name === sname) return arr[j];
+    }}
+  }}
+  return null;
+}}
+
+function spCollAutoGroup() {{
+  var modes = spReadAutoModes('sp-coll-autogroup-1', 'sp-coll-autogroup-2');
+  // Universe = all unique sample names across currently-active analytes
+  var names = [], seen = {{}};
+  (SP_DATA.analytes || []).forEach(function(a) {{
+    if (!spCollatedActive.has(a)) return;
+    (SP_DATA.samples[a] || []).forEach(function(s) {{
+      if (!seen[s.name]) {{ seen[s.name] = true; names.push(s.name); }}
+    }});
+  }});
+  if (!modes.length) {{
+    spCollGroups = [];
+    spCollUnassigned = names;
+    spCollRenderGroupPanel();
+    spRenderCollatedChart();
+    return;
+  }}
+  var res = spBuildAutoGroups(names, modes, spCollGetMeta);
+  spCollGroups = res.groups.map(function(g, i) {{
+    return {{ id: ++spCollGroupIdCounter, name: g.name, color: SP_COLL_PALETTE[i % SP_COLL_PALETTE.length], visible: true, samples: g.samples }};
+  }});
+  spCollUnassigned = res.unassigned;
+  spCollRenderGroupPanel();
+  spRenderCollatedChart();
 }}
 
 // ── Group panel (mirrors spRenderGroupPanel) ──────────────────────────────────
@@ -5018,16 +5215,18 @@ def run_analysis(msd_path, platemap_path, output_path, spots_override=None, unit
     # Parse total protein CSV if provided
     total_protein_map = None
     animal_tissue_map = None
+    animal_group_map = None
     if total_protein_path:
         try:
-            total_protein_map, animal_tissue_map = parse_total_protein_csv(total_protein_path)
-            print(f"\nLoaded total protein data: {len(total_protein_map)} animal/tissue entries")
+            total_protein_map, animal_tissue_map, animal_group_map = parse_total_protein_csv(total_protein_path)
+            print(f"\nLoaded total protein data: {len(total_protein_map)} animal/tissue entries"
+                  f"{f', {len(animal_group_map)} group assignments' if animal_group_map else ''}")
         except Exception as e:
             print(f"Warning: could not load total protein CSV: {e}")
 
     print(f"\n{'=' * 60}")
     print(f"Generating Excel: {output_path}")
-    create_output(results, output_path, msd_path, raw_plate_blocks, units, cv_threshold, plate_dilution_factors, lloq_method, total_protein_map, qc_dilution_factors, qc_expected_concentrations, group_dilution_factors=group_dilution_factors, animal_tissue_map=animal_tissue_map)
+    create_output(results, output_path, msd_path, raw_plate_blocks, units, cv_threshold, plate_dilution_factors, lloq_method, total_protein_map, qc_dilution_factors, qc_expected_concentrations, group_dilution_factors=group_dilution_factors, animal_tissue_map=animal_tissue_map, animal_group_map=animal_group_map)
     print("Done!")
 
     # Generate and open interactive HTML report (co-located with the Excel file so
@@ -5042,7 +5241,8 @@ def run_analysis(msd_path, platemap_path, output_path, spots_override=None, unit
                              total_protein_map, output_path,
                              group_dilution_factors=group_dilution_factors,
                              cv_threshold=cv_threshold,
-                             animal_tissue_map=animal_tissue_map)
+                             animal_tissue_map=animal_tissue_map,
+                             animal_group_map=animal_group_map)
         if os.path.exists(html_path):
             _open_file(html_path)
     except Exception as e:
