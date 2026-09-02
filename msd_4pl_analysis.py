@@ -129,7 +129,7 @@ import re, sys, argparse, os, tempfile, json, subprocess, platform, functools, m
 import threading, urllib.request
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 
-__version__ = "1.6.0"
+__version__ = "1.6.1"
 
 # ── Auto-update check ─────────────────────────────────────────────────────────
 _GITHUB_REPO  = "aomer92/msd-4pl-analysis"
@@ -1303,6 +1303,8 @@ def _extract_animal_tissue(sample_name):
         185-008-1001-SC-C-1          → ('1001', 'SC-C')      compound tissue
         185-008-7001-SC-T-2          → ('7001', 'SC-T')
         185-008-1001-SC-L-1          → ('1001', 'SC-L')
+        1001-C5-L                    → ('1001', 'C5-L')      spinal level + side
+        7502A-T6-R                   → ('7502A', 'T6-R')
 
     Strategy:
       1. Strip trailing replicate suffix (_P1/_R1 or -1/-2 after a non-digit).
@@ -1352,6 +1354,20 @@ def _extract_animal_tissue(sample_name):
 
     # First try hyphen-delimited (existing formats: 185-008-1001-fCtx, fCtx-1001, Rn2541)
     segments = s.split('-')
+
+    # Special case: trailing "{level}-{side}" spinal-cord tissue pair, e.g.
+    # 1001-C5-L, 7502A-T6-R. 'level' (C5/T6/L4/L5/S1/...) is a short anatomical
+    # code — single letter + 1-2 digits — which matches _id_pat just like an
+    # animal ID does, so the general rule below (which looks for the first
+    # PURELY-alpha segment as the tissue boundary) would mistake the level
+    # code for the animal and the trailing single-letter side for the tissue,
+    # colliding every animal that shares a level+side onto one lookup key.
+    # Must be checked first since it overrides that general rule.
+    _level_pat = re.compile(r'^[A-Za-z]\d{1,2}$')
+    if (len(segments) >= 3 and re.match(r'^[LR]$', segments[-1])
+            and _level_pat.match(segments[-2]) and _id_pat.match(segments[-3])):
+        return segments[-3], f"{segments[-2]}-{segments[-1]}"
+
     animal, tissue = _try_parse(segments, tissue_joiner='-')
     if animal is not None:
         return animal, tissue
