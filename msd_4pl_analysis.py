@@ -129,7 +129,7 @@ import re, sys, argparse, os, tempfile, json, subprocess, platform, functools, m
 import threading, urllib.request
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 
-__version__ = "1.5.0"
+__version__ = "1.6.0"
 
 # ── Auto-update check ─────────────────────────────────────────────────────────
 _GITHUB_REPO  = "aomer92/msd-4pl-analysis"
@@ -1262,6 +1262,12 @@ def parse_total_protein_csv(filepath):
     return tp_map, animal_tissue_map, animal_group_map
 
 
+def _natural_well_key(well):
+    """Sort key for well IDs in natural order: A1, A2, ..., A12, B1, ... (not A1, A10, A2)."""
+    m = re.search(r'\d+', well)
+    return (well[0], int(m.group()) if m else 0)
+
+
 def _extract_replicate_index(sample_name):
     """Return the 0-based replicate index from a replicate suffix, or None.
 
@@ -1519,7 +1525,10 @@ def _aggregate_unknowns(results):
     Returns two dicts, both keyed by (sample_name, group, plate, spot):
 
     unk_data  — non-QC samples:
-        wells, signals (finite), concs (finite interp), spot, group, plate,
+        wells, signals (finite), concs (finite interp), reps (one dict per well:
+        {'well','signal','conc'} — signal/conc may be non-finite, unlike the
+        filtered signals/concs lists, so reps is the source for well-paired
+        per-replicate display), spot, group, plate,
         lloq_sig, uloq_conc, lloq_conc, params
 
     qc_data   — QC samples (identified by _identify_qc_level):
@@ -1529,7 +1538,7 @@ def _aggregate_unknowns(results):
     The key includes spot so that multiplex plates keep analytes separate.
     """
     unk_data = defaultdict(lambda: {
-        'wells': [], 'signals': [], 'concs': [],
+        'wells': [], 'signals': [], 'concs': [], 'reps': [],
         'spot': None, 'group': '', 'plate': None,
         'lloq_sig': None, 'uloq_conc': None, 'lloq_conc': None, 'params': None,
     })
@@ -1572,6 +1581,9 @@ def _aggregate_unknowns(results):
                 if d['params']    is None: d['params']    = params
 
             d['wells'].append(unk['well'])
+            if not _identify_qc_level(sname):
+                d['reps'].append({'well': unk['well'], 'signal': unk['signal'],
+                                  'conc': unk['interp_conc']})
             if np.isfinite(unk['signal']):
                 d['signals'].append(unk['signal'])
             if np.isfinite(unk['interp_conc']):
@@ -1896,20 +1908,21 @@ def _create_output_inner(wb, tmp_dir, results, output_path, msd_path, raw_plate_
             _style_row(ws, row, 5, fill=STD_FILL)
             row += 1
 
-        # Individual standard points data (kept in columns G-I for reference)
+        # Individual standard points data (kept in columns H-J for reference;
+        # column G is left as a narrow spacer before this side table)
         ind_start = row + 1
-        ws.cell(row=ind_start, column=7, value="Conc").font = BOLD_FONT
-        ws.cell(row=ind_start, column=8, value="Signal").font = BOLD_FONT
-        ws.cell(row=ind_start, column=9, value="Fitted").font = BOLD_FONT
+        ws.cell(row=ind_start, column=8, value="Conc").font = BOLD_FONT
+        ws.cell(row=ind_start, column=9, value="Signal").font = BOLD_FONT
+        ws.cell(row=ind_start, column=10, value="Fitted").font = BOLD_FONT
         irow = ind_start + 1
         for s in sorted(res.get('standards', []), key=lambda x: x['conc']):
             if s['conc'] > 0 and s['signal'] > 0:
-                ws.cell(row=irow, column=7, value=s['conc'])
-                ws.cell(row=irow, column=8, value=s['signal'])
+                ws.cell(row=irow, column=8, value=s['conc'])
+                ws.cell(row=irow, column=9, value=s['signal'])
                 if res['params'] is not None:
                     fitted_val = four_pl(s['conc'], *res['params'])
                     if np.isfinite(fitted_val) and fitted_val > 0:
-                        ws.cell(row=irow, column=9, value=round(float(fitted_val), 1))
+                        ws.cell(row=irow, column=10, value=round(float(fitted_val), 1))
                 irow += 1
 
         # Blanks
@@ -1931,7 +1944,7 @@ def _create_output_inner(wb, tmp_dir, results, output_path, msd_path, raw_plate_
         row += 2
         _section_title(ws, row, "Interpolated Unknowns")
         row += 1
-        _header_row(ws, row, ["Well", "Sample Name", "Signal", interp_header, "Flag"])
+        _header_row(ws, row, ["Well", "Sample Name", "Replicate", "Signal", interp_header, "Flag"])
         row += 1
 
         std_concs = [s['conc'] for s in res.get('standards', []) if s['conc'] > 0]
@@ -1941,33 +1954,51 @@ def _create_output_inner(wb, tmp_dir, results, output_path, msd_path, raw_plate_
         # Use pre-computed LLOQ signal for this spot
         lloq_sig = res.get('lloq_sig')
 
+        # Technical-replicate numbering: wells sharing the exact same Sample Name
+        # string (within this plate/spot/group) are the technical replicates that
+        # _aggregate_unknowns later averages into one All Unknowns row. Any
+        # replicate suffix already embedded in the sample name (e.g. _P1/-1) is
+        # a biological-replicate marker and is treated as part of the sample
+        # identity here, not as the technical-replicate index. Numbered 1, 2, 3…
+        # in natural well order (A1, A2, ..., B1, ...) so numbering is
+        # deterministic regardless of raw-file parse order.
+        _unk_by_sample = defaultdict(list)
+        for unk in res.get('unknowns', []):
+            _unk_by_sample[unk.get('sample_name', '')].append(unk['well'])
+        _replicate_num = {}   # (sample_name, well) -> replicate number
+        for _sname, _wells in _unk_by_sample.items():
+            for _i, _w in enumerate(sorted(_wells, key=_natural_well_key), 1):
+                _replicate_num[(_sname, _w)] = _i
+
         for unk in res.get('unknowns', []):
             ws.cell(row=row, column=1, value=_safe_str(unk['well']))
             ws.cell(row=row, column=2, value=_safe_str(unk.get('sample_name', '')))
-            ws.cell(row=row, column=3, value=_xv(unk['signal']))
-            ws.cell(row=row, column=3).number_format = '#,##0'
+            ws.cell(row=row, column=3, value=_replicate_num.get(
+                (unk.get('sample_name', ''), unk['well']), 1))
+            ws.cell(row=row, column=4, value=_xv(unk['signal']))
+            ws.cell(row=row, column=4).number_format = '#,##0'
             c_val = unk['interp_conc']
             if c_val is not None and np.isfinite(c_val):
-                ws.cell(row=row, column=4, value=round(float(c_val), 4))
-                ws.cell(row=row, column=4).number_format = '#,##0.0000'
+                ws.cell(row=row, column=5, value=round(float(c_val), 4))
+                ws.cell(row=row, column=5).number_format = '#,##0.0000'
                 # Check signal against LLOQ signal threshold first
                 if lloq_sig is not None and unk['signal'] < lloq_sig:
-                    ws.cell(row=row, column=5, value="< LLOQ")
-                    ws.cell(row=row, column=5).font = WARN_FONT
+                    ws.cell(row=row, column=6, value="< LLOQ")
+                    ws.cell(row=row, column=6).font = WARN_FONT
                 elif uloq and c_val > uloq:
-                    ws.cell(row=row, column=5, value="> ULOQ")
-                    ws.cell(row=row, column=5).font = WARN_FONT
+                    ws.cell(row=row, column=6, value="> ULOQ")
+                    ws.cell(row=row, column=6).font = WARN_FONT
                 elif lloq and c_val < lloq:
-                    ws.cell(row=row, column=5, value="< LLOQ")
-                    ws.cell(row=row, column=5).font = WARN_FONT
+                    ws.cell(row=row, column=6, value="< LLOQ")
+                    ws.cell(row=row, column=6).font = WARN_FONT
                 else:
-                    ws.cell(row=row, column=5, value="In Range")
-                    ws.cell(row=row, column=5).font = PASS_FONT
+                    ws.cell(row=row, column=6, value="In Range")
+                    ws.cell(row=row, column=6).font = PASS_FONT
             else:
-                ws.cell(row=row, column=4, value="N/A")
-                ws.cell(row=row, column=5, value="Out of Range")
-                ws.cell(row=row, column=5).font = FAIL_FONT
-            _style_row(ws, row, 5, fill=UNK_FILL)
+                ws.cell(row=row, column=5, value="N/A")
+                ws.cell(row=row, column=6, value="Out of Range")
+                ws.cell(row=row, column=6).font = FAIL_FONT
+            _style_row(ws, row, 6, fill=UNK_FILL)
             row += 1
 
         # Chart — matplotlib image (pre-generated in parallel)
@@ -1993,12 +2024,13 @@ def _create_output_inner(wb, tmp_dir, results, output_path, msd_path, raw_plate_
             row += len(block_lines)
             added_plates.add(plate)
 
-        for ci, w in enumerate([14, 18, 14, 16, 14, 2, 14, 14, 14], 1):
+        for ci, w in enumerate([14, 18, 14, 16, 14, 14, 2, 14, 14, 14], 1):
             ws.column_dimensions[get_column_letter(ci)].width = w
 
     # ── All Unknowns Combined ─────────────────────────────────────────
     ws_all = wb.create_sheet("All Unknowns")
     all_h = ["Sample Name", "Animal", "Tissue", "Study Group", "Plate", "Spot", "Group", "Wells",
+             "Replicate Signals", "Replicate " + interp_header,
              "Avg Signal", avg_interp_header,
              "%CV", "Flag", "Dilution Factor", corrected_header, "Total Protein",
              "Normalized Protein Concentration"]
@@ -2018,8 +2050,16 @@ def _create_output_inner(wb, tmp_dir, results, output_path, msd_path, raw_plate_
         avg_signal = np.mean(signals) if signals else np.nan
         avg_conc   = np.mean(concs)   if concs   else np.nan
         # Natural well sort: A1, A2, A9, A10, B1, … instead of A1, A10, A2
-        wells = ', '.join(sorted(grp_data['wells'],
-                                 key=lambda w: (w[0], int(re.search(r'\d+', w).group()))))
+        wells = ', '.join(sorted(grp_data['wells'], key=_natural_well_key))
+        # Per-replicate signal / interp. conc., same natural well order as `wells`
+        # above, so position i in each list corresponds to well i in Wells —
+        # this is what avg_signal/avg_conc/%CV below were computed from.
+        _reps_sorted = sorted(grp_data['reps'], key=lambda r: _natural_well_key(r['well']))
+        rep_signals_str = ', '.join(
+            f"{r['signal']:,.1f}" if np.isfinite(r['signal']) else 'N/A' for r in _reps_sorted)
+        rep_concs_str = ', '.join(
+            f"{r['conc']:.4f}" if (r['conc'] is not None and np.isfinite(r['conc'])) else 'N/A'
+            for r in _reps_sorted)
         uloq_conc    = grp_data['uloq_conc']
         lloq_conc    = grp_data['lloq_conc']
         all_lloq_sig = grp_data['lloq_sig']
@@ -2065,38 +2105,40 @@ def _create_output_inner(wb, tmp_dir, results, output_path, msd_path, raw_plate_
         ws_all.cell(row=arow, column=6,  value=_safe_str(str(spot_key)))
         ws_all.cell(row=arow, column=7,  value=_safe_str(curve_group) if curve_group else None)
         ws_all.cell(row=arow, column=8,  value=_safe_str(wells))
-        ws_all.cell(row=arow, column=9,  value=round(float(avg_signal), 1) if np.isfinite(avg_signal) else "N/A")
-        ws_all.cell(row=arow, column=9).number_format = '#,##0'
-        ws_all.cell(row=arow, column=10, value=round(float(avg_conc), 4) if np.isfinite(avg_conc) else "N/A")
-        ws_all.cell(row=arow, column=10).number_format = '#,##0.0000'
-        # %CV (col 11)
-        cv_cell = ws_all.cell(row=arow, column=11)
+        ws_all.cell(row=arow, column=9,  value=_safe_str(rep_signals_str))
+        ws_all.cell(row=arow, column=10, value=_safe_str(rep_concs_str))
+        ws_all.cell(row=arow, column=11, value=round(float(avg_signal), 1) if np.isfinite(avg_signal) else "N/A")
+        ws_all.cell(row=arow, column=11).number_format = '#,##0'
+        ws_all.cell(row=arow, column=12, value=round(float(avg_conc), 4) if np.isfinite(avg_conc) else "N/A")
+        ws_all.cell(row=arow, column=12).number_format = '#,##0.0000'
+        # %CV (col 13)
+        cv_cell = ws_all.cell(row=arow, column=13)
         cv_cell.value = round(float(cv), 1) if np.isfinite(cv) else "N/A"
         cv_cell.number_format = '0.0'
         if np.isfinite(cv) and cv_threshold is not None:
             cv_cell.fill = CV_BAD_FILL if cv > cv_threshold else CV_GOOD_FILL
-        # Flag (col 12)
-        ws_all.cell(row=arow, column=12, value=flag)
-        cell_flag = ws_all.cell(row=arow, column=12)
+        # Flag (col 14)
+        ws_all.cell(row=arow, column=14, value=flag)
+        cell_flag = ws_all.cell(row=arow, column=14)
         cell_flag.font = PASS_FONT if flag == "In Range" else (WARN_FONT if flag in ["> ULOQ", "< LLOQ"] else FAIL_FONT)
-        # Dilution Factor (col 13)
-        df_cell = ws_all.cell(row=arow, column=13)
+        # Dilution Factor (col 15)
+        df_cell = ws_all.cell(row=arow, column=15)
         has_factor = is_qc_factor or (plate in plate_dilution_factors)
         df_cell.value = _xv(factor) if has_factor else None
         if has_factor:
             df_cell.number_format = '0.###'
-        # Corrected Avg Interp. Conc. (col 14)
-        corrected_cell = ws_all.cell(row=arow, column=14)
+        # Corrected Avg Interp. Conc. (col 16)
+        corrected_cell = ws_all.cell(row=arow, column=16)
         corrected_cell.value = round(float(corrected_conc), 4) if np.isfinite(corrected_conc) else "N/A"
         corrected_cell.number_format = '#,##0.0000'
-        # Total Protein (col 15)
+        # Total Protein (col 17)
         # tp_map structure: {(animal, tissue): {sample_num_int: float}}
         # tissue may be enriched from the TP CSV's Tissue Type column (see above).
         # _P1/_R1 / -1/-2 suffix → direct sample_num lookup.
         # No suffix + tissue present → sequential counter (one TP value per replicate row).
         # tissue still None after enrichment → animal-only fallback lookup.
         tp_val = None
-        tp_cell = ws_all.cell(row=arow, column=15)
+        tp_cell = ws_all.cell(row=arow, column=17)
         if total_protein_map and animal:
             tp_key = (animal, tissue)
             tp_dict = total_protein_map.get(tp_key)
@@ -2124,8 +2166,8 @@ def _create_output_inner(wb, tmp_dir, results, output_path, msd_path, raw_plate_
             if tp_val is not None:
                 tp_cell.value = _xv(tp_val)
                 tp_cell.number_format = '0.0000'
-        # Normalized Protein Concentration (col 16)
-        norm_cell = ws_all.cell(row=arow, column=16)
+        # Normalized Protein Concentration (col 18)
+        norm_cell = ws_all.cell(row=arow, column=18)
         if tp_val is not None and np.isfinite(corrected_conc) and float(tp_val) != 0:
             norm_cell.value = round(float(corrected_conc) / float(tp_val), 6)
             norm_cell.number_format = '0.000000'
