@@ -129,7 +129,7 @@ import re, sys, argparse, os, tempfile, json, subprocess, platform, functools, m
 import threading, urllib.request
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 
-__version__ = "1.6.1"
+__version__ = "1.6.2"
 
 # ── Auto-update check ─────────────────────────────────────────────────────────
 _GITHUB_REPO  = "aomer92/msd-4pl-analysis"
@@ -453,11 +453,24 @@ QC_LEVELS = ["ULOQ", "HQC", "MQC", "LQC", "LLOQ"]
 
 @functools.lru_cache(maxsize=None)
 def _identify_qc_level(sample_name):
-    """Return which QC level (ULOQ/HQC/MQC/LQC/LLOQ) this sample represents, or None."""
+    """Return which QC level this sample represents, or None.
+
+    Checks the canonical levels (ULOQ/HQC/MQC/LQC/LLOQ) first. If none match
+    but the name still contains "QC" anywhere (e.g. '1XQC-1', '2XQC-2' —
+    custom per-study QC pool naming), the '-'/'_'-delimited token containing
+    "QC" is used as the level identifier, with any trailing pool/replicate
+    suffix (the '-1'/'-2' after the token) stripped away — so '1XQC-1' and
+    '1XQC-2' both resolve to level '1XQC', letting one dilution factor apply
+    to every pool/replicate sharing that QC concentration.
+    """
     upper = sample_name.upper()
     for level in QC_LEVELS:
         if level in upper:
             return level
+    if 'QC' in upper:
+        for tok in re.split(r'[-_]', sample_name):
+            if 'QC' in tok.upper():
+                return tok.upper()
     return None
 
 
