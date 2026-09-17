@@ -129,7 +129,7 @@ import re, sys, argparse, os, tempfile, json, subprocess, platform, functools, m
 import threading, urllib.request
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 
-__version__ = "1.6.2"
+__version__ = "1.6.3"
 
 # ── Auto-update check ─────────────────────────────────────────────────────────
 _GITHUB_REPO  = "aomer92/msd-4pl-analysis"
@@ -1303,6 +1303,10 @@ def _extract_replicate_index(sample_name):
     m = re.search(r'(?<![0-9])-([0-9]{1,2})$', s)
     if m:
         return int(m.group(1)) - 1
+    # Underscore-delimited trailing replicate, e.g. ATLAS189_fCTX_1001_1 → 0
+    m = re.search(r'_([0-9]{1,2})$', s)
+    if m:
+        return int(m.group(1)) - 1
     return None
 
 
@@ -1318,6 +1322,7 @@ def _extract_animal_tissue(sample_name):
         185-008-1001-SC-L-1          → ('1001', 'SC-L')
         1001-C5-L                    → ('1001', 'C5-L')      spinal level + side
         7502A-T6-R                   → ('7502A', 'T6-R')
+        ATLAS189_fCTX_1001_1         → ('ATLAS189-1001', 'fCTX')  study_tissue_animal_rep
 
     Strategy:
       1. Strip trailing replicate suffix (_P1/_R1 or -1/-2 after a non-digit).
@@ -1389,6 +1394,19 @@ def _extract_animal_tissue(sample_name):
     # Only attempt when there are multiple underscore-separated parts, so that a plain
     # animal ID like 'Rn2541' (already handled above) isn't re-tried unnecessarily.
     us_segments = s.split('_')
+
+    # Special case: "{study}_{tissue}_{animal}_{rep}", e.g. ATLAS189_fCTX_1001_1
+    # — tissue precedes animal (reversed from every other supported underscore
+    # convention), with a trailing 1-2 digit replicate. The general rule below
+    # assumes the animal immediately precedes the tissue, so on this ordering
+    # it would take the study prefix as the animal instead. Animal numbers are
+    # not globally unique across studies (the same "1001" can exist in two
+    # different studies sharing one plate map), so the study prefix is kept
+    # as part of the returned animal id ("ATLAS189-1001") rather than discarded.
+    if (len(us_segments) == 4 and re.match(r'^[0-9]{1,2}$', us_segments[3])
+            and re.match(r'^[A-Za-z]+$', us_segments[1]) and _id_pat.match(us_segments[2])):
+        return f"{us_segments[0]}-{us_segments[2]}", us_segments[1]
+
     if len(us_segments) > 1:
         animal, tissue = _try_parse(us_segments, tissue_joiner='_')
         if animal is not None:
