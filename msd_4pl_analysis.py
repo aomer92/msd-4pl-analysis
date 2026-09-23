@@ -129,7 +129,7 @@ import re, sys, argparse, os, tempfile, json, subprocess, platform, functools, m
 import threading, urllib.request
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 
-__version__ = "1.6.3"
+__version__ = "1.6.4"
 
 # ── Auto-update check ─────────────────────────────────────────────────────────
 _GITHUB_REPO  = "aomer92/msd-4pl-analysis"
@@ -1323,6 +1323,8 @@ def _extract_animal_tissue(sample_name):
         1001-C5-L                    → ('1001', 'C5-L')      spinal level + side
         7502A-T6-R                   → ('7502A', 'T6-R')
         ATLAS189_fCTX_1001_1         → ('ATLAS189-1001', 'fCTX')  study_tissue_animal_rep
+        197-1001_fCTX_r1             → ('197-1001', 'fCTX')  study-animal_tissue_r{rep}
+        197-7502A_fCTX_r1            → ('197-7502A', 'fCTX')
 
     Strategy:
       1. Strip trailing replicate suffix (_P1/_R1 or -1/-2 after a non-digit).
@@ -1342,6 +1344,19 @@ def _extract_animal_tissue(sample_name):
 
     # ID-like: purely numeric (1001, 185) OR optional leading letters + digits (M001, F1234, Rn1868)
     _id_pat = re.compile(r'^[A-Za-z]*\d+$')
+
+    # Special case: "{study}-{animal}_{tissue}", e.g. 197-1001_fCTX (left after
+    # a trailing _r1/_r2 replicate suffix is stripped above, from
+    # "197-1001_fCTX_r1"). Study and animal are hyphen-joined, tissue follows
+    # an underscore — a mixed delimiter shape neither the hyphen-only nor
+    # underscore-only path below can parse (hyphen-split fuses "1001_fCTX"
+    # into one segment; underscore-split fuses "197-1001" into one segment).
+    # Animal numbers are not guaranteed unique across studies sharing one
+    # plate map, so the study prefix is kept in the returned animal id
+    # (matches the study_tissue_animal_rep precedent below).
+    _m = re.match(r'^([A-Za-z0-9]+)-([0-9]+[A-Za-z]*)_([A-Za-z]+)$', s)
+    if _m:
+        return f"{_m.group(1)}-{_m.group(2)}", _m.group(3)
 
     def _try_parse(segs, tissue_joiner='-'):
         """Apply the same animal/tissue extraction logic to a list of segments."""
