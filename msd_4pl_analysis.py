@@ -129,7 +129,7 @@ import re, sys, argparse, os, tempfile, json, subprocess, platform, functools, m
 import threading, urllib.request
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 
-__version__ = "1.9.0"
+__version__ = "1.9.1"
 
 # ── Auto-update check ─────────────────────────────────────────────────────────
 _GITHUB_REPO  = "aomer92/msd-4pl-analysis"
@@ -4361,7 +4361,7 @@ function spRenderChart() {{
       rangemode: 'tozero'
     }},
     shapes: shapes,
-    legend: {{ orientation: 'h', x: 0, y: 1.08 }},
+    showlegend: false,  // x-axis category labels already identify each bar
     paper_bgcolor: 'white',
     plot_bgcolor: 'white'
   }};
@@ -5315,7 +5315,7 @@ function spRenderCollatedChart() {{
     margin:{{l:100,r:40,t:40,b:160}},
     xaxis:{{tickangle:-40,automargin:true,categoryorder:'array',categoryarray:orderedNames}},
     yaxis:{{title:{{text:yTitle,standoff:12}},automargin:false,rangemode:'tozero'}},
-    shapes:shapes, legend:{{orientation:'h',x:0,y:1.08}},
+    shapes:shapes, showlegend:false,  // x-axis category labels already identify each bar
     paper_bgcolor:'white', plot_bgcolor:'white'
   }};
   Plotly.react('sp-collated-chart', traces, layout, {{responsive:true}});
