@@ -129,7 +129,7 @@ import re, sys, argparse, os, tempfile, json, subprocess, platform, functools, m
 import threading, urllib.request
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 
-__version__ = "1.8.0"
+__version__ = "1.8.1"
 
 # ── Auto-update check ─────────────────────────────────────────────────────────
 _GITHUB_REPO  = "aomer92/msd-4pl-analysis"
@@ -1511,7 +1511,10 @@ def _validate_group_sequence(animal_group_map):
         problems.append(f"no animals were assigned to Group 1 (lowest group found: {groups[0]})")
     missing = [g for g in range(1, groups[-1] + 1) if g not in groups]
     if missing:
-        problems.append(f"missing group number(s): {', '.join(str(m) for m in missing)}")
+        shown = ', '.join(str(m) for m in missing[:20])
+        if len(missing) > 20:
+            shown += f", … and {len(missing) - 20} more"
+        problems.append(f"missing group number(s): {shown}")
     if not problems:
         return None
     return ("Group Number sequence looks incomplete — " + "; ".join(problems) +
@@ -5465,18 +5468,20 @@ def run_analysis(msd_path, platemap_path, output_path, spots_override=None, unit
             print(f"Warning: could not load total protein CSV: {e}")
 
     # Infer Study Group Number from animal ID (e.g. 1001 -> Group 1) when enabled.
-    # Explicit Group Numbers from the total protein CSV always win; inference only
-    # fills in animals that CSV didn't cover (or supplies every animal when no
-    # CSV/no group data was provided at all).
-    if infer_group_numbers:
-        inferred_group_map = infer_animal_group_map(results)
-        if inferred_group_map:
-            merged = dict(inferred_group_map)
-            merged.update(animal_group_map or {})
-            n_new = len(merged) - len(animal_group_map or {})
-            animal_group_map = merged
-            print(f"Inferred Study Group from animal ID for {n_new} additional animal(s) "
-                  f"({len(inferred_group_map)} candidates, {len(animal_group_map)} total group assignments)")
+    # Real, explicit Group Numbers from the total protein CSV always take
+    # precedence — inference is only used when the CSV denoted NO group data
+    # at all (no CSV, or a CSV without a Group Number column/values). It is
+    # not a per-animal gap-filler for a CSV that already assigns some groups:
+    # animals the CSV leaves ungrouped are more likely intentionally excluded
+    # from grouping (e.g. QC/controls) than accidentally missing.
+    if infer_group_numbers and not animal_group_map:
+        animal_group_map = infer_animal_group_map(results)
+        if animal_group_map:
+            print(f"Inferred Study Group from animal ID for {len(animal_group_map)} animal(s) "
+                  f"(no Group Number data was provided via the total protein CSV)")
+    elif infer_group_numbers and animal_group_map:
+        print(f"Study Group inference skipped — {len(animal_group_map)} animal(s) already have "
+              f"an explicit Group Number from the total protein CSV; that data takes precedence.")
 
     # Flag (don't block on) a non-sequential/missing-Group-1 result — usually
     # means the inference formula doesn't apply to this animal ID convention.
@@ -6256,7 +6261,8 @@ def run_interactive():
     # Row 4 — Infer Study Group from Animal Number (on by default)
     ttk.Checkbutton(
         opts_lf, variable=infer_group_var,
-        text='Infer Study Group from Animal Number (e.g. 1001 → Group 1, 13502 → Group 13)'
+        text='Infer Study Group from Animal Number if none is given (e.g. 1001 → Group 1, 13502 → Group 13). '
+             'Ignored when the total protein CSV already provides Group Numbers.'
     ).grid(row=4, column=0, columnspan=6, sticky=tk.W, **_rp)
 
     # ── Group Dilution Factors ─────────────────────────────────────────
