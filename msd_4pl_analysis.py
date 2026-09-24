@@ -129,7 +129,7 @@ import re, sys, argparse, os, tempfile, json, subprocess, platform, functools, m
 import threading, urllib.request
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 
-__version__ = "1.8.1"
+__version__ = "1.9.0"
 
 # ── Auto-update check ─────────────────────────────────────────────────────────
 _GITHUB_REPO  = "aomer92/msd-4pl-analysis"
@@ -3017,8 +3017,16 @@ def generate_html_report(results, html_path, msd_path, units=None,
         animal_str   = animal or ''
         tissue_str   = tissue or ''
         group_td     = f"<td>{study_group or ''}</td>" if has_group else ''
+        # Escape for safe embedding inside a double-quoted HTML attribute
+        # (sample names come from the user's own plate map and can contain
+        # characters like " or & that would otherwise break the attribute).
+        sname_attr = (sname.replace('&', '&amp;').replace('"', '&quot;')
+                           .replace('<', '&lt;').replace('>', '&gt;'))
+        excl_td = (f'<td class="msd-excl-cell"><input type="checkbox" class="msd-excl-cb" '
+                   f'data-sample="{sname_attr}" onchange="msdToggleExcludeRow(this)" '
+                   f'title="Remove {sname_attr} from the Sample Plots charts"></td>')
         unk_rows_html.append(
-            f"<tr><td>{sname}</td><td>{animal_str}</td><td>{tissue_str}</td>"
+            f"<tr>{excl_td}<td>{sname}</td><td>{animal_str}</td><td>{tissue_str}</td>"
             f"{group_td}"
             f"<td>{plate}</td><td>{spot}</td><td>{group}</td>"
             f"<td>{', '.join(data['wells'])}</td><td>{avg_sig_str}</td>"
@@ -3158,6 +3166,7 @@ def generate_html_report(results, html_path, msd_path, units=None,
     group_header = "<th onclick=\"sortTable(this)\">Study Group</th>" if has_group else ""
     unk_hdr_row = (
         "<tr>"
+        "<th title=\"Remove this sample from the Sample Plots charts\">Exclude</th>"
         "<th onclick=\"sortTable(this)\">Sample Name</th>"
         "<th onclick=\"sortTable(this)\">Animal</th>"
         "<th onclick=\"sortTable(this)\">Tissue</th>"
@@ -3218,6 +3227,10 @@ def generate_html_report(results, html_path, msd_path, units=None,
   .status-warn {{ color: #9C5700; font-weight: 500; }}
   .status-fail {{ color: #9C0006; font-weight: 500; }}
   .cv-bad {{ background: #F8CBAD; }}
+  .msd-excl-cell {{ text-align: center; }}
+  .msd-excl-cb {{ cursor: pointer; width: 15px; height: 15px; }}
+  tr.msd-row-excluded td {{ opacity: 0.45; text-decoration: line-through; }}
+  tr.msd-row-excluded .msd-excl-cell {{ opacity: 1; text-decoration: none; }}
   .curves-grid {{ display: grid; grid-template-columns: repeat(auto-fill, minmax(520px, 1fr)); gap: 20px; }}
   .export-bar {{ display: flex; justify-content: flex-end; margin-bottom: 10px; }}
   .export-btn {{ padding: 8px 18px; background: #3a506b; color: white; border: none;
@@ -3846,14 +3859,34 @@ function spMakeChip(sname, groupId) {{
   return span;
 }}
 
-// Shared between Per Group and Collated — toggling exclusion in one view is
-// reflected in the other, and re-renders whichever tab(s) are initialized.
+// Shared between Per Group, Collated, and the All Unknowns "Exclude" checkbox
+// column — toggling exclusion from any of the three keeps all of them in
+// sync, and re-renders whichever tab(s) are initialized.
 function spToggleExclude(sname) {{
   if (spExcludedSamples.has(sname)) {{ spExcludedSamples.delete(sname); }}
   else {{ spExcludedSamples.add(sname); }}
   if (spInitialized) {{ spRenderGroupPanel(); spRenderChart(); }}
   var collToggles = document.getElementById('sp-collated-group-toggles');
   if (collToggles && collToggles.dataset.built) {{ spCollRenderGroupPanel(); spRenderCollatedChart(); }}
+  msdSyncExcludeCheckboxes();
+}}
+
+// Called when the "Exclude" checkbox on an All Unknowns row is toggled.
+function msdToggleExcludeRow(cb) {{
+  spToggleExclude(cb.dataset.sample);
+}}
+
+// Keeps every "Exclude" checkbox in the All Unknowns table (a sample name can
+// appear on more than one row, e.g. across plates) — and that row's styling —
+// in sync with spExcludedSamples, regardless of whether the change came from
+// this table or from a chip's ✕ button in Sample Plots.
+function msdSyncExcludeCheckboxes() {{
+  document.querySelectorAll('.msd-excl-cb').forEach(function(cb) {{
+    var excluded = spExcludedSamples.has(cb.dataset.sample);
+    cb.checked = excluded;
+    var row = cb.closest('tr');
+    if (row) {{ row.classList.toggle('msd-row-excluded', excluded); }}
+  }});
 }}
 
 function spDragStart(e, name, fromGroup) {{
