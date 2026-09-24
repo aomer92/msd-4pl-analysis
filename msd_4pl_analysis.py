@@ -129,7 +129,7 @@ import re, sys, argparse, os, tempfile, json, subprocess, platform, functools, m
 import threading, urllib.request
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 
-__version__ = "1.6.4"
+__version__ = "1.7.0"
 
 # ── Auto-update check ─────────────────────────────────────────────────────────
 _GITHUB_REPO  = "aomer92/msd-4pl-analysis"
@@ -3160,7 +3160,13 @@ def generate_html_report(results, html_path, msd_path, units=None,
   .sp-drop-zone.drag-over {{ background:#e8f4fd;border-color:#2F5496; }}
   .sp-chip {{ display:inline-flex;align-items:center;gap:4px;padding:3px 8px;border-radius:12px;font-size:11px;cursor:grab;user-select:none;border:1px solid rgba(0,0,0,0.15);background:white; }}
   .sp-chip.flagged {{ border-color:#c0392b;color:#c0392b; }}
+  .sp-chip.sp-chip-excluded {{ opacity:0.5;background:#f2f2f2; }}
+  .sp-chip.sp-chip-excluded span {{ text-decoration:line-through; }}
   .sp-chip input[type=checkbox] {{ cursor:pointer;margin:0; }}
+  .sp-chip-exclude-btn {{ border:none;background:transparent;cursor:pointer;font-size:11px;line-height:1;padding:0 1px;color:#888;flex-shrink:0; }}
+  .sp-chip-exclude-btn:hover {{ color:#c0392b; }}
+  .sp-chip-excluded .sp-chip-exclude-btn {{ color:#2F5496; }}
+  .sp-chip-excluded .sp-chip-exclude-btn:hover {{ color:#1b3866; }}
   .sp-group-block {{ margin-bottom:10px;border-radius:6px;overflow:hidden;border:1px solid #ddd; }}
   .sp-group-header {{ display:flex;align-items:center;gap:6px;padding:6px 10px;font-size:12px;font-weight:600;color:white; }}
   .sp-group-drop {{ min-height:36px;padding:6px;display:flex;flex-wrap:wrap;gap:4px;align-content:flex-start; }}
@@ -3511,6 +3517,11 @@ function msdToggleCurveSamples(btn, divId, traceIdx) {{
 var SP_DATA = {_sp_json};
 var spInitialized = false;
 var spCurrentAnalyte = null;
+// Sample names removed from the chart entirely (shared across Per Group and
+// Collated — a sample excluded in one view stays excluded in the other).
+// Purely a display filter: excluded samples are still listed (greyed out,
+// struck through) in the Unassigned/Group panels so they can be restored.
+var spExcludedSamples = new Set();
 var spGroups = [];          // [{{id, name, color, visible, samples:[]}}]
 var spUnassigned = [];      // [sampleName, ...]
 var spSortMode = 'group';
@@ -3693,10 +3704,11 @@ function spRenderGroupPanel() {{
 function spMakeChip(sname, groupId) {{
   var d = spGetSampleData(sname);
   var flagged = d && d.anyFlagged;
+  var excluded = spExcludedSamples.has(sname);
   var span = document.createElement('span');
-  span.className = 'sp-chip' + (flagged ? ' flagged' : '');
+  span.className = 'sp-chip' + (flagged ? ' flagged' : '') + (excluded ? ' sp-chip-excluded' : '');
   span.draggable = true;
-  span.title = sname;
+  span.title = excluded ? sname + ' (excluded from chart)' : sname;
   var label = (flagged ? '⚠ ' : '') + sname;
   if (groupId === '__unassigned__') {{
     // Add checkbox with shift+click range selection
@@ -3719,6 +3731,16 @@ function spMakeChip(sname, groupId) {{
     }};
     span.appendChild(cb);
   }}
+  var excludeBtn = document.createElement('button');
+  excludeBtn.type = 'button';
+  excludeBtn.className = 'sp-chip-exclude-btn';
+  excludeBtn.title = excluded ? 'Restore to chart' : 'Remove from chart';
+  excludeBtn.textContent = excluded ? '↺' : '✕';
+  excludeBtn.onclick = function(e) {{
+    e.stopPropagation();
+    spToggleExclude(sname);
+  }};
+  span.appendChild(excludeBtn);
   var txt = document.createElement('span');
   txt.textContent = label;
   txt.style.maxWidth = '120px';
@@ -3729,6 +3751,16 @@ function spMakeChip(sname, groupId) {{
   span.addEventListener('dragstart', function(e) {{ spDragStart(e, sname, groupId); }});
   span.addEventListener('dragend', function(e) {{ spDragEnd(e); }});
   return span;
+}}
+
+// Shared between Per Group and Collated — toggling exclusion in one view is
+// reflected in the other, and re-renders whichever tab(s) are initialized.
+function spToggleExclude(sname) {{
+  if (spExcludedSamples.has(sname)) {{ spExcludedSamples.delete(sname); }}
+  else {{ spExcludedSamples.add(sname); }}
+  if (spInitialized) {{ spRenderGroupPanel(); spRenderChart(); }}
+  var collToggles = document.getElementById('sp-collated-group-toggles');
+  if (collToggles && collToggles.dataset.built) {{ spCollRenderGroupPanel(); spRenderCollatedChart(); }}
 }}
 
 function spDragStart(e, name, fromGroup) {{
@@ -3984,6 +4016,9 @@ function spRenderChart() {{
   var filtered = (spActivePlates && spActivePlates.size > 0)
     ? allData.filter(function(d) {{ return spActivePlates.has(d.plate); }})
     : allData;
+
+  // ── Excluded-sample filtering (user-removed via the ✕ chip button) ─────────
+  filtered = filtered.filter(function(d) {{ return !spExcludedSamples.has(d.name); }});
 
   // Disambiguate display labels: add [Px] only when same sample runs on multiple
   // active plates so the x-axis clearly identifies each bar.
@@ -4874,9 +4909,10 @@ function spCollRenderGroupPanel() {{
 }}
 
 function spCollMakeChip(sname, groupId) {{
+  var excluded = spExcludedSamples.has(sname);
   var span = document.createElement('span');
-  span.className = 'sp-chip';
-  span.draggable = true; span.title = sname;
+  span.className = 'sp-chip' + (excluded ? ' sp-chip-excluded' : '');
+  span.draggable = true; span.title = excluded ? sname + ' (excluded from chart)' : sname;
   if (groupId === '__unassigned__') {{
     var cb = document.createElement('input');
     cb.type = 'checkbox'; cb.setAttribute('data-sample', sname);
@@ -4893,6 +4929,13 @@ function spCollMakeChip(sname, groupId) {{
     }};
     span.appendChild(cb);
   }}
+  var excludeBtn = document.createElement('button');
+  excludeBtn.type = 'button';
+  excludeBtn.className = 'sp-chip-exclude-btn';
+  excludeBtn.title = excluded ? 'Restore to chart' : 'Remove from chart';
+  excludeBtn.textContent = excluded ? '↺' : '✕';
+  excludeBtn.onclick = function(e) {{ e.stopPropagation(); spToggleExclude(sname); }};
+  span.appendChild(excludeBtn);
   var txt = document.createElement('span');
   txt.textContent = sname; txt.style.cssText = 'max-width:120px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;';
   span.appendChild(txt);
@@ -5005,9 +5048,12 @@ function spRenderCollatedChart() {{
   // For unassigned: individual bar per (sample, analyte) colored by analyte
 
   // Map: name → [{{entry, analyte, analyteIdx}}] for active analytes
+  // (excluded samples are filtered out here so they never enter any group's
+  // averaged bar, nor appear as an unassigned bar)
   var nameEntries = {{}};
   analytes.forEach(function(a, ai) {{
     (SP_DATA.samples[a] || []).forEach(function(d) {{
+      if (spExcludedSamples.has(d.name)) return;
       if (!nameEntries[d.name]) nameEntries[d.name] = [];
       nameEntries[d.name].push({{d: d, analyte: a, analyteIdx: ai}});
     }});
