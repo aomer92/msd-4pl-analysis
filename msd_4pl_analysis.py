@@ -129,7 +129,7 @@ import re, sys, argparse, os, tempfile, json, subprocess, platform, functools, m
 import threading, urllib.request
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 
-__version__ = "1.7.0"
+__version__ = "1.8.0"
 
 # ── Auto-update check ─────────────────────────────────────────────────────────
 _GITHUB_REPO  = "aomer92/msd-4pl-analysis"
@@ -1428,6 +1428,96 @@ def _extract_animal_tissue(sample_name):
             return animal, tissue
 
     return None, None
+
+
+def _infer_group_number(sample_name):
+    """Infer the in-vivo study Group Number from a 4-5 digit run found
+    anywhere in a sample name.
+
+    Convention observed across NHP study animal numbering (e.g. ATLAS197):
+    the animal ID is a 4-5 digit number where the group is the leading 1-2
+    digits and the trailing 3 digits identify the individual within that
+    group — e.g. 1001/1501/1502 -> group 1, 2001/2501/2502 -> group 2, ...,
+    13001/13501/13502 -> group 13. The digit run can appear anywhere in the
+    name (a study prefix like "197-" or a trailing letter/tissue suffix like
+    "7502A"/"1001_fCTX" doesn't block it) — only a run of digits immediately
+    adjacent to other digits is excluded, so a 4-5 digit match is never a
+    fragment of a longer number. When more than one 4-5 digit run appears,
+    the LAST one in the name is used (the animal ID is consistently the
+    right-most numeric component in every convention seen so far).
+
+    This can misfire on ID conventions where the group isn't encoded in the
+    number at all (e.g. 'Rn2541'-style IDs, whose real groups come from study
+    design, not from the digits) — infer_animal_group_map's caller validates
+    the resulting group set (must start at 1, no gaps) specifically to catch
+    that kind of misapplication and warn rather than silently mislabel data.
+
+    Returns the group number as a string (e.g. '1', '13'), or None if no
+    4-5 digit run is present.
+    """
+    if not sample_name:
+        return None
+    matches = re.findall(r'(?<!\d)\d{4,5}(?!\d)', sample_name)
+    if not matches:
+        return None
+    digits = matches[-1]
+    group = digits[:-3]
+    return group if group else None
+
+
+def infer_animal_group_map(results):
+    """Build {animal: group_number_str} by inferring from every unique
+    animal ID found in `results`' unknown sample names (see
+    _infer_group_number). Used as a fallback/supplement when no total-protein
+    CSV (or an incomplete one) supplies explicit Group Numbers.
+    """
+    inferred = {}
+    for res in results:
+        for u in res.get('unknowns', []):
+            sname = u.get('sample_name', '')
+            if not sname:
+                continue
+            animal, _tissue = _extract_animal_tissue(sname)
+            if not animal or animal in inferred:
+                continue
+            grp = _infer_group_number(sname)
+            if grp:
+                inferred[animal] = grp
+    return inferred
+
+
+def _validate_group_sequence(animal_group_map):
+    """Sanity-check that a Group Number assignment (inferred or from CSV) is
+    sequential starting at 1 — i.e. groups {1, 2, ..., N} with no gaps.
+
+    Real study designs always start dosing groups at 1 and number them
+    consecutively, so a missing Group 1 or a gap in the sequence is a strong
+    signal the inference (or the source CSV) doesn't actually match this
+    dataset's convention. Returns a human-readable warning string, or None
+    if the sequence looks correct (or there's nothing numeric to check).
+    """
+    if not animal_group_map:
+        return None
+    groups = set()
+    for g in animal_group_map.values():
+        s = str(g).strip()
+        if s.isdigit():
+            groups.add(int(s))
+    if not groups:
+        return None
+    groups = sorted(groups)
+    problems = []
+    if groups[0] != 1:
+        problems.append(f"no animals were assigned to Group 1 (lowest group found: {groups[0]})")
+    missing = [g for g in range(1, groups[-1] + 1) if g not in groups]
+    if missing:
+        problems.append(f"missing group number(s): {', '.join(str(m) for m in missing)}")
+    if not problems:
+        return None
+    return ("Group Number sequence looks incomplete — " + "; ".join(problems) +
+            f". Groups found: {groups}. If this is unexpected, double-check the "
+            f"'Infer Study Group from Animal Number' option and/or the total "
+            f"protein CSV's Group Number column.")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -5204,7 +5294,7 @@ function spRenderCollatedChart() {{
     print(f"Saved HTML report: {html_path}")
 
 
-def run_analysis(msd_path, platemap_path, output_path, spots_override=None, units=None, cv_threshold=25, dilution_factors=None, lloq_method='current', total_protein_path=None, qc_dilution_factors=None, qc_expected_concentrations=None, group_dilution_factors=None):
+def run_analysis(msd_path, platemap_path, output_path, spots_override=None, units=None, cv_threshold=25, dilution_factors=None, lloq_method='current', total_protein_path=None, qc_dilution_factors=None, qc_expected_concentrations=None, group_dilution_factors=None, infer_group_numbers=True):
     _ensure_deps()   # lazy-load numpy / scipy / matplotlib / openpyxl
     print("=" * 60)
     print("MSD 4PL ANALYSIS")
@@ -5374,6 +5464,26 @@ def run_analysis(msd_path, platemap_path, output_path, spots_override=None, unit
         except Exception as e:
             print(f"Warning: could not load total protein CSV: {e}")
 
+    # Infer Study Group Number from animal ID (e.g. 1001 -> Group 1) when enabled.
+    # Explicit Group Numbers from the total protein CSV always win; inference only
+    # fills in animals that CSV didn't cover (or supplies every animal when no
+    # CSV/no group data was provided at all).
+    if infer_group_numbers:
+        inferred_group_map = infer_animal_group_map(results)
+        if inferred_group_map:
+            merged = dict(inferred_group_map)
+            merged.update(animal_group_map or {})
+            n_new = len(merged) - len(animal_group_map or {})
+            animal_group_map = merged
+            print(f"Inferred Study Group from animal ID for {n_new} additional animal(s) "
+                  f"({len(inferred_group_map)} candidates, {len(animal_group_map)} total group assignments)")
+
+    # Flag (don't block on) a non-sequential/missing-Group-1 result — usually
+    # means the inference formula doesn't apply to this animal ID convention.
+    group_sequence_warning = _validate_group_sequence(animal_group_map)
+    if group_sequence_warning:
+        print(f"\n⚠ WARNING: {group_sequence_warning}")
+
     print(f"\n{'=' * 60}")
     print(f"Generating Excel: {output_path}")
     create_output(results, output_path, msd_path, raw_plate_blocks, units, cv_threshold, plate_dilution_factors, lloq_method, total_protein_map, qc_dilution_factors, qc_expected_concentrations, group_dilution_factors=group_dilution_factors, animal_tissue_map=animal_tissue_map, animal_group_map=animal_group_map)
@@ -5414,9 +5524,11 @@ def run_analysis(msd_path, platemap_path, output_path, spots_override=None, unit
         'qc_dilution_factors': qc_dilution_factors,
         'qc_expected_concentrations': qc_expected_concentrations,
         'group_dilution_factors': group_dilution_factors,
+        'infer_group_numbers': infer_group_numbers,
         'status': 'pass',
     }
     _save_run_to_history(last_args)
+    return group_sequence_warning
 
 
 def run_interactive():
@@ -5447,6 +5559,8 @@ def run_interactive():
             ','.join(str(x) for x in entry['dilution_factors'])
             if entry.get('dilution_factors') else '')
         total_protein_var.set(entry.get('total_protein') or '')
+        # Default True for entries saved before this option existed
+        infer_group_var.set(entry.get('infer_group_numbers', True))
         # Restore group dilution factors and per-group QC values if any were saved
         saved_grp = entry.get('group_dilution_factors') or {}
         saved_qc = entry.get('qc_dilution_factors') or {}
@@ -5671,6 +5785,7 @@ def run_interactive():
         lloq_method = lloq_method_var.get()
         dilution_factors = dilution_factors_var.get().strip()
         total_protein_path = total_protein_var.get().strip()
+        infer_group_numbers = infer_group_var.get()
 
         if not msd_path or not platemap_path or not output_path:
             messagebox.showerror("Error", "Please select MSD file, plate map, and output location.")
@@ -5737,14 +5852,16 @@ def run_interactive():
         print(f"LLOQ method: {lloq_method}")
 
         # Thread result container
-        _result = {'error': None, 'done': False}
+        _result = {'error': None, 'done': False, 'group_warning': None}
 
         def _worker():
             try:
-                run_analysis(msd_path, platemap_path, output_path, spots_override,
+                _result['group_warning'] = run_analysis(
+                             msd_path, platemap_path, output_path, spots_override,
                              units, cv_threshold, dilution_factors, lloq_method,
                              total_protein_path, qc_dilution_factors, qc_expected_concentrations,
-                             group_dilution_factors=group_dilution_factors)
+                             group_dilution_factors=group_dilution_factors,
+                             infer_group_numbers=infer_group_numbers)
             except Exception as exc:
                 _result['error'] = exc
                 print(f"\nAnalysis error: {exc}")
@@ -5772,6 +5889,7 @@ def run_interactive():
                     'qc_dilution_factors': qc_dilution_factors,
                     'qc_expected_concentrations': qc_expected_concentrations,
                     'group_dilution_factors': group_dilution_factors,
+                    'infer_group_numbers': infer_group_numbers,
                     'status': 'fail', 'error': err_msg,
                 }
                 _save_run_to_history(fail_entry)
@@ -5779,6 +5897,9 @@ def run_interactive():
                 root.deiconify()
                 refresh_history()
             else:
+                if _result.get('group_warning'):
+                    root.deiconify()
+                    messagebox.showwarning("Group Number Check", _result['group_warning'], parent=root)
                 root.destroy()
 
         root.withdraw()
@@ -5801,6 +5922,7 @@ def run_interactive():
     lloq_method_var = tk.StringVar(value="current")
     dilution_factors_var = tk.StringVar()
     total_protein_var = tk.StringVar()
+    infer_group_var = tk.BooleanVar(value=True)
     group_df_vars = {}   # {group: StringVar} — populated by _detect_groups
     grp_qc_vars = {}     # {group: {level: StringVar}} — populated by _detect_groups
     grp_exp_vars = {}    # {group: StringVar} — populated by _detect_groups
@@ -6131,6 +6253,12 @@ def run_interactive():
                    [('CSV Files', '*.csv'), ('All Files', '*.*')])).grid(
         row=3, column=5, padx=(6, 0), **_rp)
 
+    # Row 4 — Infer Study Group from Animal Number (on by default)
+    ttk.Checkbutton(
+        opts_lf, variable=infer_group_var,
+        text='Infer Study Group from Animal Number (e.g. 1001 → Group 1, 13502 → Group 13)'
+    ).grid(row=4, column=0, columnspan=6, sticky=tk.W, **_rp)
+
     # ── Group Dilution Factors ─────────────────────────────────────────
     grp_lf = ttk.LabelFrame(outer, text='Group Dilution Factors  (optional — applied per group detected in plate map)',
                              padding='10 6')
@@ -6316,6 +6444,9 @@ if __name__ == '__main__':
                         help='Optional per-plate dilution factors as comma-separated values (e.g. 1,2,1)')
     parser.add_argument('--total-protein', default=None,
                         help='Optional total protein CSV for normalisation (External Animal Number + Tissue Type)')
+    parser.add_argument('--no-infer-group-numbers', dest='infer_group_numbers', action='store_false', default=True,
+                        help='Disable inferring Study Group Number from animal ID digits (enabled by default; '
+                             'see the GUI option of the same name for the rule)')
     parser.add_argument('--gui', action='store_true', help='Launch interactive file picker dialogs')
     parser.add_argument('--rerun', action='store_true', help='Rerun the last analysis with saved parameters')
     args = parser.parse_args()
@@ -6335,6 +6466,7 @@ if __name__ == '__main__':
         args.lloq_method = last_args.get('lloq_method', 'current')
         args.dilution_factors = last_args.get('dilution_factors')
         args.total_protein = last_args.get('total_protein')
+        args.infer_group_numbers = last_args.get('infer_group_numbers', True)
         args.gui = False
         print(f"Rerunning: {_run_label(last_args)}")
         print(f"  MSD: {args.msd}")
@@ -6345,7 +6477,7 @@ if __name__ == '__main__':
     if args.gui or (not args.msd and not args.platemap and not args.rerun):
         run_interactive()
     elif args.msd and args.platemap:
-        run_analysis(args.msd, args.platemap, args.output, args.spots, args.units, args.cv_threshold, args.dilution_factors, args.lloq_method, args.total_protein)
+        run_analysis(args.msd, args.platemap, args.output, args.spots, args.units, args.cv_threshold, args.dilution_factors, args.lloq_method, args.total_protein, infer_group_numbers=args.infer_group_numbers)
     else:
         print("Error: provide both --msd and --platemap, or use --gui for interactive mode.")
         parser.print_help()
