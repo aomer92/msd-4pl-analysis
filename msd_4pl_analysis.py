@@ -130,7 +130,7 @@ import copy
 import threading, urllib.request
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 
-__version__ = "1.15.1"
+__version__ = "1.16.0"
 
 # ── Auto-update check ─────────────────────────────────────────────────────────
 _GITHUB_REPO  = "aomer92/msd-4pl-analysis"
@@ -391,6 +391,28 @@ from collections import defaultdict
 _deps_lock  = threading.Lock()
 _deps_ready = threading.Event()
 
+def _use_stable_mpl_cache():
+    """Point matplotlib at a persistent cache directory before it is imported.
+
+    PyInstaller's runtime hook sets MPLCONFIGDIR to a throwaway temp directory,
+    so the frozen app rebuilds matplotlib's font cache from scratch on every
+    launch — and, because the chart pool spawns fresh interpreters, once per
+    worker as well. On a 12-plate run that was nine rebuilds and the dominant
+    cost of the whole analysis. Re-pointing it at a stable per-user directory
+    makes the cache survive both the worker spawn and the next launch.
+
+    Must run before `import matplotlib`; matplotlib reads this at import time.
+    """
+    try:
+        base = os.path.join(os.path.expanduser('~'), '.msd_4pl_analysis', 'mpl-cache')
+        os.makedirs(base, exist_ok=True)
+        if not os.access(base, os.W_OK):
+            return
+        os.environ['MPLCONFIGDIR'] = base
+    except OSError:
+        pass   # read-only home, locked-down profile — fall back to the default
+
+
 def _ensure_deps():
     """Lazy-load all heavy analysis dependencies the first time an analysis runs.
     Keeps GUI startup near-instant (only stdlib loads at launch).
@@ -404,6 +426,7 @@ def _ensure_deps():
         if _deps_ready.is_set():   # another thread finished while we waited
             return
     g = globals()
+    _use_stable_mpl_cache()
     try:
         import numpy as np;          g['np'] = np
         import pandas as pd;         g['pd'] = pd
@@ -1827,6 +1850,7 @@ def _physical_cpu_count():
 def _worker_init():
     """Pre-warm matplotlib in each worker process so the first task doesn't pay
     the full import + font-cache cost.  Must be module-level to be picklable."""
+    _use_stable_mpl_cache()   # before matplotlib imports in this fresh interpreter
     import matplotlib as _mpl
     _mpl.use('Agg')
     import matplotlib.pyplot      # loads font manager and mathtext
