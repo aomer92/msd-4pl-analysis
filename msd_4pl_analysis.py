@@ -126,10 +126,11 @@ The Excel workbook contains:
 """
 
 import re, sys, argparse, os, tempfile, json, subprocess, platform, functools, multiprocessing, shutil
+import copy
 import threading, urllib.request
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 
-__version__ = "1.11.0"
+__version__ = "1.12.0"
 
 # ── Auto-update check ─────────────────────────────────────────────────────────
 _GITHUB_REPO  = "aomer92/msd-4pl-analysis"
@@ -409,8 +410,9 @@ def _ensure_deps():
         from scipy.optimize import curve_fit; g['curve_fit'] = curve_fit
         from openpyxl import Workbook; g['Workbook'] = Workbook
         from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+        from openpyxl.styles.cell_style import StyleArray
         g.update(Font=Font, PatternFill=PatternFill, Alignment=Alignment,
-                 Border=Border, Side=Side)
+                 Border=Border, Side=Side, StyleArray=StyleArray)
         from openpyxl.drawing.image import Image as XlImage; g['XlImage'] = XlImage
         from openpyxl.utils import get_column_letter; g['get_column_letter'] = get_column_letter
         import matplotlib; matplotlib.use('Agg'); g['matplotlib'] = matplotlib
@@ -428,6 +430,7 @@ def _ensure_deps():
     g['HEADER_FILL'] = PatternFill('solid', fgColor='2F5496')
     g['HEADER_FONT'] = Font(bold=True, color='FFFFFF', name='Arial', size=10)
     g['DATA_FONT']   = Font(name='Arial', size=10)
+    g['CENTER_ALIGN']= Alignment(horizontal='center')
     g['BOLD_FONT']   = Font(bold=True, name='Arial', size=10)
     g['SECTION_FONT']= Font(bold=True, name='Arial', size=12, color='2F5496')
     g['THIN_BORDER'] = Border(
@@ -1591,16 +1594,53 @@ def _xv(val, fallback="N/A"):
         return fallback
 
 
+def _row_style_array(ws, fill, font):
+    """Resolve (font, THIN_BORDER, centred alignment, fill) into a single
+    StyleArray, cached per workbook.
+
+    Assigning cell.font / .fill / .border / .alignment one cell at a time makes
+    openpyxl re-hash each style object into the workbook's indexed style tables
+    for every cell — on a 12-plate run that was ~84k Alignment objects and the
+    single largest cost in Excel writing. Resolving the ids once and cloning the
+    resulting StyleArray is ~21x faster for the same output.
+
+    The cache lives on the workbook because style ids are workbook-scoped: a
+    module-level cache would hand stale ids to the next analysis in a GUI session.
+    """
+    cache = getattr(ws.parent, '_msd_style_cache', None)
+    if cache is None:
+        cache = ws.parent._msd_style_cache = {}
+    key = (id(font), id(fill))
+    sa = cache.get(key)
+    if sa is None:
+        wb = ws.parent
+        sa = StyleArray()
+        sa.fontId      = wb._fonts.add(font)
+        sa.borderId    = wb._borders.add(THIN_BORDER)
+        sa.alignmentId = wb._alignments.add(CENTER_ALIGN)
+        if fill:
+            sa.fillId  = wb._fills.add(fill)
+        cache[key] = sa
+    return sa
+
+
 def _style_row(ws, row, max_col, fill=None, font=None):
     if font is None:
         font = DATA_FONT
+    sa = _row_style_array(ws, fill, font)
     for c in range(1, max_col + 1):
         cell = ws.cell(row=row, column=c)
-        cell.font = font
-        cell.border = THIN_BORDER
-        cell.alignment = Alignment(horizontal='center')
-        if fill:
-            cell.fill = fill
+        # Callers set number_format — and, when no row fill is given, per-cell
+        # fills such as the %CV pass/fail colour — *before* calling _style_row,
+        # so carry both over rather than flattening them with the row style.
+        prev = cell._style
+        num_fmt_id = prev.numFmtId if prev is not None else 0
+        prev_fill_id = prev.fillId if prev is not None else 0
+        cell._style = copy.copy(sa)
+        if num_fmt_id:
+            cell._style.numFmtId = num_fmt_id
+        if fill is None and prev_fill_id:
+            cell._style.fillId = prev_fill_id
 
 def _header_row(ws, row, headers):
     for ci, h in enumerate(headers, 1):
@@ -1662,16 +1702,76 @@ def _worker_init():
     warnings.filterwarnings('ignore')
 
 
+# Below this many charts the ProcessPoolExecutor costs more to start and tear
+# down (~0.6 s measured, independent of worker count) than it saves: a single
+# standard-curve chart renders in ~0.28 s. Single- and double-plate runs are the
+# common case, so they take the sequential path.
+_CHART_POOL_MIN_TASKS = 4
+
+
 def _chart_worker(args):
-    """Module-level wrapper so ProcessPoolExecutor can pickle the call."""
+    """Module-level wrapper so ProcessPoolExecutor can pickle the call.
+
+    Handles both chart kinds so the overlay — the single most expensive figure —
+    renders alongside the per-spot charts instead of serially before them.
+    """
     # Subprocess workers get a fresh Python process — globals() is empty.
     # _ensure_deps() injects numpy / matplotlib / etc. so chart functions
     # can reference plt, np, etc. as module-level names.
     _ensure_deps()
-    res, tmp_dir, lloq_method, units = args
+    kind = args[0]
+    if kind == 'overlay':
+        _, results, tmp_dir, qc_pts, qc_exp, units = args
+        return 'overlay', generate_overlay_chart(results, tmp_dir, qc_pts, qc_exp,
+                                                 units=units)
+    _, res, tmp_dir, lloq_method, units = args
     path = generate_std_curve_chart(res, tmp_dir, lloq_method, units=units)
     # Return a stable key (not id(res) — memory addresses differ across processes)
     return (res['plate'], res['spot'], res.get('group', '')), path
+
+
+def _render_all_charts(results, tmp_dir, lloq_method, units,
+                       qc_overlay_points, qc_expected_concentrations):
+    """Render the overlay chart and every per-spot standard-curve chart.
+
+    Returns (overlay_path, chart_map). Uses a process pool when there is enough
+    work to amortise its start-up cost, and falls back to sequential rendering if
+    the pool cannot be created at all (e.g. frozen-app edge cases).
+    """
+    tasks = [('overlay', results, tmp_dir,
+              qc_overlay_points or None, qc_expected_concentrations or None, units)]
+    tasks += [('spot', res, tmp_dir, lloq_method, units) for res in results]
+
+    def _sequential():
+        overlay = generate_overlay_chart(
+            results, tmp_dir, qc_overlay_points or None,
+            qc_expected_concentrations or None, units=units)
+        return overlay, {(r['plate'], r['spot'], r.get('group', '')):
+                         generate_std_curve_chart(r, tmp_dir, lloq_method, units=units)
+                         for r in results}
+
+    if len(tasks) < _CHART_POOL_MIN_TASKS:
+        return _sequential()
+
+    try:
+        # Use physical cores (not hyperthreads) — chart rendering is CPU-bound
+        # and hyperthreads add context-switch overhead without throughput gain.
+        # Cap at 8 to avoid excessive memory pressure on large-core machines.
+        _workers = min(len(tasks), _physical_cpu_count(), 8)
+        with ProcessPoolExecutor(max_workers=_workers,
+                                 initializer=_worker_init) as _pool:
+            _raw = list(_pool.map(_chart_worker, tasks))
+    except Exception:
+        return _sequential()
+
+    overlay_path = None
+    chart_map = {}
+    for key, path in _raw:
+        if key == 'overlay':
+            overlay_path = path
+        else:
+            chart_map[key] = path
+    return overlay_path, chart_map
 
 
 def _aggregate_unknowns(results):
@@ -1847,31 +1947,12 @@ def _create_output_inner(wb, tmp_dir, results, output_path, msd_path, raw_plate_
     qc_summary_rows, qc_overlay_points = _compute_qc_summary(
         results, qc_dilution_factors, qc_expected_concentrations)
 
-    # Pre-generate all charts before Excel writing (sequential — matplotlib mathtext is not thread-safe)
-    overlay_path = generate_overlay_chart(
-        results, tmp_dir,
-        qc_overlay_points if qc_overlay_points else None,
-        qc_expected_concentrations if qc_expected_concentrations else None,
-        units=units
-    )
-    # Generate per-spot charts in parallel (each process has its own matplotlib
-    # state, so mathtext thread-safety is not an issue).
-    # Falls back to sequential if the process pool fails (e.g. frozen app edge cases).
-    _chart_args = [(res, tmp_dir, lloq_method, units) for res in results]
-    _key = lambda r: (r['plate'], r['spot'], r.get('group', ''))
-    try:
-        # Use physical cores (not hyperthreads) — chart rendering is CPU-bound
-        # and hyperthreads add context-switch overhead without throughput gain.
-        # Cap at 8 to avoid excessive memory pressure on large-core machines.
-        _workers = min(len(results), _physical_cpu_count(), 8)
-        with ProcessPoolExecutor(max_workers=_workers,
-                                 initializer=_worker_init) as _pool:
-            _raw = list(_pool.map(_chart_worker, _chart_args))
-        chart_map = {_key(res): path for res, (_k, path) in zip(results, _raw)}
-    except Exception:
-        chart_map = {_key(res): generate_std_curve_chart(res, tmp_dir, lloq_method,
-                                                          units=units)
-                     for res in results}
+    # Pre-generate every chart (overlay + per-spot) before Excel writing.
+    # Each worker process has its own matplotlib state, so mathtext
+    # thread-safety is not an issue.
+    overlay_path, chart_map = _render_all_charts(
+        results, tmp_dir, lloq_method, units,
+        qc_overlay_points, qc_expected_concentrations)
 
     unit_suffix = f" ({units})" if units else ""
     interp_header = f"Interp. Conc.{unit_suffix}"
@@ -2542,6 +2623,7 @@ def generate_html_report(results, html_path, msd_path, units=None,
 
         # ── Calibrator drop table (client-side re-fit) ─────────────────────
         cal_html = ''
+        raw_entry = None
         if res.get('standards') and fit_trace_idx is not None:
             std_sorted = sorted(res['standards'], key=lambda s: (s['conc'], s['well']))
             cal_rows = ''.join(
@@ -2565,7 +2647,7 @@ def generate_html_report(results, html_path, msd_path, units=None,
             </div>"""
 
             a, b, c, d = res['params'] if res['params'] is not None else (None, None, None, None)
-            curve_raw_data[curve_key] = {
+            raw_entry = {
                 'divId': div_id,
                 'fitTraceIdx': fit_trace_idx,
                 'label': label,
@@ -2577,10 +2659,17 @@ def generate_html_report(results, html_path, msd_path, units=None,
                          if a is not None else None),
             }
 
-        return (curve_key, label, chart_html + cal_html)
+        return (curve_key, label, chart_html + cal_html, raw_entry)
 
     with ThreadPoolExecutor() as _pool:
         curve_divs = list(_pool.map(_build_curve_div, results))
+
+    # Populate curve_raw_data here, in results order, rather than from inside the
+    # worker: threads finish in arbitrary order, which made the emitted JSON key
+    # order — and so the report file itself — differ between identical runs.
+    for _ck, _lbl, _html, _raw_entry in curve_divs:
+        if _raw_entry is not None:
+            curve_raw_data[_ck] = _raw_entry
 
     # ── Overlay figure ────────────────────────────────────────────────────────
     import json as _json
@@ -3185,7 +3274,7 @@ def generate_html_report(results, html_path, msd_path, units=None,
     # ── Assemble curve cards HTML ─────────────────────────────────────────────
     curves_section_html = '\n'.join(
         f'<div class="curve-card" data-curvekey="{curve_key}"><h3>{label}</h3>{div_html}</div>'
-        for curve_key, label, div_html in curve_divs
+        for curve_key, label, div_html, _ in curve_divs
     )
     _curve_json = _json.dumps(curve_raw_data)
 
