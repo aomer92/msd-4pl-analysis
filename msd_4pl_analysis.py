@@ -129,7 +129,7 @@ import re, sys, argparse, os, tempfile, json, subprocess, platform, functools, m
 import threading, urllib.request
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 
-__version__ = "1.10.1"
+__version__ = "1.11.0"
 
 # ── Auto-update check ─────────────────────────────────────────────────────────
 _GITHUB_REPO  = "aomer92/msd-4pl-analysis"
@@ -3375,6 +3375,8 @@ def generate_html_report(results, html_path, msd_path, units=None,
   .msd-cal-table tr.msd-cal-excluded td {{ opacity: 0.4; text-decoration: line-through; }}
   tr.msd-row-modified {{ background: #fff8e1; }}
   tr.msd-row-modified td:last-child::after {{ content: ' *'; color: #9C6500; font-weight: 700; }}
+  .hm-grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(340px, 1fr)); gap: 16px; }}
+  .hm-cell {{ background: white; border-radius: 6px; box-shadow: 0 1px 4px rgba(0,0,0,0.08); padding: 8px; }}
   .sp-panel {{ background:white;border-radius:6px;box-shadow:0 1px 4px rgba(0,0,0,0.08);padding:14px; }}
   .sp-drop-zone {{ min-height:80px;border:2px dashed #ccc;border-radius:4px;padding:6px;display:flex;flex-wrap:wrap;gap:4px;align-content:flex-start;transition:background 0.15s; }}
   .sp-drop-zone.drag-over {{ background:#e8f4fd;border-color:#2F5496; }}
@@ -3477,20 +3479,12 @@ def generate_html_report(results, html_path, msd_path, units=None,
 
   <div id="tab-heatmap" class="tab-pane">
     <h2>Plate Heatmaps</h2>
-    <p style="font-size:12px;color:#555;margin:-8px 0 12px;">Raw signal and interpolated concentration per well, independent of curve fitting.</p>
-    <div style="display:flex;gap:16px;align-items:center;margin-bottom:14px;flex-wrap:wrap;">
-      <label style="font-size:13px;">Plate:
-        <select id="hm-plate-select" onchange="hmOnPlateChange()" style="margin-left:6px;padding:4px 8px;"></select>
-      </label>
-      <label style="font-size:13px;">Spot:
-        <select id="hm-spot-select" onchange="hmRender()" style="margin-left:6px;padding:4px 8px;"></select>
-      </label>
-      <div style="display:flex;gap:6px;">
-        <button id="hm-metric-signal" class="sp-subtab-btn sp-subtab-active" onclick="hmSetMetric('signal',this)">Signal</button>
-        <button id="hm-metric-conc" class="sp-subtab-btn" onclick="hmSetMetric('conc',this)">Interp. Concentration</button>
-      </div>
+    <p style="font-size:12px;color:#555;margin:-8px 0 12px;">Raw signal and interpolated concentration per well, independent of curve fitting. All plates shown together for live comparison.</p>
+    <div style="display:flex;gap:6px;margin-bottom:14px;">
+      <button id="hm-metric-signal" class="sp-subtab-btn sp-subtab-active" onclick="hmSetMetric('signal',this)">Signal</button>
+      <button id="hm-metric-conc" class="sp-subtab-btn" onclick="hmSetMetric('conc',this)">Interp. Concentration</button>
     </div>
-    <div id="hm-chart" style="height:560px;"></div>
+    <div id="hm-grid" class="hm-grid"></div>
   </div>
 
   <div id="tab-unknowns" class="tab-pane">
@@ -5458,58 +5452,50 @@ function spRenderCollatedChart() {{
   Plotly.react('sp-collated-chart', traces, layout, {{responsive:true}});
 }}
 // ── End Sample Plots Tab ─────────────────────────────────────────────────────
-// ── Plate Heatmap Tab ────────────────────────────────────────────────────────
+// ── Plate Heatmap Tab (all plates shown together for live comparison) ────────
 var hmMetric = 'signal';
+var hmChartEntries = [];
 
 function hmInit() {{
-  var plateSel = document.getElementById('hm-plate-select');
-  if (plateSel.options.length) {{ hmRender(); return; }}
+  var grid = document.getElementById('hm-grid');
+  if (grid.dataset.built === '1') {{ hmRenderAll(); return; }}
   var plates = Object.keys(HEATMAP_DATA.plates).map(Number).sort(function(a, b) {{ return a - b; }});
   plates.forEach(function(p) {{
-    var opt = document.createElement('option');
-    opt.value = p; opt.textContent = 'Plate ' + p;
-    plateSel.appendChild(opt);
+    var pdata = HEATMAP_DATA.plates[p];
+    var spots = Object.keys(pdata.spots).sort(function(a, b) {{ return a - b; }});
+    spots.forEach(function(s) {{
+      var chartId = 'hm-chart-p' + p + '-s' + s;
+      hmChartEntries.push({{ plate: p, spot: s, chartId: chartId }});
+      var cell = document.createElement('div');
+      cell.className = 'hm-cell';
+      var chartDiv = document.createElement('div');
+      chartDiv.id = chartId;
+      chartDiv.style.height = '320px';
+      cell.appendChild(chartDiv);
+      grid.appendChild(cell);
+    }});
   }});
-  hmPopulateSpots();
-  hmRender();
-}}
-
-function hmPopulateSpots() {{
-  var plateSel = document.getElementById('hm-plate-select');
-  var spotSel = document.getElementById('hm-spot-select');
-  var prevVal = spotSel.value;
-  spotSel.innerHTML = '';
-  var pdata = HEATMAP_DATA.plates[plateSel.value];
-  if (!pdata) return;
-  var spots = Object.keys(pdata.spots).sort(function(a, b) {{ return a - b; }});
-  spots.forEach(function(s) {{
-    var opt = document.createElement('option');
-    opt.value = s; opt.textContent = 'Spot ' + s;
-    spotSel.appendChild(opt);
-  }});
-  if (spots.indexOf(prevVal) !== -1) spotSel.value = prevVal;
-}}
-
-function hmOnPlateChange() {{
-  hmPopulateSpots();
-  hmRender();
+  grid.dataset.built = '1';
+  hmRenderAll();
 }}
 
 function hmSetMetric(metric, btn) {{
   hmMetric = metric;
   document.querySelectorAll('#tab-heatmap .sp-subtab-btn').forEach(function(b) {{ b.classList.remove('sp-subtab-active'); }});
   btn.classList.add('sp-subtab-active');
-  hmRender();
+  hmRenderAll();
 }}
 
-function hmRender() {{
-  var plateSel = document.getElementById('hm-plate-select');
-  var spotSel = document.getElementById('hm-spot-select');
-  var pdata = HEATMAP_DATA.plates[plateSel.value];
-  if (!pdata || !spotSel.value) {{ Plotly.purge('hm-chart'); return; }}
-  var wells = pdata.spots[spotSel.value];
+function hmRenderAll() {{
+  hmChartEntries.forEach(function(entry) {{ hmRenderOne(entry.plate, entry.spot, entry.chartId); }});
+}}
+
+function hmRenderOne(plateNum, spotNum, chartId) {{
+  var pdata = HEATMAP_DATA.plates[plateNum];
+  var wells = pdata.spots[spotNum];
   var rows = pdata.rows;
   var cols = pdata.cols;
+  var multiSpot = Object.keys(pdata.spots).length > 1;
   var z = [], text = [];
   rows.forEach(function(r) {{
     var zRow = [], textRow = [];
@@ -5539,18 +5525,17 @@ function hmRender() {{
     z: z, x: cols.map(String), y: rows, type: 'heatmap',
     text: text, hoverinfo: 'text',
     colorscale: colorscale, showscale: true, hoverongaps: false,
-    xgap: 2, ygap: 2
+    xgap: 1, ygap: 1
   }}];
   var layout = {{
-    title: {{ text: 'Plate ' + plateSel.value + ', Spot ' + spotSel.value + ' — ' +
-                    (hmMetric === 'signal' ? 'Raw Signal' : 'Interpolated Concentration'), font: {{ size: 13 }} }},
-    xaxis: {{ side: 'top', type: 'category', title: '' }},
-    yaxis: {{ autorange: 'reversed', type: 'category', title: '' }},
-    margin: {{ l: 50, r: 20, t: 60, b: 20 }},
-    height: 540,
+    title: {{ text: 'Plate ' + plateNum + (multiSpot ? (', Spot ' + spotNum) : ''), font: {{ size: 12 }} }},
+    xaxis: {{ side: 'top', type: 'category', tickfont: {{ size: 9 }} }},
+    yaxis: {{ autorange: 'reversed', type: 'category', tickfont: {{ size: 9 }} }},
+    margin: {{ l: 30, r: 10, t: 36, b: 10 }},
+    height: 320,
     paper_bgcolor: 'white', plot_bgcolor: 'white'
   }};
-  Plotly.react('hm-chart', data, layout, {{ responsive: true }});
+  Plotly.react(chartId, data, layout, {{ responsive: true }});
 }}
 // ── End Plate Heatmap Tab ─────────────────────────────────────────────────────
 
