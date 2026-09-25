@@ -130,7 +130,7 @@ import copy
 import threading, urllib.request
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 
-__version__ = "1.12.0"
+__version__ = "1.13.0"
 
 # ── Auto-update check ─────────────────────────────────────────────────────────
 _GITHUB_REPO  = "aomer92/msd-4pl-analysis"
@@ -1200,6 +1200,132 @@ def calculate_lloq_signal(signals, lloq_method='current'):
     return None
 
 
+# Back-calculated calibrator accuracy tolerances (%RE). The lowest and highest
+# calibrator levels — the ones that define the quantifiable range — are allowed
+# the wider tolerance, matching standard bioanalytical practice.
+CAL_RE_TOLERANCE = 20.0
+CAL_RE_TOLERANCE_ANCHOR = 25.0
+
+# Hill slope outside this range usually means the fit latched onto something
+# other than the intended sigmoid (wrong analyte, saturated plate, bad dilution).
+# Bounds set from the curves in this repository: the median slope is 0.95 and
+# the 10th/90th percentiles are 0.75/3.3, so this flags roughly the outer tenth
+# rather than a routine assay.
+HILL_SLOPE_RANGE = (0.5, 3.0)
+
+
+def compute_calibrator_accuracy(res, tolerance=CAL_RE_TOLERANCE,
+                                anchor_tolerance=CAL_RE_TOLERANCE_ANCHOR):
+    """Back-calculate each calibrator level through its own fitted curve.
+
+    For every nominal standard concentration, the replicate signals are averaged
+    and read back through the inverse 4PL. The relative error
+
+        %RE = (back-calculated − nominal) / nominal × 100
+
+    says whether the curve actually reproduces the standards it was fitted to —
+    the criterion that establishes a working range. It is independent of R²,
+    which can look excellent while individual levels are well outside tolerance.
+
+    Returns a dict:
+        levels      list of per-level dicts, ascending by nominal concentration:
+                    conc, n, mean_signal, back_calc, re_pct, passed, tolerance
+        lloq        lowest nominal concentration whose level passed (None if none)
+        uloq        highest nominal concentration whose level passed
+        n_failed    count of levels outside tolerance
+        interior_gap True when a level between lloq and uloq failed, i.e. the
+                    passing levels are not contiguous — reported, never
+                    silently narrowed.
+    Returns None when there is no fit or no standards to back-calculate.
+    """
+    params = res.get('params')
+    standards = res.get('standards') or []
+    if params is None or not standards:
+        return None
+
+    by_conc = defaultdict(list)
+    for st in standards:
+        c = st.get('conc')
+        sig = st.get('signal')
+        if c is not None and c > 0 and np.isfinite(sig):
+            by_conc[float(c)].append(float(sig))
+    if not by_conc:
+        return None
+
+    concs = sorted(by_conc)
+    levels = []
+    for i, c in enumerate(concs):
+        sigs = by_conc[c]
+        mean_sig = float(np.mean(sigs))
+        try:
+            back = inverse_4pl(mean_sig, *params)
+        except (ValueError, ZeroDivisionError, OverflowError):
+            back = np.nan
+        # The lowest and highest levels anchor the range and get the wider tolerance
+        tol = anchor_tolerance if i in (0, len(concs) - 1) else tolerance
+        if back is not None and np.isfinite(back):
+            re_pct = (back - c) / c * 100.0
+            passed = abs(re_pct) <= tol
+        else:
+            back, re_pct, passed = np.nan, np.nan, False
+        levels.append({'conc': c, 'n': len(sigs), 'mean_signal': mean_sig,
+                       'back_calc': float(back) if np.isfinite(back) else None,
+                       're_pct': float(re_pct) if np.isfinite(re_pct) else None,
+                       'passed': bool(passed), 'tolerance': tol})
+
+    passing = [lv['conc'] for lv in levels if lv['passed']]
+    lloq = min(passing) if passing else None
+    uloq = max(passing) if passing else None
+    interior_gap = bool(passing) and any(
+        (not lv['passed']) and lloq < lv['conc'] < uloq for lv in levels)
+    return {'levels': levels, 'lloq': lloq, 'uloq': uloq,
+            'n_failed': sum(1 for lv in levels if not lv['passed']),
+            'interior_gap': interior_gap}
+
+
+def compute_curve_flags(res, accuracy=None):
+    """Short, human-readable warnings about a fitted standard curve.
+
+    These are advisories shown next to the fit, not gates — nothing is dropped
+    or corrected on their account.
+    """
+    flags = []
+    if res.get('no_standards'):
+        return ["No standards"]
+    params = res.get('params')
+    if params is None:
+        return ["Fit failed"]
+
+    b = params[1]
+    lo, hi = HILL_SLOPE_RANGE
+    if not (lo <= b <= hi):
+        flags.append(f"Hill slope {b:.2f}")
+
+    # Two conditions were measured across every dataset here and deliberately
+    # left unflagged, because in these assays they describe the norm rather than
+    # an anomaly: the top calibrator sitting below the fitted plateau (median
+    # top-signal/d is 0.2) and the blank-derived LLOQ landing above the lowest
+    # calibrator (median ratio 3.5). Both are carried instead by the
+    # accuracy-based LLOQ/ULOQ columns, which state the quantifiable range
+    # directly rather than by inference.
+    # The plain count of calibrators outside tolerance is a column, not a flag:
+    # 72% of the curves in this repository have at least one, so flagging it
+    # would say nothing. What is worth flagging is structure — a quantifiable
+    # range narrower than the calibrators that were run, or one with a hole in it.
+    if accuracy and accuracy['lloq'] is not None:
+        levels = accuracy['levels']
+        if accuracy['lloq'] > levels[0]['conc']:
+            flags.append("Range starts above lowest std")
+        if accuracy['uloq'] < levels[-1]['conc']:
+            flags.append("Range ends below highest std")
+        if accuracy['interior_gap']:
+            flags.append("Non-contiguous range")
+    elif accuracy:
+        flags.append("No calibrator within tolerance")
+
+    return flags
+
+
 def parse_total_protein_csv(filepath):
     """Parse a total protein CSV file.
 
@@ -1625,22 +1751,29 @@ def _row_style_array(ws, fill, font):
 
 
 def _style_row(ws, row, max_col, fill=None, font=None):
-    if font is None:
-        font = DATA_FONT
-    sa = _row_style_array(ws, fill, font)
+    """Apply the standard data-row style (font, thin border, centred) to a row.
+
+    Callers set number_format, per-cell fills such as the %CV pass/fail colour,
+    and per-cell fonts such as the green/amber/red Status colours *before*
+    calling this, so anything the caller set explicitly is carried over rather
+    than flattened by the row style. Passing `fill` or `font` here states a
+    row-wide choice, which does override the per-cell one.
+    """
+    row_font = DATA_FONT if font is None else font
+    sa = _row_style_array(ws, fill, row_font)
     for c in range(1, max_col + 1):
         cell = ws.cell(row=row, column=c)
-        # Callers set number_format — and, when no row fill is given, per-cell
-        # fills such as the %CV pass/fail colour — *before* calling _style_row,
-        # so carry both over rather than flattening them with the row style.
         prev = cell._style
         num_fmt_id = prev.numFmtId if prev is not None else 0
         prev_fill_id = prev.fillId if prev is not None else 0
+        prev_font_id = prev.fontId if prev is not None else 0
         cell._style = copy.copy(sa)
         if num_fmt_id:
             cell._style.numFmtId = num_fmt_id
         if fill is None and prev_fill_id:
             cell._style.fillId = prev_fill_id
+        if font is None and prev_font_id:
+            cell._style.fontId = prev_font_id
 
 def _header_row(ws, row, headers):
     for ci, h in enumerate(headers, 1):
@@ -1968,7 +2101,9 @@ def _create_output_inner(wb, tmp_dir, results, output_path, msd_path, raw_plate_
     # Row 1: LLOQ method metadata
     ws.cell(row=1, column=1, value="LLOQ Method:").font = SECTION_FONT
     ws.cell(row=1, column=2, value=lloq_method_label)
-    headers = ["Plate", "Spot", "Group", "Min (a)", "Hill Slope (b)", "EC50 (c)", "Max (d)", "LLOQ Signal", "LLOQ Conc", "R²", "Flags", "Status"]
+    headers = ["Plate", "Spot", "Group", "Min (a)", "Hill Slope (b)", "EC50 (c)", "Max (d)",
+               "LLOQ Signal", "LLOQ Conc", "Acc. LLOQ", "Acc. ULOQ", "Cal Pass",
+               "R²", "Flags", "Status"]
     _header_row(ws, 2, headers)
 
     for ri, res in enumerate(results, 3):
@@ -2001,24 +2136,36 @@ def _create_output_inner(wb, tmp_dir, results, output_path, msd_path, raw_plate_
         vals.append(lloq_sig_val)
         vals.append(lloq_conc_val)
 
+        # Accuracy-based quantifiable range: reported alongside the blank-derived
+        # LLOQ above, never replacing it — the two answer different questions.
+        acc = res.get('accuracy')
+        if acc and acc['lloq'] is not None:
+            vals += [round(acc['lloq'], 4), round(acc['uloq'], 4),
+                     f"{len(acc['levels']) - acc['n_failed']}/{len(acc['levels'])}"]
+        elif acc:
+            vals += ["None", "None",
+                     f"0/{len(acc['levels'])}"]
+        else:
+            vals += ["N/A", "N/A", "N/A"]
+
+        flag_text = ", ".join(res.get('flags') or []) or None
         if res['params'] is not None:
             r2_raw = res['r2']
             vals += [round(float(r2_raw), 6) if (r2_raw is not None and np.isfinite(r2_raw)) else "N/A"]
-            flag_text = "No standards" if res.get('no_standards') else None
             vals.append(flag_text)
             if r2_raw is None or not np.isfinite(r2_raw):
                 vals.append("Poor")
             else:
                 vals.append("Good" if r2_raw >= R2_GOOD else ("Acceptable" if r2_raw >= R2_ACCEPTABLE else ("Negative R²" if r2_raw < 0 else "Poor")))
         else:
-            vals += ["N/A", None, "Failed"]
+            vals += ["N/A", flag_text, "Failed"]
 
         for ci, v in enumerate(vals, 1):
             # Never write bare empty strings — they produce invalid inlineStr cells
             if v == '':
                 v = None
             ws.cell(row=ri, column=ci, value=v)
-        status = ws.cell(row=ri, column=12)
+        status = ws.cell(row=ri, column=len(headers))
         status.font = PASS_FONT if status.value == "Good" else (WARN_FONT if status.value == "Acceptable" else FAIL_FONT)
         _style_row(ws, ri, len(headers))
 
@@ -2111,8 +2258,12 @@ def _create_output_inner(wb, tmp_dir, results, output_path, msd_path, raw_plate_
         row += 1
         _section_title(ws, row, "Standard Curve Data")
         row += 1
-        _header_row(ws, row, ["Well(s)", "Concentration", "Mean Signal", "Fitted Signal", "% Recovery"])
+        _header_row(ws, row, ["Well(s)", "Concentration", "Mean Signal", "Fitted Signal",
+                              "% Recovery", "Back-Calc Conc", "%RE"])
         row += 1
+
+        _acc = res.get('accuracy')
+        acc_by_conc = {lv['conc']: lv for lv in _acc['levels']} if _acc else {}
 
         std_groups = {}
         for s in res.get('standards', []):
@@ -2141,24 +2292,38 @@ def _create_output_inner(wb, tmp_dir, results, output_path, msd_path, raw_plate_
             if recovery is not None and np.isfinite(recovery):
                 ws.cell(row=row, column=5, value=round(float(recovery), 1))
                 ws.cell(row=row, column=5).number_format = '0.0'
-            _style_row(ws, row, 5, fill=STD_FILL)
+
+            # Back-calculated concentration and its relative error — the
+            # criterion the accuracy-based range on the Summary sheet uses.
+            # % Recovery above compares signals; this compares concentrations.
+            lvl = acc_by_conc.get(float(sg['conc']))
+            if lvl and lvl['back_calc'] is not None:
+                ws.cell(row=row, column=6, value=round(lvl['back_calc'], 4))
+                ws.cell(row=row, column=6).number_format = '#,##0.0000'
+                re_cell = ws.cell(row=row, column=7, value=round(lvl['re_pct'], 1))
+                re_cell.number_format = '0.0'
+                re_cell.font = PASS_FONT if lvl['passed'] else FAIL_FONT
+            elif lvl:
+                ws.cell(row=row, column=6, value="N/A")
+                ws.cell(row=row, column=7, value="N/A").font = FAIL_FONT
+            _style_row(ws, row, 7, fill=STD_FILL)
             row += 1
 
-        # Individual standard points data (kept in columns H-J for reference;
-        # column G is left as a narrow spacer before this side table)
+        # Individual standard points data (kept in columns I-K for reference;
+        # column H is left as a narrow spacer before this side table)
         ind_start = row + 1
-        ws.cell(row=ind_start, column=8, value="Conc").font = BOLD_FONT
-        ws.cell(row=ind_start, column=9, value="Signal").font = BOLD_FONT
-        ws.cell(row=ind_start, column=10, value="Fitted").font = BOLD_FONT
+        ws.cell(row=ind_start, column=9,  value="Conc").font = BOLD_FONT
+        ws.cell(row=ind_start, column=10, value="Signal").font = BOLD_FONT
+        ws.cell(row=ind_start, column=11, value="Fitted").font = BOLD_FONT
         irow = ind_start + 1
         for s in sorted(res.get('standards', []), key=lambda x: x['conc']):
             if s['conc'] > 0 and s['signal'] > 0:
-                ws.cell(row=irow, column=8, value=s['conc'])
-                ws.cell(row=irow, column=9, value=s['signal'])
+                ws.cell(row=irow, column=9,  value=s['conc'])
+                ws.cell(row=irow, column=10, value=s['signal'])
                 if res['params'] is not None:
                     fitted_val = four_pl(s['conc'], *res['params'])
                     if np.isfinite(fitted_val) and fitted_val > 0:
-                        ws.cell(row=irow, column=10, value=round(float(fitted_val), 1))
+                        ws.cell(row=irow, column=11, value=round(float(fitted_val), 1))
                 irow += 1
 
         # Blanks
@@ -2260,7 +2425,7 @@ def _create_output_inner(wb, tmp_dir, results, output_path, msd_path, raw_plate_
             row += len(block_lines)
             added_plates.add(plate)
 
-        for ci, w in enumerate([14, 18, 14, 16, 14, 14, 2, 14, 14, 14], 1):
+        for ci, w in enumerate([14, 18, 14, 16, 14, 16, 10, 2, 14, 14, 14], 1):
             ws.column_dimensions[get_column_letter(ci)].width = w
 
     # ── All Unknowns Combined ─────────────────────────────────────────
@@ -2993,10 +3158,9 @@ def generate_html_report(results, html_path, msd_path, units=None,
                           else 'Acceptable' if r2_val >= R2_ACCEPTABLE
                           else 'Negative R²' if r2_val < 0
                           else 'Poor')
-            flags = ''
         else:
             status = 'Failed'
-            flags = 'No standards' if res.get('no_standards') else ''
+        flags = ', '.join(res.get('flags') or [])
         lloq_sig = res.get('lloq_sig')
         if lloq_sig is not None:
             lloq_sig_disp = f"{lloq_sig:,.1f}"
@@ -3010,11 +3174,30 @@ def generate_html_report(results, html_path, msd_path, units=None,
         status_class = {'Good': 'status-good', 'Acceptable': 'status-warn',
                         'Poor': 'status-fail', 'Negative R²': 'status-fail',
                         'Failed': 'status-fail'}.get(status, '')
+
+        # Accuracy-based quantifiable range, shown beside the blank-derived LLOQ
+        acc = res.get('accuracy')
+        if acc and acc['lloq'] is not None:
+            acc_lloq = f"{acc['lloq']:.4g}"
+            acc_uloq = f"{acc['uloq']:.4g}"
+        elif acc:
+            acc_lloq = acc_uloq = 'None'
+        else:
+            acc_lloq = acc_uloq = 'N/A'
+        if acc:
+            n_pass = len(acc['levels']) - acc['n_failed']
+            cal_pass = f"{n_pass}/{len(acc['levels'])}"
+            cal_class = 'status-good' if n_pass == len(acc['levels']) else 'status-warn'
+        else:
+            cal_pass, cal_class = 'N/A', ''
+
         curve_key = f"p{plate}_s{spot}_{group or 'default'}"
         summary_rows_html.append(
             f"<tr id='sumrow_{curve_key}'><td>{plate}</td><td>{spot}</td><td>{group}</td>"
             f"<td>{a}</td><td>{b}</td><td>{c}</td><td>{d}</td>"
-            f"<td>{lloq_sig_disp}</td><td>{lloq_conc_disp}</td><td>{r2}</td>"
+            f"<td>{lloq_sig_disp}</td><td>{lloq_conc_disp}</td>"
+            f"<td>{acc_lloq}</td><td>{acc_uloq}</td>"
+            f"<td class='{cal_class}'>{cal_pass}</td><td>{r2}</td>"
             f"<td>{flags}</td><td class='{status_class}'>{status}</td></tr>"
         )
 
@@ -3541,8 +3724,11 @@ def generate_html_report(results, html_path, msd_path, units=None,
         <th onclick="sortTable(this)">Hill Slope (b)</th>
         <th onclick="sortTable(this)">EC50 (c)</th>
         <th onclick="sortTable(this)">Max (d)</th>
-        <th onclick="sortTable(this)">LLOQ Signal</th>
+        <th onclick="sortTable(this)" title="Lowest signal distinguishable from blanks, and that signal read back through the curve">LLOQ Signal</th>
         <th onclick="sortTable(this)">LLOQ Conc</th>
+        <th onclick="sortTable(this)" title="Lowest calibrator that back-calculates within tolerance">Acc. LLOQ</th>
+        <th onclick="sortTable(this)" title="Highest calibrator that back-calculates within tolerance">Acc. ULOQ</th>
+        <th onclick="sortTable(this)" title="Calibrator levels within &plusmn;20% (&plusmn;25% at the range ends)">Cal Pass</th>
         <th onclick="sortTable(this)">R²</th>
         <th onclick="sortTable(this)">Flags</th>
         <th onclick="sortTable(this)">Status</th>
@@ -5813,17 +5999,27 @@ function msdRecomputeCurve(key) {{
   if (!cd) return;
   var card = document.querySelector('[data-curvekey="' + key + '"]');
   if (!card) return;
-  var concs = [], sigs = [];
+  var concs = [], sigs = [], byConc = {{}};
   card.querySelectorAll('.msd-cal-cb').forEach(function(cb) {{
     var row = cb.closest('tr');
     if (cb.checked) {{
-      concs.push(parseFloat(cb.dataset.conc));
-      sigs.push(parseFloat(cb.dataset.signal));
+      var cv = parseFloat(cb.dataset.conc), sv = parseFloat(cb.dataset.signal);
+      concs.push(cv);
+      sigs.push(sv);
+      (byConc[cv] = byConc[cv] || []).push(sv);
       row.classList.remove('msd-cal-excluded');
     }} else {{
       row.classList.add('msd-cal-excluded');
     }}
   }});
+  // One entry per retained nominal level, ascending — the unit the
+  // accuracy-based range is judged on.
+  var levels = Object.keys(byConc).map(parseFloat).sort(function(x, y) {{ return x - y; }})
+    .map(function(cv) {{
+      var arr = byConc[cv], sum = 0;
+      for (var i = 0; i < arr.length; i++) sum += arr[i];
+      return {{ conc: cv, meanSignal: sum / arr.length }};
+    }});
   (cd.blanks || []).forEach(function(bl) {{ concs.push(0); sigs.push(bl.signal); }});
 
   var badge = card.querySelector('.msd-live-r2');
@@ -5835,7 +6031,7 @@ function msdRecomputeCurve(key) {{
     badge.textContent = 'Fit failed (need ≥4 points)';
     statusBadge.textContent = 'Failed';
     statusBadge.className = 'msd-live-status status-fail';
-    msdUpdateSummaryRow(key, null, cd);
+    msdUpdateSummaryRow(key, null, cd, levels);
     return;
   }}
 
@@ -5853,31 +6049,104 @@ function msdRecomputeCurve(key) {{
   statusBadge.textContent = st.label;
   statusBadge.className = 'msd-live-status ' + st.cls;
 
-  msdUpdateSummaryRow(key, fit, cd);
+  msdUpdateSummaryRow(key, fit, cd, levels);
 }}
 
-function msdUpdateSummaryRow(key, fit, cd) {{
+// Resolve summary columns by header text once, so adding or reordering columns
+// server-side cannot silently write live values into the wrong cell.
+var MSD_SUMCOL = (function() {{
+  var map = {{}};
+  var ths = document.querySelectorAll('#summaryTable thead th');
+  for (var i = 0; i < ths.length; i++) {{
+    map[ths[i].textContent.trim()] = i;
+  }}
+  return map;
+}})();
+
+// Tolerances must match CAL_RE_TOLERANCE / CAL_RE_TOLERANCE_ANCHOR in the
+// Python side, so a live re-fit judges calibrators the same way the report did.
+var MSD_CAL_TOL = 20.0, MSD_CAL_TOL_ANCHOR = 25.0;
+// Must match HILL_SLOPE_RANGE on the Python side.
+var MSD_HILL_MIN = 0.5, MSD_HILL_MAX = 3.0;
+
+// Back-calculate the retained calibrators through a live fit, mirroring
+// compute_calibrator_accuracy(). Returns null when nothing can be judged.
+function msdCalAccuracy(fit, levels) {{
+  if (!fit || !levels.length) return null;
+  var nPass = 0, passing = [], passFlags = [];
+  for (var i = 0; i < levels.length; i++) {{
+    var c = levels[i].conc;
+    var back = msdInverse4PL(levels[i].meanSignal, fit.a, fit.b, fit.c, fit.d);
+    var tol = (i === 0 || i === levels.length - 1) ? MSD_CAL_TOL_ANCHOR : MSD_CAL_TOL;
+    var ok = isFinite(back) && Math.abs((back - c) / c * 100.0) <= tol;
+    passFlags.push(ok);
+    if (ok) {{ nPass++; passing.push(c); }}
+  }}
+  if (!passing.length) return {{ lloq: null, uloq: null, nPass: 0, n: levels.length }};
+  var lo = Math.min.apply(null, passing), hi = Math.max.apply(null, passing);
+  var gap = false;
+  for (var j = 0; j < levels.length; j++) {{
+    if (!passFlags[j] && levels[j].conc > lo && levels[j].conc < hi) gap = true;
+  }}
+  return {{ lloq: lo, uloq: hi, nPass: nPass, n: levels.length, gap: gap,
+           lowest: levels[0].conc, highest: levels[levels.length - 1].conc }};
+}}
+
+// Mirror of compute_curve_flags() for a live re-fit, so the Flags column stays
+// consistent with the Cal Pass and Acc. LLOQ/ULOQ values next to it rather than
+// still describing the curve as it was served.
+function msdFlagsFor(fit, acc) {{
+  var flags = [];
+  if (!fit) return ['Fit failed'];
+  if (fit.b < MSD_HILL_MIN || fit.b > MSD_HILL_MAX) {{
+    flags.push('Hill slope ' + fit.b.toFixed(2));
+  }}
+  if (acc) {{
+    if (acc.lloq == null) {{
+      flags.push('No calibrator within tolerance');
+    }} else {{
+      if (acc.lloq > acc.lowest)  flags.push('Range starts above lowest std');
+      if (acc.uloq < acc.highest) flags.push('Range ends below highest std');
+      if (acc.gap)                flags.push('Non-contiguous range');
+    }}
+  }}
+  return flags;
+}}
+
+function msdUpdateSummaryRow(key, fit, cd, levels) {{
   var row = document.getElementById('sumrow_' + key);
   if (!row) return;
   row.classList.add('msd-row-modified');
   var cells = row.cells;
+  var iStatus = MSD_SUMCOL['Status'];
   if (!fit) {{
-    cells[11].textContent = 'Failed';
-    cells[11].className = '';
+    cells[iStatus].textContent = 'Failed';
+    cells[iStatus].className = '';
     return;
   }}
-  cells[3].textContent = fit.a.toPrecision(4);
-  cells[4].textContent = fit.b.toPrecision(4);
-  cells[5].textContent = fit.c.toPrecision(4);
-  cells[6].textContent = fit.d.toPrecision(4);
-  cells[9].textContent = fit.r2.toFixed(6);
+  cells[MSD_SUMCOL['Min (a)']].textContent        = fit.a.toPrecision(4);
+  cells[MSD_SUMCOL['Hill Slope (b)']].textContent = fit.b.toPrecision(4);
+  cells[MSD_SUMCOL['EC50 (c)']].textContent       = fit.c.toPrecision(4);
+  cells[MSD_SUMCOL['Max (d)']].textContent        = fit.d.toPrecision(4);
+  cells[MSD_SUMCOL['R²']].textContent             = fit.r2.toFixed(6);
   if (cd && cd.lloqSig != null) {{
     var lc = msdInverse4PL(cd.lloqSig, fit.a, fit.b, fit.c, fit.d);
-    cells[8].textContent = (isFinite(lc) && lc > 0) ? lc.toPrecision(4) : 'N/A';
+    cells[MSD_SUMCOL['LLOQ Conc']].textContent = (isFinite(lc) && lc > 0) ? lc.toPrecision(4) : 'N/A';
   }}
+  // Dropping a calibrator changes what the curve reproduces, so the
+  // accuracy-based range is re-derived rather than left showing stale values.
+  var acc = msdCalAccuracy(fit, levels || []);
+  if (acc) {{
+    cells[MSD_SUMCOL['Acc. LLOQ']].textContent = acc.lloq == null ? 'None' : acc.lloq.toPrecision(4);
+    cells[MSD_SUMCOL['Acc. ULOQ']].textContent = acc.uloq == null ? 'None' : acc.uloq.toPrecision(4);
+    var cp = cells[MSD_SUMCOL['Cal Pass']];
+    cp.textContent = acc.nPass + '/' + acc.n;
+    cp.className = (acc.nPass === acc.n) ? 'status-good' : 'status-warn';
+  }}
+  cells[MSD_SUMCOL['Flags']].textContent = msdFlagsFor(fit, acc).join(', ');
   var st = msdStatusFor(fit.r2);
-  cells[11].textContent = st.label;
-  cells[11].className = st.cls;
+  cells[iStatus].textContent = st.label;
+  cells[iStatus].className = st.cls;
 }}
 
 function msdResetCurve(key) {{
@@ -6075,6 +6344,23 @@ def run_analysis(msd_path, platemap_path, output_path, spots_override=None, unit
                     'no_standards': no_standards,
                     'lloq_sig': lloq_sig_cached
                 })
+
+    # Back-calculate the calibrators through each fitted curve and derive the
+    # advisory flags once, here, so the Excel workbook and the HTML report both
+    # report the same numbers rather than recomputing them independently.
+    for res in results:
+        lloq_conc = None
+        lloq_sig = res.get('lloq_sig')
+        if lloq_sig is not None and res.get('params') is not None:
+            try:
+                lc = inverse_4pl(lloq_sig, *res['params'])
+                if np.isfinite(lc) and lc > 0:
+                    lloq_conc = float(lc)
+            except (ValueError, ZeroDivisionError, OverflowError):
+                pass
+        res['lloq_conc'] = lloq_conc
+        res['accuracy'] = compute_calibrator_accuracy(res)
+        res['flags'] = compute_curve_flags(res, res['accuracy'])
 
     # Only raise for spots that have unknowns but no curve to interpolate them.
     # Spots with no standards AND no unknowns are silently empty — not an error.
