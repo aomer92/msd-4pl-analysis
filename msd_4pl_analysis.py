@@ -130,7 +130,7 @@ import copy
 import threading, urllib.request
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 
-__version__ = "1.15.0"
+__version__ = "1.15.1"
 
 # ── Auto-update check ─────────────────────────────────────────────────────────
 _GITHUB_REPO  = "aomer92/msd-4pl-analysis"
@@ -6188,15 +6188,23 @@ var hmRange = null;
 var hmLog = true;
 
 function hmCollectRange() {{
-  var lo = Infinity, hi = -Infinity;
+  var lo = Infinity, hi = -Infinity, loPos = Infinity;
   hmChartEntries.forEach(function(e) {{
     var wells = HEATMAP_DATA.plates[e.plate].spots[e.spot];
     Object.keys(wells).forEach(function(w) {{
       var v = (hmMetric === 'signal') ? wells[w].signal : wells[w].conc;
-      if (v != null && isFinite(v)) {{ if (v < lo) lo = v; if (v > hi) hi = v; }}
+      if (v != null && isFinite(v)) {{
+        if (v < lo) lo = v;
+        if (v > hi) hi = v;
+        if (v > 0 && v < loPos) loPos = v;
+      }}
     }});
   }});
-  return (lo <= hi) ? [lo, hi] : null;
+  if (lo > hi) return null;
+  // The log floor has to come from the whole set, not from one plate: clamping
+  // with a per-plate minimum gives each plate a different zmin and quietly
+  // un-shares the scale this function exists to share.
+  return [lo, hi, isFinite(loPos) ? loPos : null];
 }}
 
 function hmFmt(v) {{
@@ -6286,19 +6294,17 @@ function hmRenderOne(plateNum, spotNum, chartId) {{
   }};
   if (hmLog) {{
     // Colour by log10 while hover text keeps the real values.
-    var floorV = null;
-    z.forEach(function(rw) {{ rw.forEach(function(v) {{
-      if (v != null && isFinite(v) && v > 0 && (floorV === null || v < floorV)) floorV = v;
-    }}); }});
-    if (floorV === null) floorV = 1;
     trace.z = z.map(function(rw) {{
       return rw.map(function(v) {{
         return (v == null || !isFinite(v) || v <= 0) ? null : Math.log10(v);
       }});
     }});
     if (hmShared && hmRange) {{
-      trace.zmin = Math.log10(Math.max(hmRange[0], floorV));
-      trace.zmax = Math.log10(Math.max(hmRange[1], floorV * 10));
+      var floorV = hmRange[2] || 1;                       // global smallest positive
+      var lo = Math.max(hmRange[0], floorV);
+      var hi = Math.max(hmRange[1], lo * 10);
+      trace.zmin = Math.log10(lo);
+      trace.zmax = Math.log10(hi);
     }}
   }} else if (hmShared && hmRange) {{
     trace.zmin = hmRange[0]; trace.zmax = hmRange[1];
