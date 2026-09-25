@@ -129,7 +129,7 @@ import re, sys, argparse, os, tempfile, json, subprocess, platform, functools, m
 import threading, urllib.request
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 
-__version__ = "1.10.0"
+__version__ = "1.10.1"
 
 # ── Auto-update check ─────────────────────────────────────────────────────────
 _GITHUB_REPO  = "aomer92/msd-4pl-analysis"
@@ -2619,6 +2619,9 @@ def generate_html_report(results, html_path, msd_path, units=None,
         trace_label = f"P{plate} S{spot}" + (f" {group}" if group else "")
         color = _group_color_map.get(group, colors[i % len(colors)])
         _group_trace_indices[group or ''].append(len(overlay_fig.data))
+        _overlay_curve_key = f"p{plate}_s{spot}_{group or 'default'}"
+        if _overlay_curve_key in curve_raw_data:
+            curve_raw_data[_overlay_curve_key]['overlayFitTraceIdx'] = len(overlay_fig.data)
         overlay_fig.add_trace(go.Scatter(
             x=x_fit, y=y_fit,
             mode='lines', name=trace_label,
@@ -5766,6 +5769,11 @@ function msdRecomputeCurve(key) {{
   Plotly.restyle(gd, {{ x: [line.xs], y: [line.ys] }}, [cd.fitTraceIdx]);
   Plotly.relayout(gd, {{ 'title.text': cd.label + '<br><sup>R² = ' + fit.r2.toFixed(6) + ' (live)</sup>' }});
 
+  if (cd.overlayFitTraceIdx !== undefined) {{
+    var overlayGd = document.getElementById('overlay_chart');
+    if (overlayGd) Plotly.restyle(overlayGd, {{ x: [line.xs], y: [line.ys] }}, [cd.overlayFitTraceIdx]);
+  }}
+
   var st = msdStatusFor(fit.r2);
   badge.textContent = 'Live R²: ' + fit.r2.toFixed(6);
   statusBadge.textContent = st.label;
@@ -5820,6 +5828,11 @@ function msdResetCurve(key) {{
     var line = msdBuildFitLine(cd.orig, concs);
     Plotly.restyle(gd, {{ x: [line.xs], y: [line.ys] }}, [cd.fitTraceIdx]);
     Plotly.relayout(gd, {{ 'title.text': cd.label + '<br><sup>R² = ' + cd.orig.r2.toFixed(6) + '</sup>' }});
+
+    if (cd.overlayFitTraceIdx !== undefined) {{
+      var overlayGd = document.getElementById('overlay_chart');
+      if (overlayGd) Plotly.restyle(overlayGd, {{ x: [line.xs], y: [line.ys] }}, [cd.overlayFitTraceIdx]);
+    }}
   }}
 
   var row = document.getElementById('sumrow_' + key);
