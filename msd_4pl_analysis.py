@@ -130,7 +130,7 @@ import copy
 import threading, urllib.request
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 
-__version__ = "1.14.0"
+__version__ = "1.15.0"
 
 # ── Auto-update check ─────────────────────────────────────────────────────────
 _GITHUB_REPO  = "aomer92/msd-4pl-analysis"
@@ -2615,6 +2615,38 @@ def _create_output_inner(wb, tmp_dir, results, output_path, msd_path, raw_plate_
 # MAIN
 # ═══════════════════════════════════════════════════════════════════════════════
 
+def _resource_path(*parts):
+    """Locate a file shipped with the app, frozen or running from source."""
+    base = getattr(sys, '_MEIPASS', None) or os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(base, *parts)
+
+
+def _plotly_bundle_js():
+    """Return the plotly.js source to write beside each HTML report.
+
+    The report only ever draws scatter, bar and heatmap traces, so it ships the
+    cartesian build (~1.4 MB) instead of the full bundle plotly's Python package
+    carries (~4.8 MB) — the same library, minus the 3-D, map and specialty trace
+    types this report has no way to produce. That is ~3.4 MB less in every study
+    folder and a visibly faster first paint.
+
+    Falls back to the full bundle if the vendored file is missing (a source
+    checkout without it, or a build that did not include it), so the report is
+    never left without Plotly.
+    """
+    vendored = _resource_path('vendor', 'plotly-cartesian.min.js')
+    try:
+        with open(vendored, encoding='utf-8') as f:
+            js = f.read()
+        if 'heatmap' in js and 'scatter' in js:
+            return js
+        print("  Note: vendored plotly bundle looks incomplete — using the full bundle")
+    except OSError:
+        pass
+    import plotly.offline as _poff
+    return _poff.get_plotlyjs()
+
+
 def _open_file(path):
     """Open a file with the system default application (cross-platform)."""
     try:
@@ -3601,13 +3633,15 @@ def generate_html_report(results, html_path, msd_path, units=None,
     _heatmap_json = _json.dumps(_heatmap_data)
 
     # ── Plotly JS bundle — write once alongside HTML, reference by relative path ─
-    # This avoids embedding ~3.5 MB of JS in every report. Both files live in the
-    # same temp directory so a relative src= works in any browser.
+    # This avoids embedding the JS in every report. Both files live in the same
+    # directory so a relative src= works in any browser, including file://.
     _html_dir = os.path.dirname(os.path.abspath(html_path))
     _plotly_js_path = os.path.join(_html_dir, 'plotly.min.js')
     if not os.path.exists(_plotly_js_path):
+        _bundle = _plotly_bundle_js()
         with open(_plotly_js_path, 'w', encoding='utf-8') as _pf:
-            _pf.write(poff.get_plotlyjs())
+            _pf.write(_bundle)
+        print(f"  plotly bundle: {len(_bundle) / 1048576:.1f} MB")
 
     msd_basename = os.path.basename(msd_path)
     excel_basename = os.path.basename(excel_path) if excel_path else None
@@ -4329,10 +4363,12 @@ function showTab(name, btn) {{
   btn.classList.add('active');
   // Resize all Plotly charts now that their containers are visible
   pane.querySelectorAll('.js-plotly-plot').forEach(el => Plotly.Plots.resize(el));
-  if (msdIsDark()) msdApplyChartTheme();
   if (name === 'sampleplots') spInit();
   if (name === 'qcplots') qpInit();
   if (name === 'heatmap') hmInit();
+  // After the lazy builders, not before — these tabs create their figures on
+  // first open, so theming ahead of them would leave white charts on a dark page.
+  if (msdIsDark()) msdApplyChartTheme();
 }}
 
 function sortTable(th) {{
@@ -5147,8 +5183,8 @@ function spRenderChart() {{
     }},
     shapes: shapes,
     showlegend: false,  // x-axis category labels already identify each bar
-    paper_bgcolor: 'white',
-    plot_bgcolor: 'white'
+    paper_bgcolor: msdThemeTokens().surface,
+    plot_bgcolor: msdThemeTokens().surface
   }};
 
   Plotly.react('sp-chart', traces, layout, {{responsive: true}});
@@ -5662,8 +5698,8 @@ function qpRenderChart() {{
     }},
     shapes: shapes,
     legend: {{ orientation: 'h', x: 0, y: 1.08 }},
-    paper_bgcolor: 'white',
-    plot_bgcolor: 'white'
+    paper_bgcolor: msdThemeTokens().surface,
+    plot_bgcolor: msdThemeTokens().surface
   }};
 
   Plotly.react('qp-chart', traces, layout, {{responsive: true}});
@@ -6101,7 +6137,7 @@ function spRenderCollatedChart() {{
     xaxis:{{tickangle:-40,automargin:true,categoryorder:'array',categoryarray:orderedNames}},
     yaxis:{{title:{{text:yTitle,standoff:12}},automargin:false,rangemode:'tozero'}},
     shapes:shapes, showlegend:false,  // x-axis category labels already identify each bar
-    paper_bgcolor:'white', plot_bgcolor:'white'
+    paper_bgcolor: msdThemeTokens().surface, plot_bgcolor: msdThemeTokens().surface
   }};
   Plotly.react('sp-collated-chart', traces, layout, {{responsive:true}});
 }}

@@ -26,12 +26,20 @@ if [ -f "icon.icns" ]; then
     ICON_ARG="--icon=icon.icns"
 fi
 
+# The HTML report ships the cartesian plotly build (scatter/bar/heatmap only,
+# ~1.4 MB) rather than the full ~4.8 MB bundle inside the plotly package.
+if [ ! -f "vendor/plotly-cartesian.min.js" ]; then
+    echo "⚠ vendor/plotly-cartesian.min.js is missing — reports will fall back"
+    echo "  to the full plotly bundle (~3.4 MB larger per study folder)."
+fi
+
 python3 -m PyInstaller \
     --onefile \
     --windowed \
     --name "MSD_4PL_Analysis" \
     $ICON_ARG \
     --collect-data openpyxl \
+    --add-data "vendor/plotly-cartesian.min.js:vendor" \
     msd_4pl_analysis.py
 
 echo ""

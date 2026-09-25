@@ -7,6 +7,10 @@ hiddenimports = ['scipy.optimize', 'scipy.special', 'scipy.linalg', 'openpyxl', 
 tmp_ret = collect_all('matplotlib')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 
+# Cartesian-only plotly build (scatter/bar/heatmap) written beside each HTML
+# report — ~1.4 MB instead of the ~4.8 MB full bundle.
+datas += [('vendor/plotly-cartesian.min.js', 'vendor')]
+
 
 a = Analysis(
     ['msd_4pl_analysis.py'],
