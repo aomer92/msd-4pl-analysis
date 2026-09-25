@@ -129,7 +129,7 @@ import re, sys, argparse, os, tempfile, json, subprocess, platform, functools, m
 import threading, urllib.request
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 
-__version__ = "1.9.1"
+__version__ = "1.10.0"
 
 # ── Auto-update check ─────────────────────────────────────────────────────────
 _GITHUB_REPO  = "aomer92/msd-4pl-analysis"
@@ -2404,9 +2404,13 @@ def generate_html_report(results, html_path, msd_path, units=None,
         results, qc_dilution_factors, qc_expected_concentrations)
 
     # ── Per-spot standard curve figures (built in parallel) ──────────────────
+    curve_raw_data = {}   # curve_key → JS-facing dict (raw calibrator points + fit metadata)
+
     def _build_curve_div(res):
         plate, spot, group = res['plate'], res['spot'], res.get('group', '')
         label = f"Plate {plate}, Spot {spot}" + (f", Group {group}" if group else "")
+        curve_key = f"p{plate}_s{spot}_{group or 'default'}"
+        div_id = f"curve_p{plate}_s{spot}_{group or 'default'}"
         fig = go.Figure()
 
         all_concs_pos, all_sigs_pos = [], []
@@ -2445,6 +2449,7 @@ def generate_html_report(results, html_path, msd_path, units=None,
             ))
 
         lloq_sig = res.get('lloq_sig')
+        fit_trace_idx = None
         if res['params'] is not None:
             concs_for_fit = [s['conc'] for s in res.get('standards', []) if s['conc'] > 0]
             if concs_for_fit:
@@ -2452,6 +2457,7 @@ def generate_html_report(results, html_path, msd_path, units=None,
                 x_fit = np.logspace(np.log10(c_min * 0.5), np.log10(c_max * 2), 80)
                 y_fit = four_pl(x_fit, *res['params'])
                 all_sigs_pos += [v for v in y_fit if v > 0]
+                fit_trace_idx = len(fig.data)
                 fig.add_trace(go.Scatter(
                     x=list(x_fit), y=list(y_fit),
                     mode='lines', name='4PL Fit',
@@ -2524,7 +2530,6 @@ def generate_html_report(results, html_path, msd_path, units=None,
             margin=dict(l=70, r=130, t=75, b=55),
             autosize=True, height=400
         )
-        div_id = f"curve_p{plate}_s{spot}_{group or 'default'}"
         chart_html = fig.to_html(full_html=False, include_plotlyjs=False,
                                   div_id=div_id, config={'responsive': True})
         if has_samples:
@@ -2534,7 +2539,45 @@ def generate_html_report(results, html_path, msd_path, units=None,
                 f'\U0001f441 Samples</button>'
             )
             chart_html = btn + chart_html
-        return (label, chart_html)
+
+        # ── Calibrator drop table (client-side re-fit) ─────────────────────
+        cal_html = ''
+        if res.get('standards') and fit_trace_idx is not None:
+            std_sorted = sorted(res['standards'], key=lambda s: (s['conc'], s['well']))
+            cal_rows = ''.join(
+                f"<tr><td>{s['well']}</td><td>{s['conc']:g}</td><td>{s['signal']:,.0f}</td>"
+                f"<td><input type='checkbox' class='msd-cal-cb' checked "
+                f"data-conc='{s['conc']}' data-signal='{s['signal']}' "
+                f"onchange=\"msdRecomputeCurve('{curve_key}')\"></td></tr>"
+                for s in std_sorted
+            )
+            cal_html = f"""
+            <div class="msd-cal-wrap">
+              <div class="msd-live-row">
+                <span class="msd-live-r2"></span>
+                <span class="msd-live-status"></span>
+                <button class="msd-reset-btn" onclick="msdResetCurve('{curve_key}')">↺ Reset Calibrators</button>
+              </div>
+              <table class="msd-cal-table">
+                <thead><tr><th>Well</th><th>Conc</th><th>Signal</th><th>Include</th></tr></thead>
+                <tbody>{cal_rows}</tbody>
+              </table>
+            </div>"""
+
+            a, b, c, d = res['params'] if res['params'] is not None else (None, None, None, None)
+            curve_raw_data[curve_key] = {
+                'divId': div_id,
+                'fitTraceIdx': fit_trace_idx,
+                'label': label,
+                'lloqSig': (float(lloq_sig) if lloq_sig is not None and np.isfinite(lloq_sig) else None),
+                'blanks': [{'signal': float(bl['signal'])} for bl in res.get('blanks', [])
+                           if np.isfinite(bl['signal'])],
+                'orig': ({'a': float(a), 'b': float(b), 'c': float(c), 'd': float(d),
+                          'r2': float(res['r2']) if res.get('r2') is not None else None}
+                         if a is not None else None),
+            }
+
+        return (curve_key, label, chart_html + cal_html)
 
     with ThreadPoolExecutor() as _pool:
         curve_divs = list(_pool.map(_build_curve_div, results))
@@ -2875,8 +2918,9 @@ def generate_html_report(results, html_path, msd_path, units=None,
         status_class = {'Good': 'status-good', 'Acceptable': 'status-warn',
                         'Poor': 'status-fail', 'Negative R²': 'status-fail',
                         'Failed': 'status-fail'}.get(status, '')
+        curve_key = f"p{plate}_s{spot}_{group or 'default'}"
         summary_rows_html.append(
-            f"<tr><td>{plate}</td><td>{spot}</td><td>{group}</td>"
+            f"<tr id='sumrow_{curve_key}'><td>{plate}</td><td>{spot}</td><td>{group}</td>"
             f"<td>{a}</td><td>{b}</td><td>{c}</td><td>{d}</td>"
             f"<td>{lloq_sig_disp}</td><td>{lloq_conc_disp}</td><td>{r2}</td>"
             f"<td>{flags}</td><td class='{status_class}'>{status}</td></tr>"
@@ -3137,9 +3181,60 @@ def generate_html_report(results, html_path, msd_path, units=None,
 
     # ── Assemble curve cards HTML ─────────────────────────────────────────────
     curves_section_html = '\n'.join(
-        f'<div class="curve-card"><h3>{label}</h3>{div_html}</div>'
-        for label, div_html in curve_divs
+        f'<div class="curve-card" data-curvekey="{curve_key}"><h3>{label}</h3>{div_html}</div>'
+        for curve_key, label, div_html in curve_divs
     )
+    _curve_json = _json.dumps(curve_raw_data)
+
+    # ── Plate Heatmap data (raw signal per well, independent of plate map) ────
+    _raw_plates_for_heat = parse_msd_file(msd_path)
+    _well_overlay = {}   # (plate,spot) → {well: {type,name,group,conc}}
+    for res in results:
+        _hp, _hs, _hg = res['plate'], res['spot'], res.get('group', '')
+        _hkey = (_hp, _hs)
+        _ov = _well_overlay.setdefault(_hkey, {})
+        for s in res.get('standards', []):
+            w = normalize_well(s['well'])
+            _ov.setdefault(w, {'type': 'Standard', 'name': f"STD ({s['conc']:g})",
+                                'group': _hg, 'conc': float(s['conc'])})
+        for bl in res.get('blanks', []):
+            w = normalize_well(bl['well'])
+            _ov.setdefault(w, {'type': 'Blank', 'name': bl.get('sample_name') or 'Blank',
+                                'group': _hg, 'conc': 0})
+        for u in res.get('unknowns', []):
+            w = normalize_well(u['well'])
+            _ic = u.get('interp_conc')
+            _ov.setdefault(w, {'type': 'Unknown', 'name': u['sample_name'], 'group': _hg,
+                                'conc': (float(_ic) if _ic is not None and np.isfinite(_ic) else None)})
+
+    _heatmap_data = {'plates': {}}
+    for _pdata in _raw_plates_for_heat:
+        _pnum = _pdata['plate_num']
+        _well_signals = _pdata['data']
+        if not _well_signals:
+            continue
+        _rows = sorted(set(re.match(r'([A-P])(\d+)', w).group(1) for w in _well_signals))
+        _cols = sorted(set(int(re.match(r'([A-P])(\d+)', w).group(2)) for w in _well_signals))
+        _plate_entry = {'rows': _rows, 'cols': _cols, 'spots': {}}
+        for _spot_idx in range(_pdata['spots_per_well']):
+            _spot_num = _spot_idx + 1
+            _overlay = _well_overlay.get((_pnum, _spot_num), {})
+            _wells_grid = {}
+            for w, _sig_list in _well_signals.items():
+                if _spot_idx >= len(_sig_list):
+                    continue
+                _sig = _sig_list[_spot_idx]
+                _ov = _overlay.get(w, {})
+                _wells_grid[w] = {
+                    'signal': (float(_sig) if np.isfinite(_sig) else None),
+                    'type': _ov.get('type', 'Unassigned'),
+                    'name': _ov.get('name', ''),
+                    'group': _ov.get('group', ''),
+                    'conc': _ov.get('conc'),
+                }
+            _plate_entry['spots'][_spot_num] = _wells_grid
+        _heatmap_data['plates'][_pnum] = _plate_entry
+    _heatmap_json = _json.dumps(_heatmap_data)
 
     # ── Plotly JS bundle — write once alongside HTML, reference by relative path ─
     # This avoids embedding ~3.5 MB of JS in every report. Both files live in the
@@ -3261,6 +3356,22 @@ def generate_html_report(results, html_path, msd_path, units=None,
                        font-size: 12px; font-weight: 600; background: #27AE60; color: white;
                        margin-bottom: 6px; display: inline-block; }}
   .curve-toggle-btn:hover {{ background: #1e8449; }}
+  .msd-cal-wrap {{ margin-top: 10px; border-top: 1px solid #e5e5e5; padding-top: 8px; }}
+  .msd-live-row {{ display: flex; align-items: center; gap: 10px; margin-bottom: 6px; min-height: 20px; }}
+  .msd-live-r2 {{ font-size: 12px; font-weight: 700; color: #3a506b; }}
+  .msd-live-status {{ font-size: 11px; font-weight: 700; padding: 2px 8px; border-radius: 3px; }}
+  .msd-reset-btn {{ margin-left: auto; font-size: 11px; padding: 3px 10px; border: 1px solid #ccc;
+                     border-radius: 4px; background: #f5f5f5; cursor: pointer; }}
+  .msd-reset-btn:hover {{ background: #e8e8e8; }}
+  .msd-cal-table {{ width: 100%; border-collapse: collapse; font-size: 11px; max-height: 160px;
+                     display: block; overflow-y: auto; }}
+  .msd-cal-table thead, .msd-cal-table tbody {{ display: table; width: 100%; table-layout: fixed; }}
+  .msd-cal-table th {{ position: sticky; top: 0; background: #f0f2f5; text-align: left;
+                        padding: 4px 6px; font-weight: 600; }}
+  .msd-cal-table td {{ padding: 3px 6px; border-top: 1px solid #eee; }}
+  .msd-cal-table tr.msd-cal-excluded td {{ opacity: 0.4; text-decoration: line-through; }}
+  tr.msd-row-modified {{ background: #fff8e1; }}
+  tr.msd-row-modified td:last-child::after {{ content: ' *'; color: #9C6500; font-weight: 700; }}
   .sp-panel {{ background:white;border-radius:6px;box-shadow:0 1px 4px rgba(0,0,0,0.08);padding:14px; }}
   .sp-drop-zone {{ min-height:80px;border:2px dashed #ccc;border-radius:4px;padding:6px;display:flex;flex-wrap:wrap;gap:4px;align-content:flex-start;transition:background 0.15s; }}
   .sp-drop-zone.drag-over {{ background:#e8f4fd;border-color:#2F5496; }}
@@ -3307,6 +3418,7 @@ def generate_html_report(results, html_path, msd_path, units=None,
 <div class="tabs">
   <button class="tab-btn active" onclick="showTab('summary', this)">Summary</button>
   <button class="tab-btn" onclick="showTab('curves', this)">Standard Curves</button>
+  <button class="tab-btn" onclick="showTab('heatmap', this)">Plate Heatmap</button>
   <button class="tab-btn" onclick="showTab('unknowns', this)">All Unknowns</button>
   <button class="tab-btn" onclick="showTab('sampleplots', this)">Sample Plots</button>
   <button class="tab-btn" onclick="showTab('qcplots', this)">QC Plots</button>
@@ -3354,9 +3466,28 @@ def generate_html_report(results, html_path, msd_path, units=None,
 
   <div id="tab-curves" class="tab-pane">
     <h2>Standard Curves</h2>
+    <p style="font-size:12px;color:#555;margin:-8px 0 12px;">Uncheck calibrator points below a curve to drop them and re-fit live — R² and Status update here and in the Summary table above.</p>
     <div class="curves-grid">
       {curves_section_html}
     </div>
+  </div>
+
+  <div id="tab-heatmap" class="tab-pane">
+    <h2>Plate Heatmaps</h2>
+    <p style="font-size:12px;color:#555;margin:-8px 0 12px;">Raw signal and interpolated concentration per well, independent of curve fitting.</p>
+    <div style="display:flex;gap:16px;align-items:center;margin-bottom:14px;flex-wrap:wrap;">
+      <label style="font-size:13px;">Plate:
+        <select id="hm-plate-select" onchange="hmOnPlateChange()" style="margin-left:6px;padding:4px 8px;"></select>
+      </label>
+      <label style="font-size:13px;">Spot:
+        <select id="hm-spot-select" onchange="hmRender()" style="margin-left:6px;padding:4px 8px;"></select>
+      </label>
+      <div style="display:flex;gap:6px;">
+        <button id="hm-metric-signal" class="sp-subtab-btn sp-subtab-active" onclick="hmSetMetric('signal',this)">Signal</button>
+        <button id="hm-metric-conc" class="sp-subtab-btn" onclick="hmSetMetric('conc',this)">Interp. Concentration</button>
+      </div>
+    </div>
+    <div id="hm-chart" style="height:560px;"></div>
   </div>
 
   <div id="tab-unknowns" class="tab-pane">
@@ -3550,6 +3681,7 @@ function showTab(name, btn) {{
   pane.querySelectorAll('.js-plotly-plot').forEach(el => Plotly.Plots.resize(el));
   if (name === 'sampleplots') spInit();
   if (name === 'qcplots') qpInit();
+  if (name === 'heatmap') hmInit();
 }}
 
 function sortTable(th) {{
@@ -3620,6 +3752,8 @@ function msdToggleCurveSamples(btn, divId, traceIdx) {{
 }}
 
 // ── Sample Plots Tab ─────────────────────────────────────────────────────────
+var HEATMAP_DATA = {_heatmap_json};
+var CURVE_DATA = {_curve_json};
 var SP_DATA = {_sp_json};
 var spInitialized = false;
 var spCurrentAnalyte = null;
@@ -5321,6 +5455,387 @@ function spRenderCollatedChart() {{
   Plotly.react('sp-collated-chart', traces, layout, {{responsive:true}});
 }}
 // ── End Sample Plots Tab ─────────────────────────────────────────────────────
+// ── Plate Heatmap Tab ────────────────────────────────────────────────────────
+var hmMetric = 'signal';
+
+function hmInit() {{
+  var plateSel = document.getElementById('hm-plate-select');
+  if (plateSel.options.length) {{ hmRender(); return; }}
+  var plates = Object.keys(HEATMAP_DATA.plates).map(Number).sort(function(a, b) {{ return a - b; }});
+  plates.forEach(function(p) {{
+    var opt = document.createElement('option');
+    opt.value = p; opt.textContent = 'Plate ' + p;
+    plateSel.appendChild(opt);
+  }});
+  hmPopulateSpots();
+  hmRender();
+}}
+
+function hmPopulateSpots() {{
+  var plateSel = document.getElementById('hm-plate-select');
+  var spotSel = document.getElementById('hm-spot-select');
+  var prevVal = spotSel.value;
+  spotSel.innerHTML = '';
+  var pdata = HEATMAP_DATA.plates[plateSel.value];
+  if (!pdata) return;
+  var spots = Object.keys(pdata.spots).sort(function(a, b) {{ return a - b; }});
+  spots.forEach(function(s) {{
+    var opt = document.createElement('option');
+    opt.value = s; opt.textContent = 'Spot ' + s;
+    spotSel.appendChild(opt);
+  }});
+  if (spots.indexOf(prevVal) !== -1) spotSel.value = prevVal;
+}}
+
+function hmOnPlateChange() {{
+  hmPopulateSpots();
+  hmRender();
+}}
+
+function hmSetMetric(metric, btn) {{
+  hmMetric = metric;
+  document.querySelectorAll('#tab-heatmap .sp-subtab-btn').forEach(function(b) {{ b.classList.remove('sp-subtab-active'); }});
+  btn.classList.add('sp-subtab-active');
+  hmRender();
+}}
+
+function hmRender() {{
+  var plateSel = document.getElementById('hm-plate-select');
+  var spotSel = document.getElementById('hm-spot-select');
+  var pdata = HEATMAP_DATA.plates[plateSel.value];
+  if (!pdata || !spotSel.value) {{ Plotly.purge('hm-chart'); return; }}
+  var wells = pdata.spots[spotSel.value];
+  var rows = pdata.rows;
+  var cols = pdata.cols;
+  var z = [], text = [];
+  rows.forEach(function(r) {{
+    var zRow = [], textRow = [];
+    cols.forEach(function(c) {{
+      var w = r + c;
+      var cell = wells[w];
+      var val = null;
+      var label = w + ': no data';
+      if (cell) {{
+        val = (hmMetric === 'signal') ? cell.signal : cell.conc;
+        label = '<b>' + w + '</b>' + (cell.type ? ('<br>' + cell.type) : '') +
+                (cell.name ? (': ' + cell.name) : '') +
+                (cell.group ? ('<br>Group: ' + cell.group) : '') +
+                '<br>Signal: ' + (cell.signal != null ? Number(cell.signal).toLocaleString() : 'N/A') +
+                '<br>Interp. Conc: ' + (cell.conc != null ? cell.conc : 'N/A');
+      }}
+      zRow.push(val);
+      textRow.push(label);
+    }});
+    z.push(zRow);
+    text.push(textRow);
+  }});
+  var colorscale = (hmMetric === 'signal')
+    ? [[0, '#1a2f5c'], [0.5, '#4a90c4'], [1, '#f4d35e']]
+    : [[0, '#f7fbff'], [0.5, '#6baed6'], [1, '#08306b']];
+  var data = [{{
+    z: z, x: cols.map(String), y: rows, type: 'heatmap',
+    text: text, hoverinfo: 'text',
+    colorscale: colorscale, showscale: true, hoverongaps: false,
+    xgap: 2, ygap: 2
+  }}];
+  var layout = {{
+    title: {{ text: 'Plate ' + plateSel.value + ', Spot ' + spotSel.value + ' — ' +
+                    (hmMetric === 'signal' ? 'Raw Signal' : 'Interpolated Concentration'), font: {{ size: 13 }} }},
+    xaxis: {{ side: 'top', type: 'category', title: '' }},
+    yaxis: {{ autorange: 'reversed', type: 'category', title: '' }},
+    margin: {{ l: 50, r: 20, t: 60, b: 20 }},
+    height: 540,
+    paper_bgcolor: 'white', plot_bgcolor: 'white'
+  }};
+  Plotly.react('hm-chart', data, layout, {{ responsive: true }});
+}}
+// ── End Plate Heatmap Tab ─────────────────────────────────────────────────────
+
+// ── Live Calibrator Drop / Client-side 4PL Re-fit ─────────────────────────────
+function four_pl_js(x, a, b, c, d) {{
+  if (x <= 0) return a;
+  return d + (a - d) / (1 + Math.pow(x / c, b));
+}}
+
+function msdStatusFor(r2) {{
+  if (r2 === null || r2 === undefined || !isFinite(r2)) return {{ label: 'Poor', cls: 'status-fail' }};
+  if (r2 < 0) return {{ label: 'Negative R²', cls: 'status-fail' }};
+  if (r2 >= 0.99) return {{ label: 'Good', cls: 'status-good' }};
+  if (r2 >= 0.95) return {{ label: 'Acceptable', cls: 'status-warn' }};
+  return {{ label: 'Poor', cls: 'status-fail' }};
+}}
+
+// Levenberg-Marquardt fit of the 4PL model, 1/y² weighted (matches the Python
+// scipy.curve_fit sigma=y weighting used when the report was generated).
+function js4PLFit(concs, sigs) {{
+  var n = concs.length;
+  if (n < 4) return null;
+  var pos = [];
+  for (var i = 0; i < n; i++) if (concs[i] > 0) pos.push(concs[i]);
+  if (!pos.length) return null;
+
+  var a0 = Math.min.apply(null, sigs);
+  var d0 = Math.max.apply(null, sigs);
+  var logSum = 0;
+  for (i = 0; i < pos.length; i++) logSum += Math.log(pos[i]);
+  var c0 = Math.exp(logSum / pos.length);
+  var b0 = 1.0;
+  var params = [a0, b0, c0, d0];
+
+  var w = [];
+  for (i = 0; i < n; i++) {{
+    var s = Math.max(Math.abs(sigs[i]), 1e-3);
+    w.push(1 / (s * s));
+  }}
+
+  function clampParams(p) {{
+    p[1] = Math.min(20, Math.max(0.01, p[1]));
+    p[2] = Math.max(1e-9, p[2]);
+    return p;
+  }}
+
+  function residuals(p) {{
+    var r = new Array(n);
+    for (var i = 0; i < n; i++) {{
+      var pred = four_pl_js(concs[i], p[0], p[1], p[2], p[3]);
+      r[i] = (sigs[i] - pred) * Math.sqrt(w[i]);
+    }}
+    return r;
+  }}
+
+  function cost(r) {{
+    var s = 0;
+    for (var i = 0; i < r.length; i++) s += r[i] * r[i];
+    return s;
+  }}
+
+  function jacobian(p) {{
+    var J = [];
+    var eps = 1e-6;
+    var r0 = residuals(p);
+    for (var k = 0; k < 4; k++) {{
+      var pk = p.slice();
+      var h = Math.max(Math.abs(p[k]) * eps, 1e-9);
+      pk[k] += h;
+      var r1 = residuals(pk);
+      var col = new Array(n);
+      for (var i = 0; i < n; i++) col[i] = (r1[i] - r0[i]) / h;
+      J.push(col);
+    }}
+    return J; // J[param][point]
+  }}
+
+  // Solve a 4x4 linear system via Gaussian elimination with partial pivoting.
+  function solve4(A, bVec) {{
+    var M = A.map(function(row) {{ return row.slice(); }});
+    var b = bVec.slice();
+    var nP = 4;
+    for (var col = 0; col < nP; col++) {{
+      var piv = col;
+      for (var r = col + 1; r < nP; r++) if (Math.abs(M[r][col]) > Math.abs(M[piv][col])) piv = r;
+      if (Math.abs(M[piv][col]) < 1e-14) return null;
+      if (piv !== col) {{
+        var tmp = M[piv]; M[piv] = M[col]; M[col] = tmp;
+        var tb = b[piv]; b[piv] = b[col]; b[col] = tb;
+      }}
+      for (var r2 = col + 1; r2 < nP; r2++) {{
+        var factor = M[r2][col] / M[col][col];
+        for (var c2 = col; c2 < nP; c2++) M[r2][c2] -= factor * M[col][c2];
+        b[r2] -= factor * b[col];
+      }}
+    }}
+    var x = new Array(nP);
+    for (var i2 = nP - 1; i2 >= 0; i2--) {{
+      var sum = b[i2];
+      for (var j2 = i2 + 1; j2 < nP; j2++) sum -= M[i2][j2] * x[j2];
+      x[i2] = sum / M[i2][i2];
+    }}
+    return x;
+  }}
+
+  var lambda = 1e-3;
+  var r = residuals(params);
+  var c = cost(r);
+  for (var iter = 0; iter < 150; iter++) {{
+    var J = jacobian(params);
+    var JTJ = [[0,0,0,0],[0,0,0,0],[0,0,0,0],[0,0,0,0]];
+    var JTr = [0,0,0,0];
+    for (var p1 = 0; p1 < 4; p1++) {{
+      for (var p2 = 0; p2 < 4; p2++) {{
+        var s2 = 0;
+        for (var i3 = 0; i3 < n; i3++) s2 += J[p1][i3] * J[p2][i3];
+        JTJ[p1][p2] = s2;
+      }}
+      var s3 = 0;
+      for (var i4 = 0; i4 < n; i4++) s3 += J[p1][i4] * r[i4];
+      JTr[p1] = -s3;
+    }}
+    var improved = false;
+    for (var tryCount = 0; tryCount < 10; tryCount++) {{
+      var A = JTJ.map(function(row, ri) {{
+        return row.map(function(v, ci) {{ return ri === ci ? v * (1 + lambda) : v; }});
+      }});
+      var delta = solve4(A, JTr);
+      if (!delta) break;
+      var newParams = clampParams([params[0] + delta[0], params[1] + delta[1],
+                                    params[2] + delta[2], params[3] + delta[3]]);
+      var newR = residuals(newParams);
+      var newC = cost(newR);
+      if (isFinite(newC) && newC < c) {{
+        params = newParams; r = newR; c = newC;
+        lambda = Math.max(lambda / 3, 1e-12);
+        improved = true;
+        break;
+      }} else {{
+        lambda *= 3;
+      }}
+    }}
+    if (!improved && lambda > 1e10) break;
+  }}
+
+  var wSum = 0, wMeanNum = 0;
+  for (i = 0; i < n; i++) {{ wSum += w[i]; wMeanNum += w[i] * sigs[i]; }}
+  var wMean = wMeanNum / wSum;
+  var ssRes = 0, ssTot = 0;
+  for (i = 0; i < n; i++) {{
+    var pred2 = four_pl_js(concs[i], params[0], params[1], params[2], params[3]);
+    ssRes += w[i] * Math.pow(sigs[i] - pred2, 2);
+    ssTot += w[i] * Math.pow(sigs[i] - wMean, 2);
+  }}
+  var r2 = ssTot > 0 ? 1 - ssRes / ssTot : 0;
+
+  return {{ a: params[0], b: params[1], c: params[2], d: params[3], r2: r2 }};
+}}
+
+function msdInverse4PL(y, a, b, c, d) {{
+  if (Math.abs(b) < 1e-9) return NaN;
+  var denom = y - d;
+  if (Math.abs(denom) < 1e-9) return NaN;
+  var ratio = (a - d) / denom - 1;
+  if (ratio <= 0) return NaN;
+  return c * Math.pow(ratio, 1 / b);
+}}
+
+function msdBuildFitLine(fit, concs) {{
+  var pos = concs.filter(function(v) {{ return v > 0; }});
+  var cMin = Math.min.apply(null, pos), cMax = Math.max.apply(null, pos);
+  var xs = [], ys = [];
+  var nPts = 80;
+  var lo = Math.log10(cMin * 0.5), hi = Math.log10(cMax * 2);
+  for (var i = 0; i < nPts; i++) {{
+    var t = lo + (hi - lo) * i / (nPts - 1);
+    var xv = Math.pow(10, t);
+    xs.push(xv);
+    ys.push(four_pl_js(xv, fit.a, fit.b, fit.c, fit.d));
+  }}
+  return {{ xs: xs, ys: ys }};
+}}
+
+function msdRecomputeCurve(key) {{
+  var cd = CURVE_DATA[key];
+  if (!cd) return;
+  var card = document.querySelector('[data-curvekey="' + key + '"]');
+  if (!card) return;
+  var concs = [], sigs = [];
+  card.querySelectorAll('.msd-cal-cb').forEach(function(cb) {{
+    var row = cb.closest('tr');
+    if (cb.checked) {{
+      concs.push(parseFloat(cb.dataset.conc));
+      sigs.push(parseFloat(cb.dataset.signal));
+      row.classList.remove('msd-cal-excluded');
+    }} else {{
+      row.classList.add('msd-cal-excluded');
+    }}
+  }});
+  (cd.blanks || []).forEach(function(bl) {{ concs.push(0); sigs.push(bl.signal); }});
+
+  var badge = card.querySelector('.msd-live-r2');
+  var statusBadge = card.querySelector('.msd-live-status');
+  var gd = document.getElementById(cd.divId);
+
+  var fit = js4PLFit(concs, sigs);
+  if (!fit) {{
+    badge.textContent = 'Fit failed (need ≥4 points)';
+    statusBadge.textContent = 'Failed';
+    statusBadge.className = 'msd-live-status status-fail';
+    msdUpdateSummaryRow(key, null, cd);
+    return;
+  }}
+
+  var line = msdBuildFitLine(fit, concs);
+  Plotly.restyle(gd, {{ x: [line.xs], y: [line.ys] }}, [cd.fitTraceIdx]);
+  Plotly.relayout(gd, {{ 'title.text': cd.label + '<br><sup>R² = ' + fit.r2.toFixed(6) + ' (live)</sup>' }});
+
+  var st = msdStatusFor(fit.r2);
+  badge.textContent = 'Live R²: ' + fit.r2.toFixed(6);
+  statusBadge.textContent = st.label;
+  statusBadge.className = 'msd-live-status ' + st.cls;
+
+  msdUpdateSummaryRow(key, fit, cd);
+}}
+
+function msdUpdateSummaryRow(key, fit, cd) {{
+  var row = document.getElementById('sumrow_' + key);
+  if (!row) return;
+  row.classList.add('msd-row-modified');
+  var cells = row.cells;
+  if (!fit) {{
+    cells[11].textContent = 'Failed';
+    cells[11].className = '';
+    return;
+  }}
+  cells[3].textContent = fit.a.toPrecision(4);
+  cells[4].textContent = fit.b.toPrecision(4);
+  cells[5].textContent = fit.c.toPrecision(4);
+  cells[6].textContent = fit.d.toPrecision(4);
+  cells[9].textContent = fit.r2.toFixed(6);
+  if (cd && cd.lloqSig != null) {{
+    var lc = msdInverse4PL(cd.lloqSig, fit.a, fit.b, fit.c, fit.d);
+    cells[8].textContent = (isFinite(lc) && lc > 0) ? lc.toPrecision(4) : 'N/A';
+  }}
+  var st = msdStatusFor(fit.r2);
+  cells[11].textContent = st.label;
+  cells[11].className = st.cls;
+}}
+
+function msdResetCurve(key) {{
+  var cd = CURVE_DATA[key];
+  if (!cd) return;
+  var card = document.querySelector('[data-curvekey="' + key + '"]');
+  if (!card) return;
+  card.querySelectorAll('.msd-cal-cb').forEach(function(cb) {{
+    cb.checked = true;
+    cb.closest('tr').classList.remove('msd-cal-excluded');
+  }});
+  var badge = card.querySelector('.msd-live-r2');
+  var statusBadge = card.querySelector('.msd-live-status');
+  badge.textContent = '';
+  statusBadge.textContent = '';
+  statusBadge.className = 'msd-live-status';
+
+  var gd = document.getElementById(cd.divId);
+  if (cd.orig) {{
+    var concs = [];
+    card.querySelectorAll('.msd-cal-cb').forEach(function(cb) {{ concs.push(parseFloat(cb.dataset.conc)); }});
+    var line = msdBuildFitLine(cd.orig, concs);
+    Plotly.restyle(gd, {{ x: [line.xs], y: [line.ys] }}, [cd.fitTraceIdx]);
+    Plotly.relayout(gd, {{ 'title.text': cd.label + '<br><sup>R² = ' + cd.orig.r2.toFixed(6) + '</sup>' }});
+  }}
+
+  var row = document.getElementById('sumrow_' + key);
+  if (row && row.dataset.origHtml !== undefined) {{
+    row.innerHTML = row.dataset.origHtml;
+    row.classList.remove('msd-row-modified');
+  }}
+}}
+
+// Snapshot original summary-row HTML once, so "Reset Calibrators" can restore
+// the exact server-computed values rather than re-deriving them client-side.
+document.querySelectorAll('#summaryTable tbody tr').forEach(function(row) {{
+  row.dataset.origHtml = row.innerHTML;
+}});
+// ── End Live Calibrator Drop ───────────────────────────────────────────────────
+
 </script>
 </body>
 </html>"""
