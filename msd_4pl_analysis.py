@@ -130,7 +130,7 @@ import copy
 import threading, urllib.request
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 
-__version__ = "1.13.0"
+__version__ = "1.14.0"
 
 # ── Auto-update check ─────────────────────────────────────────────────────────
 _GITHUB_REPO  = "aomer92/msd-4pl-analysis"
@@ -2792,7 +2792,8 @@ def generate_html_report(results, html_path, msd_path, units=None,
         if res.get('standards') and fit_trace_idx is not None:
             std_sorted = sorted(res['standards'], key=lambda s: (s['conc'], s['well']))
             cal_rows = ''.join(
-                f"<tr><td>{s['well']}</td><td>{s['conc']:g}</td><td>{s['signal']:,.0f}</td>"
+                f"<tr><td>{s['well']}</td><td class='num'>{s['conc']:g}</td>"
+                f"<td class='num'>{s['signal']:,.0f}</td>"
                 f"<td><input type='checkbox' class='msd-cal-cb' checked "
                 f"data-conc='{s['conc']}' data-signal='{s['signal']}' "
                 f"onchange=\"msdRecomputeCurve('{curve_key}')\"></td></tr>"
@@ -2806,7 +2807,7 @@ def generate_html_report(results, html_path, msd_path, units=None,
                 <button class="msd-reset-btn" onclick="msdResetCurve('{curve_key}')">↺ Reset Calibrators</button>
               </div>
               <table class="msd-cal-table">
-                <thead><tr><th>Well</th><th>Conc</th><th>Signal</th><th>Include</th></tr></thead>
+                <thead><tr><th>Well</th><th class='num'>Conc</th><th class='num'>Signal</th><th>Include</th></tr></thead>
                 <tbody>{cal_rows}</tbody>
               </table>
             </div>"""
@@ -2824,7 +2825,35 @@ def generate_html_report(results, html_path, msd_path, units=None,
                          if a is not None else None),
             }
 
-        return (curve_key, label, chart_html + cal_html, raw_entry)
+        # A card should answer "is this curve usable?" on its own, instead of
+        # sending the reader back to the Summary table to cross-reference.
+        _r2v = res.get('r2')
+        if res['params'] is None:
+            _st_label, _st_cls = 'Failed', 'status-fail'
+        elif _r2v is None or not np.isfinite(_r2v):
+            _st_label, _st_cls = 'Poor', 'status-fail'
+        elif _r2v >= R2_GOOD:
+            _st_label, _st_cls = 'Good', 'status-good'
+        elif _r2v >= R2_ACCEPTABLE:
+            _st_label, _st_cls = 'Acceptable', 'status-warn'
+        elif _r2v < 0:
+            _st_label, _st_cls = 'Negative R²', 'status-fail'
+        else:
+            _st_label, _st_cls = 'Poor', 'status-fail'
+        _meta = [f'<span class="{_st_cls}">{_st_label}</span>']
+        if _r2v is not None and np.isfinite(_r2v):
+            _meta.append(f'<span class="mono">R² {_r2v:.6f}</span>')
+        _accm = res.get('accuracy')
+        if _accm:
+            _np = len(_accm['levels']) - _accm['n_failed']
+            _meta.append(f'<span class="mono">{_np}/{len(_accm["levels"])} cal in tol</span>')
+            if _accm['lloq'] is not None:
+                _meta.append(f'<span class="mono">range {_accm["lloq"]:.4g}\u2013{_accm["uloq"]:.4g}</span>')
+        for _fl in (res.get('flags') or []):
+            _meta.append(f'<span class="status-warn">{_fl}</span>')
+        meta_html = '<div class="curve-card-meta">' + ''.join(_meta) + '</div>'
+
+        return (curve_key, label, meta_html + chart_html + cal_html, raw_entry)
 
     with ThreadPoolExecutor() as _pool:
         curve_divs = list(_pool.map(_build_curve_div, results))
@@ -2839,8 +2868,13 @@ def generate_html_report(results, html_path, msd_path, units=None,
     # ── Overlay figure ────────────────────────────────────────────────────────
     import json as _json
     overlay_fig = go.Figure()
-    colors = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd',
-              '#8c564b', '#e377c2', '#7f7f7f', '#bcbd22', '#17becf']
+    # Fixed-order categorical palette (worst adjacent-pair CVD ΔE 9.1 light /
+    # 8.4 dark, OKLab x100). Assigned in order and never cycled: a 9th group
+    # takes a neutral and relies on its legend label rather than on a hue
+    # recycled from group 1, which would read as the same series.
+    colors = ['#2a78d6', '#eb6834', '#1baf7a', '#eda100',
+              '#e87ba4', '#008300', '#4a3aa7', '#e34948']
+    OTHER_COLOR = '#82868f'
     _group_trace_indices = defaultdict(list)        # group → [trace indices] for toggle buttons
     _overlay_sample_indices_by_group = defaultdict(list)  # group → sample trace indices only
 
@@ -2853,7 +2887,8 @@ def generate_html_report(results, html_path, msd_path, units=None,
             continue
         g = res.get('group', '') or ''
         if g not in _group_color_map:
-            _group_color_map[g] = colors[_col_idx % len(colors)]
+            _group_color_map[g] = (colors[_col_idx] if _col_idx < len(colors)
+                                   else OTHER_COLOR)
             _col_idx += 1
 
     _overlay_x_vals = []   # accumulated during first pass; avoids a second iteration
@@ -2871,7 +2906,8 @@ def generate_html_report(results, html_path, msd_path, units=None,
         y_fit = list(y_fit)
         plate, spot, group = res['plate'], res['spot'], res.get('group', '')
         trace_label = f"P{plate} S{spot}" + (f" {group}" if group else "")
-        color = _group_color_map.get(group, colors[i % len(colors)])
+        color = _group_color_map.get(group,
+                                     colors[i] if i < len(colors) else OTHER_COLOR)
         _group_trace_indices[group or ''].append(len(overlay_fig.data))
         _overlay_curve_key = f"p{plate}_s{spot}_{group or 'default'}"
         if _overlay_curve_key in curve_raw_data:
@@ -3193,13 +3229,66 @@ def generate_html_report(results, html_path, msd_path, units=None,
 
         curve_key = f"p{plate}_s{spot}_{group or 'default'}"
         summary_rows_html.append(
-            f"<tr id='sumrow_{curve_key}'><td>{plate}</td><td>{spot}</td><td>{group}</td>"
-            f"<td>{a}</td><td>{b}</td><td>{c}</td><td>{d}</td>"
-            f"<td>{lloq_sig_disp}</td><td>{lloq_conc_disp}</td>"
-            f"<td>{acc_lloq}</td><td>{acc_uloq}</td>"
-            f"<td class='{cal_class}'>{cal_pass}</td><td>{r2}</td>"
-            f"<td>{flags}</td><td class='{status_class}'>{status}</td></tr>"
+            f"<tr id='sumrow_{curve_key}'>"
+            f"<td class='num'>{plate}</td><td class='num'>{spot}</td><td>{group}</td>"
+            f"<td class='num'>{a}</td><td class='num'>{b}</td>"
+            f"<td class='num'>{c}</td><td class='num'>{d}</td>"
+            f"<td class='num'>{lloq_sig_disp}</td><td class='num'>{lloq_conc_disp}</td>"
+            f"<td class='num'>{acc_lloq}</td><td class='num'>{acc_uloq}</td>"
+            f"<td class='num'><span class='{cal_class}'>{cal_pass}</span></td>"
+            f"<td class='num'>{r2}</td>"
+            f"<td class='flag-cell'>{flags}</td>"
+            f"<td><span class='{status_class}'>{status}</span></td></tr>"
         )
+
+    # ── Run summary tiles ─────────────────────────────────────────────────────
+    # A run is judged by a handful of numbers; surfacing them means not having to
+    # read a 12-row table to find out whether the plate set is usable.
+    _n_curves = len(results)
+    _r2s = [r['r2'] for r in results
+            if r.get('r2') is not None and np.isfinite(r['r2'])]
+    _n_good = sum(1 for r in _r2s if r >= R2_GOOD)
+    _n_accept = sum(1 for r in _r2s if R2_ACCEPTABLE <= r < R2_GOOD)
+    _n_poor = _n_curves - _n_good - _n_accept
+    _flagged = sum(1 for r in results if r.get('flags'))
+    _accs = [r['accuracy'] for r in results if r.get('accuracy')]
+    _cal_total = sum(len(a['levels']) for a in _accs)
+    _cal_pass = _cal_total - sum(a['n_failed'] for a in _accs)
+
+    def _tile(label, value, sub='', cls=''):
+        cls_attr = f" {cls}" if cls else ''
+        sub_html = f'<div class="kpi-sub">{sub}</div>' if sub else ''
+        return (f'<div class="kpi"><div class="kpi-label">{label}</div>'
+                f'<div class="kpi-value{cls_attr}">{value}</div>{sub_html}</div>')
+
+    _tiles = [_tile('Curves', _n_curves,
+                    f'{len(set(r["plate"] for r in results))} plate(s)')]
+    if _r2s:
+        _mean_r2 = float(np.mean(_r2s))
+        _tiles.append(_tile('Mean R²', f'{_mean_r2:.4f}', 'across fitted curves',
+                            'is-good' if _mean_r2 >= R2_GOOD
+                            else 'is-warn' if _mean_r2 >= R2_ACCEPTABLE else 'is-bad'))
+    _tiles.append(_tile('Curve status', f'{_n_good}/{_n_curves}',
+                        f'good · {_n_accept} acceptable · {_n_poor} poor',
+                        'is-good' if _n_good == _n_curves
+                        else 'is-bad' if _n_poor else 'is-warn'))
+    if _cal_total:
+        _pct = _cal_pass / _cal_total * 100.0
+        _tiles.append(_tile('Calibrators in tolerance', f'{_cal_pass}/{_cal_total}',
+                            f'{_pct:.0f}% within \u00b120% (\u00b125% at range ends)',
+                            'is-good' if _pct == 100 else 'is-warn' if _pct >= 80 else 'is-bad'))
+    _tiles.append(_tile('Curves flagged', _flagged,
+                        'see Flags column' if _flagged else 'none',
+                        'is-good' if _flagged == 0 else 'is-warn'))
+    if qc_summary_rows:
+        _recs = [q['recovery'] for q in qc_summary_rows if np.isfinite(q['recovery'])]
+        if _recs:
+            _in_range = sum(1 for r in _recs
+                            if QC_RECOVERY_LOW <= r <= QC_RECOVERY_HIGH)
+            _tiles.append(_tile('QC recovery', f'{_in_range}/{len(_recs)}',
+                                f'within {QC_RECOVERY_LOW:.0f}\u2013{QC_RECOVERY_HIGH:.0f}%',
+                                'is-good' if _in_range == len(_recs) else 'is-bad'))
+    kpi_row_html = '<div class="kpi-row">' + ''.join(_tiles) + '</div>'
 
     # ── QC Recovery table HTML ────────────────────────────────────────────────
     qc_table_html = ''
@@ -3235,7 +3324,7 @@ def generate_html_report(results, html_path, msd_path, units=None,
       <thead><tr>
         <th onclick="sortTable(this)">Sample Name</th>
         <th onclick="sortTable(this)">Level</th>
-        <th onclick="sortTable(this)">Plate</th>
+        <th class="num" onclick="sortTable(this)">Plate</th>
         <th onclick="sortTable(this)">Group</th>
         <th onclick="sortTable(this)">Avg Signal</th>
         <th onclick="sortTable(this)">{qc_hdr}</th>
@@ -3563,129 +3652,332 @@ def generate_html_report(results, html_path, msd_path, units=None,
 <title>MSD 4PL Analysis Report</title>
 <script src="plotly.min.js"></script>
 <style>
+  /* ── Design tokens ──────────────────────────────────────────────────────────
+     Every colour in this report resolves to one of these. Dark mode restates
+     the same roles for the dark surface rather than inverting the light values,
+     and the data colours below are a validated palette (adjacent-pair CVD
+     ΔE ≥ 8.4 in both modes) rather than plotly's defaults. */
+  :root {{
+    color-scheme: light;
+    --plane:        #f4f5f7;   /* page behind the cards */
+    --surface:      #ffffff;   /* card / table surface */
+    --surface-2:    #f7f8fa;   /* zebra stripe, table head on cards */
+    --brand:        #3a506b;   /* established report navy */
+    --brand-dark:   #2e3f52;
+    --brand-accent: #7ba7bc;
+    --ink:          #14161a;
+    --ink-2:        #52565e;
+    --ink-muted:    #82868f;
+    --rule:         #e3e5ea;   /* hairline */
+    --rule-strong:  #ccd0d8;
+    --focus:        rgba(58,80,107,0.35);
+    --shadow:       0 1px 2px rgba(16,20,30,0.06), 0 2px 8px rgba(16,20,30,0.05);
+    --shadow-sticky:0 2px 10px rgba(16,20,30,0.12);
+    /* status — fixed roles, never reused as a series colour */
+    --good:         #0f7a30;
+    --good-bg:      #e7f4ea;
+    --warn:         #8a5a00;
+    --warn-bg:      #fdf2dc;
+    --bad:          #b3261e;
+    --bad-bg:       #fbe9e7;
+    --modified-bg:  #fff8e1;
+    /* categorical data colours (fixed order, never cycled) */
+    --series-1: #2a78d6; --series-2: #eb6834; --series-3: #1baf7a; --series-4: #eda100;
+    --series-5: #e87ba4; --series-6: #008300; --series-7: #4a3aa7; --series-8: #e34948;
+    --series-other: #82868f;
+    /* sequential ramp — one hue, light → dark */
+    --seq-0: #cde2fb; --seq-1: #9ec5f4; --seq-2: #5598e7; --seq-3: #2a78d6;
+    --seq-4: #256abf; --seq-5: #184f95; --seq-6: #0d366b;
+    --grid:         #e1e0d9;
+  }}
+  /* Dark values are declared twice on purpose: the media query follows the OS
+     setting, the data-theme scope follows the in-page toggle, and the toggle
+     must win in both directions. */
+  @media (prefers-color-scheme: dark) {{
+    :root:not([data-theme="light"]) {{
+      color-scheme: dark;
+      --plane:        #0d0d0f;
+      --surface:      #17171a;
+      --surface-2:    #1f1f23;
+      --brand:        #1f2b3a;
+      --brand-dark:   #161f2b;
+      --brand-accent: #7ba7bc;
+      --ink:          #f2f3f5;
+      --ink-2:        #b8bcc4;
+      --ink-muted:    #898d96;
+      --rule:         #2c2c31;
+      --rule-strong:  #3a3a41;
+      --focus:        rgba(123,167,188,0.45);
+      --shadow:       0 1px 2px rgba(0,0,0,0.5), 0 2px 8px rgba(0,0,0,0.35);
+      --shadow-sticky:0 2px 12px rgba(0,0,0,0.6);
+      --good:         #3ecf6a;  --good-bg: #10301a;
+      --warn:         #f0b429;  --warn-bg: #332708;
+      --bad:          #ff7b72;  --bad-bg:  #35150f;
+      --modified-bg:  #2e2612;
+      --series-1: #3987e5; --series-2: #d95926; --series-3: #199e70; --series-4: #c98500;
+      --series-5: #d55181; --series-6: #008300; --series-7: #9085e9; --series-8: #e66767;
+      --series-other: #898d96;
+      --seq-0: #0d366b; --seq-1: #184f95; --seq-2: #256abf; --seq-3: #2a78d6;
+      --seq-4: #5598e7; --seq-5: #9ec5f4; --seq-6: #cde2fb;
+      --grid:         #2c2c2a;
+    }}
+  }}
+  :root[data-theme="dark"] {{
+  color-scheme: dark;
+  --plane:        #0d0d0f;
+  --surface:      #17171a;
+  --surface-2:    #1f1f23;
+  --brand:        #1f2b3a;
+  --brand-dark:   #161f2b;
+  --brand-accent: #7ba7bc;
+  --ink:          #f2f3f5;
+  --ink-2:        #b8bcc4;
+  --ink-muted:    #898d96;
+  --rule:         #2c2c31;
+  --rule-strong:  #3a3a41;
+  --focus:        rgba(123,167,188,0.45);
+  --shadow:       0 1px 2px rgba(0,0,0,0.5), 0 2px 8px rgba(0,0,0,0.35);
+  --shadow-sticky:0 2px 12px rgba(0,0,0,0.6);
+  --good:         #3ecf6a;  --good-bg: #10301a;
+  --warn:         #f0b429;  --warn-bg: #332708;
+  --bad:          #ff7b72;  --bad-bg:  #35150f;
+  --modified-bg:  #2e2612;
+  --series-1: #3987e5; --series-2: #d95926; --series-3: #199e70; --series-4: #c98500;
+  --series-5: #d55181; --series-6: #008300; --series-7: #9085e9; --series-8: #e66767;
+  --series-other: #898d96;
+  --seq-0: #0d366b; --seq-1: #184f95; --seq-2: #256abf; --seq-3: #2a78d6;
+  --seq-4: #5598e7; --seq-5: #9ec5f4; --seq-6: #cde2fb;
+  --grid:         #2c2c2a;
+  }}
+
   * {{ box-sizing: border-box; margin: 0; padding: 0; }}
-  body {{ font-family: Arial, sans-serif; font-size: 13px; background: #f0f2f5; color: #222; }}
-  .header {{ background: #3a506b; color: white; padding: 18px 28px; }}
-  .header h1 {{ font-size: 22px; font-weight: bold; letter-spacing: 0.5px; }}
-  .header p {{ font-size: 12px; opacity: 0.8; margin-top: 4px; }}
-  .header .accent {{ height: 3px; background: #7ba7bc; margin-top: 10px; border-radius: 2px; }}
-  .tabs {{ display: flex; background: #2e3f52; padding: 0 20px; }}
-  .tab-btn {{ padding: 12px 22px; cursor: pointer; color: #c5d5e8; border: none;
-              background: none; font-size: 13px; font-weight: 500;
-              border-bottom: 3px solid transparent; }}
-  .tab-btn:hover {{ color: white; }}
-  .tab-btn.active {{ color: white; border-bottom-color: #7ba7bc; }}
-  .content {{ padding: 24px 28px; max-width: 1400px; margin: 0 auto; }}
+  body {{ font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+          font-size: 13px; background: var(--plane); color: var(--ink);
+          -webkit-font-smoothing: antialiased; }}
+
+  /* ── Header + tab bar: both stick, so navigation survives a long scroll ── */
+  .topbar {{ position: sticky; top: 0; z-index: 40; box-shadow: var(--shadow-sticky); }}
+  .header {{ background: var(--brand); color: #fff; padding: 14px 28px 12px; }}
+  .header h1 {{ font-size: 19px; font-weight: 600; letter-spacing: 0.2px; }}
+  .header p {{ font-size: 12px; opacity: 0.78; margin-top: 3px; }}
+  .header .accent {{ height: 2px; background: var(--brand-accent); margin-top: 9px;
+                     border-radius: 2px; opacity: 0.55; }}
+  .tabs {{ display: flex; background: var(--brand-dark); padding: 0 20px;
+           overflow-x: auto; scrollbar-width: none; }}
+  .tabs::-webkit-scrollbar {{ display: none; }}
+  .tab-btn {{ padding: 11px 20px; cursor: pointer; color: #c5d5e8; border: none;
+              background: none; font-size: 13px; font-weight: 500; white-space: nowrap;
+              border-bottom: 3px solid transparent; font-family: inherit; }}
+  .tab-btn:hover {{ color: #fff; }}
+  .tab-btn.active {{ color: #fff; border-bottom-color: var(--brand-accent); }}
+  .tab-btn:focus-visible, .export-btn:focus-visible, .excel-btn:focus-visible,
+  .sp-btn:focus-visible, .filter-input:focus-visible {{
+    outline: 2px solid var(--brand-accent); outline-offset: 2px; }}
+
+  .content {{ padding: 22px 28px 40px; max-width: 1560px; margin: 0 auto; }}
   .tab-pane {{ display: none; }}
   .tab-pane.active {{ display: block; }}
-  .filter-row {{ margin-bottom: 8px; }}
-  .filter-input {{ padding: 6px 12px; border: 1px solid #c8d5e8; border-radius: 6px;
-                   font-size: 13px; width: 280px; outline: none; background: #fafcff; }}
-  .filter-input:focus {{ border-color: #3a506b; box-shadow: 0 0 0 2px rgba(58,80,107,0.12); }}
-  .table-wrap {{ overflow-x: auto; margin-bottom: 24px; }}
-  .data-table {{ border-collapse: collapse; width: 100%; background: white;
-                  box-shadow: 0 1px 4px rgba(0,0,0,0.08); border-radius: 4px; }}
-  .data-table th {{ background: #2F5496; color: white; padding: 9px 12px;
-                    text-align: left; cursor: pointer; white-space: nowrap; user-select: none; }}
-  .data-table th:hover {{ background: #3a65b5; }}
-  .data-table th.sort-asc::after {{ content: ' ▲'; font-size: 10px; }}
-  .data-table th.sort-desc::after {{ content: ' ▼'; font-size: 10px; }}
-  .data-table td {{ padding: 7px 12px; border-bottom: 1px solid #e8edf3; vertical-align: middle; }}
-  .data-table tr:hover td {{ background: #f5f8ff; }}
+
+  /* ── Run summary tiles ── */
+  .kpi-row {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+              gap: 12px; margin-bottom: 20px; }}
+  .kpi {{ background: var(--surface); border: 1px solid var(--rule); border-radius: 8px;
+          padding: 12px 14px; box-shadow: var(--shadow); }}
+  .kpi-label {{ font-size: 11px; color: var(--ink-muted); text-transform: uppercase;
+                letter-spacing: 0.6px; font-weight: 600; }}
+  .kpi-value {{ font-size: 23px; font-weight: 600; margin-top: 4px; line-height: 1.15;
+                color: var(--ink); }}
+  .kpi-sub {{ font-size: 11px; color: var(--ink-2); margin-top: 3px; }}
+  .kpi-value.is-good {{ color: var(--good); }}
+  .kpi-value.is-warn {{ color: var(--warn); }}
+  .kpi-value.is-bad  {{ color: var(--bad); }}
+
+  .filter-row {{ margin-bottom: 10px; }}
+  .filter-input {{ padding: 7px 12px; border: 1px solid var(--rule-strong); border-radius: 7px;
+                   font-size: 13px; width: 300px; outline: none; background: var(--surface);
+                   color: var(--ink); font-family: inherit; }}
+  .filter-input:focus {{ border-color: var(--brand-accent);
+                         box-shadow: 0 0 0 3px var(--focus); }}
+
+  /* ── Tables ── */
+  .table-wrap {{ overflow-x: auto; margin-bottom: 24px; border-radius: 8px;
+                 border: 1px solid var(--rule); box-shadow: var(--shadow); }}
+  .data-table {{ border-collapse: separate; border-spacing: 0; width: 100%;
+                 background: var(--surface); font-variant-numeric: tabular-nums; }}
+  .data-table th {{ background: var(--brand); color: #fff; padding: 9px 12px;
+                    text-align: left; cursor: pointer; white-space: nowrap; user-select: none;
+                    font-weight: 600; font-size: 12px; }}
+  /* Only a wrapper that scrolls vertically can pin its own header row. */
+  .table-wrap.tall {{ max-height: calc(100vh - var(--topbar-h, 0px) - 150px); overflow-y: auto; }}
+  .table-wrap.tall .data-table th {{ position: sticky; top: 0; z-index: 2; }}
+  .data-table th:hover {{ background: var(--brand-dark); }}
+  .data-table th.sort-asc::after {{ content: ' ▲'; font-size: 9px; }}
+  .data-table th.sort-desc::after {{ content: ' ▼'; font-size: 9px; }}
+  .data-table td {{ padding: 7px 12px; border-bottom: 1px solid var(--rule);
+                    vertical-align: middle; color: var(--ink); }}
+  .data-table tbody tr:nth-child(even) td {{ background: var(--surface-2); }}
+  .data-table tbody tr:hover td {{ background: color-mix(in srgb, var(--brand-accent) 14%, var(--surface)); }}
   .data-table tr:last-child td {{ border-bottom: none; }}
-  .status-good {{ color: #006100; font-weight: 500; }}
-  .status-warn {{ color: #9C5700; font-weight: 500; }}
-  .status-fail {{ color: #9C0006; font-weight: 500; }}
-  .cv-bad {{ background: #F8CBAD; }}
+  /* Numeric columns are right-aligned so magnitudes line up digit-for-digit. */
+  .data-table td.num, .data-table th.num {{ text-align: right; }}
+
+  /* Status reads as a pill, not bare coloured text, and always carries its label. */
+  .status-good, .status-warn, .status-fail {{
+    display: inline-block; padding: 2px 9px; border-radius: 11px;
+    font-size: 11px; font-weight: 600; white-space: nowrap; }}
+  .status-good {{ color: var(--good); background: var(--good-bg); }}
+  .status-warn {{ color: var(--warn); background: var(--warn-bg); }}
+  .status-fail {{ color: var(--bad);  background: var(--bad-bg);  }}
+  td.flag-cell {{ color: var(--ink-2); font-size: 11.5px; max-width: 260px;
+                  white-space: normal; line-height: 1.4; }}
+  .cv-bad {{ background: var(--bad-bg) !important; color: var(--bad); font-weight: 600; }}
   .msd-excl-cell {{ text-align: center; }}
-  .msd-excl-cb {{ cursor: pointer; width: 15px; height: 15px; }}
-  tr.msd-row-excluded td {{ opacity: 0.45; text-decoration: line-through; }}
+  .msd-excl-cb {{ cursor: pointer; width: 15px; height: 15px; accent-color: var(--brand); }}
+  tr.msd-row-excluded td {{ opacity: 0.4; text-decoration: line-through; }}
   tr.msd-row-excluded .msd-excl-cell {{ opacity: 1; text-decoration: none; }}
-  .curves-grid {{ display: grid; grid-template-columns: repeat(auto-fill, minmax(520px, 1fr)); gap: 20px; }}
+  tr.msd-row-modified td {{ background: var(--modified-bg) !important; }}
+  tr.msd-row-modified td:last-child::after {{ content: ' *'; color: var(--warn); font-weight: 700; }}
+
+  /* ── Cards & sections ── */
+  .curves-grid {{ display: grid; grid-template-columns: repeat(auto-fill, minmax(520px, 1fr)); gap: 18px; }}
+  .curve-card {{ background: var(--surface); border: 1px solid var(--rule); border-radius: 10px;
+                 box-shadow: var(--shadow); padding: 14px 16px; }}
+  .curve-card h3 {{ font-size: 13px; color: var(--ink); margin-bottom: 4px; font-weight: 600; }}
+  .curve-card-meta {{ display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+                      margin-bottom: 10px; font-size: 11.5px; color: var(--ink-2); }}
+  .curve-card-meta .mono {{ font-variant-numeric: tabular-nums; }}
+  .section {{ background: var(--surface); border: 1px solid var(--rule); border-radius: 10px;
+              box-shadow: var(--shadow); padding: 18px; margin-bottom: 24px; }}
+  h2 {{ font-size: 15px; color: var(--ink); margin: 22px 0 12px; font-weight: 600;
+        letter-spacing: 0.1px; }}
+  .tab-pane > h2:first-child {{ margin-top: 4px; }}
+  .hint {{ font-size: 12px; color: var(--ink-2); margin: -6px 0 12px; }}
+
   .export-bar {{ display: flex; justify-content: flex-end; margin-bottom: 10px; }}
-  .export-btn {{ padding: 8px 18px; background: #3a506b; color: white; border: none;
-                 border-radius: 4px; font-size: 13px; cursor: pointer; font-weight: 500; }}
-  .export-btn:hover {{ background: #2e3f52; }}
-  .excel-btn {{ padding: 8px 18px; background: #1e6b3c; color: white; border: none;
-                border-radius: 4px; font-size: 13px; cursor: pointer; font-weight: 500;
-                text-decoration: none; display: inline-block; }}
-  .excel-btn:hover {{ background: #155230; }}
+  .export-btn, .excel-btn {{ padding: 7px 15px; border: none; border-radius: 7px;
+                 font-size: 12.5px; cursor: pointer; font-weight: 600; font-family: inherit;
+                 text-decoration: none; display: inline-block; color: #fff; }}
+  .export-btn {{ background: rgba(255,255,255,0.14); }}
+  .export-btn:hover {{ background: rgba(255,255,255,0.24); }}
+  .excel-btn {{ background: #1e6b3c; }}
+  .excel-btn:hover {{ background: #175530; }}
+  .theme-btn {{ background: rgba(255,255,255,0.14); color: #fff; border: none;
+                border-radius: 7px; padding: 7px 11px; cursor: pointer; font-size: 13px;
+                line-height: 1; font-family: inherit; }}
+  .theme-btn:hover {{ background: rgba(255,255,255,0.24); }}
+
+  .curve-toggle-btn {{ padding: 4px 12px; border: none; border-radius: 6px; cursor: pointer;
+                       font-size: 11.5px; font-weight: 600; background: var(--series-3);
+                       color: #fff; margin-bottom: 6px; display: inline-block;
+                       font-family: inherit; }}
+  .curve-toggle-btn:hover {{ filter: brightness(0.92); }}
+  .msd-cal-wrap {{ margin-top: 10px; border-top: 1px solid var(--rule); padding-top: 8px; }}
+  .msd-live-row {{ display: flex; align-items: center; gap: 10px; margin-bottom: 6px; min-height: 20px; }}
+  .msd-live-r2 {{ font-size: 12px; font-weight: 600; color: var(--ink); font-variant-numeric: tabular-nums; }}
+  .msd-live-status {{ font-size: 11px; font-weight: 600; padding: 2px 9px; border-radius: 11px; }}
+  .msd-reset-btn {{ margin-left: auto; font-size: 11px; padding: 3px 10px;
+                     border: 1px solid var(--rule-strong); border-radius: 6px;
+                     background: var(--surface); color: var(--ink-2); cursor: pointer;
+                     font-family: inherit; }}
+  .msd-reset-btn:hover {{ background: var(--surface-2); color: var(--ink); }}
+  .msd-cal-table {{ width: 100%; border-collapse: collapse; font-size: 11px; max-height: 160px;
+                     display: block; overflow-y: auto; font-variant-numeric: tabular-nums; }}
+  .msd-cal-table thead, .msd-cal-table tbody {{ display: table; width: 100%; table-layout: fixed; }}
+  .msd-cal-table th {{ position: sticky; top: 0; background: var(--surface-2); text-align: left;
+                        padding: 4px 6px; font-weight: 600; color: var(--ink-2); }}
+  .msd-cal-table td {{ padding: 3px 6px; border-top: 1px solid var(--rule); color: var(--ink); }}
+  .msd-cal-table td.num, .msd-cal-table th.num {{ text-align: right; }}
+  .msd-cal-table input[type=checkbox] {{ accent-color: var(--brand); }}
+  .msd-cal-table tr.msd-cal-excluded td {{ opacity: 0.4; text-decoration: line-through; }}
+
+  /* ── Heatmaps ── */
+  .hm-grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 14px; }}
+  .hm-cell {{ background: var(--surface); border: 1px solid var(--rule); border-radius: 10px;
+              box-shadow: var(--shadow); padding: 8px; }}
+  .hm-scalebar {{ display: flex; align-items: center; gap: 10px; margin-bottom: 14px;
+                  flex-wrap: wrap; font-size: 12px; color: var(--ink-2); }}
+  .hm-ramp {{ height: 12px; width: 220px; border-radius: 6px; border: 1px solid var(--rule);
+              background: linear-gradient(to right, var(--seq-0), var(--seq-2), var(--seq-4), var(--seq-6)); }}
+  .hm-ramp-end {{ font-variant-numeric: tabular-nums; color: var(--ink); font-weight: 600; }}
+
+  /* ── Sample plots ── */
+  .sp-panel {{ background: var(--surface); border: 1px solid var(--rule); border-radius: 10px;
+               box-shadow: var(--shadow); padding: 14px; }}
+  .sp-drop-zone {{ min-height:80px; border:2px dashed var(--rule-strong); border-radius:8px;
+                   padding:6px; display:flex; flex-wrap:wrap; gap:4px; align-content:flex-start;
+                   transition:background 0.15s; }}
+  .sp-drop-zone.drag-over {{ background: color-mix(in srgb, var(--brand-accent) 20%, var(--surface));
+                             border-color: var(--brand); }}
+  .sp-chip {{ display:inline-flex; align-items:center; gap:4px; padding:3px 8px; border-radius:12px;
+              font-size:11px; cursor:grab; user-select:none; border:1px solid var(--rule-strong);
+              background: var(--surface); color: var(--ink); }}
+  .sp-chip.flagged {{ border-color: var(--bad); color: var(--bad); }}
+  .sp-chip.sp-chip-excluded {{ opacity:0.5; background: var(--surface-2); }}
+  .sp-chip.sp-chip-excluded span {{ text-decoration:line-through; }}
+  .sp-chip input[type=checkbox] {{ cursor:pointer; margin:0; accent-color: var(--brand); }}
+  .sp-chip-exclude-btn {{ border:none; background:transparent; cursor:pointer; font-size:11px;
+                          line-height:1; padding:0 1px; color: var(--ink-muted); flex-shrink:0; }}
+  .sp-chip-exclude-btn:hover {{ color: var(--bad); }}
+  .sp-chip-excluded .sp-chip-exclude-btn {{ color: var(--brand); }}
+  .sp-chip-excluded .sp-chip-exclude-btn:hover {{ color: var(--brand-dark); }}
+  .sp-group-block {{ margin-bottom:10px; border-radius:8px; overflow:hidden; border:1px solid var(--rule); }}
+  .sp-group-header {{ display:flex; align-items:center; gap:6px; padding:6px 10px; font-size:12px;
+                      font-weight:600; color:#fff; }}
+  .sp-group-drop {{ min-height:36px; padding:6px; display:flex; flex-wrap:wrap; gap:4px;
+                    align-content:flex-start; }}
+  .sp-btn {{ padding:5px 12px; border:1px solid var(--rule-strong); border-radius:6px; cursor:pointer;
+             font-size:12px; background: var(--surface); color: var(--ink); font-family: inherit; }}
+  .sp-btn:hover {{ background: var(--surface-2); }}
+  .sp-btn-primary {{ background: var(--brand); color:#fff; border-color: var(--brand); }}
+  .sp-btn-primary:hover {{ background: var(--brand-dark); }}
+  .sp-btn-icon {{ padding:3px 7px; font-size:11px; border-radius:5px; }}
+  .sp-sort-btn {{ background: var(--surface); }}
+  .active-sort {{ background: var(--brand) !important; color:#fff !important;
+                  border-color: var(--brand) !important; }}
+  .sp-analyte-btn {{ padding:6px 16px; border:1px solid var(--rule-strong); border-radius:7px;
+                     cursor:pointer; font-size:12.5px; font-weight:500; background: var(--surface);
+                     color: var(--ink); font-family: inherit; }}
+  .sp-analyte-btn.active {{ background: var(--brand); color:#fff; border-color: var(--brand); }}
+  .sp-subtab-btn {{ padding:8px 18px; border:none; border-bottom:2px solid transparent;
+                    background:transparent; cursor:pointer; font-size:13px; font-weight:500;
+                    color: var(--ink-2); margin-bottom:-2px; font-family: inherit; }}
+  .sp-subtab-btn:hover {{ color: var(--ink); }}
+  .sp-subtab-active {{ color: var(--brand-accent) !important;
+                       border-bottom-color: var(--brand-accent) !important; font-weight:600 !important; }}
+  .sp-autogroup-bar {{ display:flex; gap:8px; align-items:center; margin-bottom:14px; flex-wrap:wrap;
+                       background: var(--surface-2); border:1px solid var(--rule); border-radius:8px;
+                       padding:8px 12px; }}
+  .sp-autogroup-sel {{ font-size:12px; padding:4px 8px; border:1px solid var(--rule-strong);
+                       border-radius:6px; background: var(--surface); color: var(--ink);
+                       cursor:pointer; font-family: inherit; }}
+  .sp-autogroup-sel:disabled {{ opacity:0.45; cursor:not-allowed; }}
+  .sp-autogroup-sel option:disabled {{ color: var(--ink-muted); }}
+
+  @media (max-width: 720px) {{
+    .content {{ padding: 16px; }}
+    .curves-grid {{ grid-template-columns: 1fr; }}
+    .filter-input {{ width: 100%; }}
+  }}
+
   @media print {{
-    .tabs, .export-bar {{ display: none !important; }}
+    .tabs, .export-bar, .theme-btn, .filter-row {{ display: none !important; }}
     .tab-pane {{ display: block !important; page-break-inside: avoid; }}
     .tab-pane + .tab-pane {{ page-break-before: always; }}
-    body {{ background: white; font-size: 11px; }}
+    body {{ background: #fff; font-size: 11px; }}
+    .header {{ position: static; }}
     .content {{ max-width: 100%; padding: 10px; }}
-    .data-table th {{ background: #2F5496 !important; -webkit-print-color-adjust: exact; print-color-adjust: exact; }}
-    .curve-card {{ box-shadow: none; border: 1px solid #ccc; }}
-    .section {{ box-shadow: none; border: 1px solid #ccc; }}
+    .data-table th {{ background: #3a506b !important; color: #fff !important;
+                      position: static; -webkit-print-color-adjust: exact; print-color-adjust: exact; }}
+    .table-wrap.tall {{ max-height: none; overflow: visible; }}
+    .topbar {{ position: static; box-shadow: none; }}
+    .curve-card, .section, .hm-cell, .kpi {{ box-shadow: none; border: 1px solid #ccc; }}
     .header {{ -webkit-print-color-adjust: exact; print-color-adjust: exact; }}
   }}
-  .curve-card {{ background: white; border-radius: 6px; box-shadow: 0 1px 4px rgba(0,0,0,0.08);
-                  padding: 16px; }}
-  .curve-card h3 {{ font-size: 13px; color: #3a506b; margin-bottom: 10px; font-weight: 600; }}
-  h2 {{ font-size: 16px; color: #3a506b; margin: 20px 0 12px; font-weight: 700; }}
-  .section {{ background: white; border-radius: 6px; box-shadow: 0 1px 4px rgba(0,0,0,0.08);
-               padding: 20px; margin-bottom: 24px; }}
-  .curve-toggle-btn {{ padding: 5px 14px; border: none; border-radius: 4px; cursor: pointer;
-                       font-size: 12px; font-weight: 600; background: #27AE60; color: white;
-                       margin-bottom: 6px; display: inline-block; }}
-  .curve-toggle-btn:hover {{ background: #1e8449; }}
-  .msd-cal-wrap {{ margin-top: 10px; border-top: 1px solid #e5e5e5; padding-top: 8px; }}
-  .msd-live-row {{ display: flex; align-items: center; gap: 10px; margin-bottom: 6px; min-height: 20px; }}
-  .msd-live-r2 {{ font-size: 12px; font-weight: 700; color: #3a506b; }}
-  .msd-live-status {{ font-size: 11px; font-weight: 700; padding: 2px 8px; border-radius: 3px; }}
-  .msd-reset-btn {{ margin-left: auto; font-size: 11px; padding: 3px 10px; border: 1px solid #ccc;
-                     border-radius: 4px; background: #f5f5f5; cursor: pointer; }}
-  .msd-reset-btn:hover {{ background: #e8e8e8; }}
-  .msd-cal-table {{ width: 100%; border-collapse: collapse; font-size: 11px; max-height: 160px;
-                     display: block; overflow-y: auto; }}
-  .msd-cal-table thead, .msd-cal-table tbody {{ display: table; width: 100%; table-layout: fixed; }}
-  .msd-cal-table th {{ position: sticky; top: 0; background: #f0f2f5; text-align: left;
-                        padding: 4px 6px; font-weight: 600; }}
-  .msd-cal-table td {{ padding: 3px 6px; border-top: 1px solid #eee; }}
-  .msd-cal-table tr.msd-cal-excluded td {{ opacity: 0.4; text-decoration: line-through; }}
-  tr.msd-row-modified {{ background: #fff8e1; }}
-  tr.msd-row-modified td:last-child::after {{ content: ' *'; color: #9C6500; font-weight: 700; }}
-  .hm-grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(340px, 1fr)); gap: 16px; }}
-  .hm-cell {{ background: white; border-radius: 6px; box-shadow: 0 1px 4px rgba(0,0,0,0.08); padding: 8px; }}
-  .sp-panel {{ background:white;border-radius:6px;box-shadow:0 1px 4px rgba(0,0,0,0.08);padding:14px; }}
-  .sp-drop-zone {{ min-height:80px;border:2px dashed #ccc;border-radius:4px;padding:6px;display:flex;flex-wrap:wrap;gap:4px;align-content:flex-start;transition:background 0.15s; }}
-  .sp-drop-zone.drag-over {{ background:#e8f4fd;border-color:#2F5496; }}
-  .sp-chip {{ display:inline-flex;align-items:center;gap:4px;padding:3px 8px;border-radius:12px;font-size:11px;cursor:grab;user-select:none;border:1px solid rgba(0,0,0,0.15);background:white; }}
-  .sp-chip.flagged {{ border-color:#c0392b;color:#c0392b; }}
-  .sp-chip.sp-chip-excluded {{ opacity:0.5;background:#f2f2f2; }}
-  .sp-chip.sp-chip-excluded span {{ text-decoration:line-through; }}
-  .sp-chip input[type=checkbox] {{ cursor:pointer;margin:0; }}
-  .sp-chip-exclude-btn {{ border:none;background:transparent;cursor:pointer;font-size:11px;line-height:1;padding:0 1px;color:#888;flex-shrink:0; }}
-  .sp-chip-exclude-btn:hover {{ color:#c0392b; }}
-  .sp-chip-excluded .sp-chip-exclude-btn {{ color:#2F5496; }}
-  .sp-chip-excluded .sp-chip-exclude-btn:hover {{ color:#1b3866; }}
-  .sp-group-block {{ margin-bottom:10px;border-radius:6px;overflow:hidden;border:1px solid #ddd; }}
-  .sp-group-header {{ display:flex;align-items:center;gap:6px;padding:6px 10px;font-size:12px;font-weight:600;color:white; }}
-  .sp-group-drop {{ min-height:36px;padding:6px;display:flex;flex-wrap:wrap;gap:4px;align-content:flex-start; }}
-  .sp-btn {{ padding:5px 12px;border:1px solid #ccc;border-radius:4px;cursor:pointer;font-size:12px;background:white;color:#333; }}
-  .sp-btn:hover {{ background:#f0f0f0; }}
-  .sp-btn-primary {{ background:#2F5496;color:white;border-color:#2F5496; }}
-  .sp-btn-primary:hover {{ background:#3a65b5; }}
-  .sp-btn-icon {{ padding:3px 7px;font-size:11px;border-radius:3px; }}
-  .sp-sort-btn {{ background:white; }}
-  .active-sort {{ background:#2F5496 !important;color:white !important;border-color:#2F5496 !important; }}
-  .sp-analyte-btn {{ padding:7px 18px;border:none;border-radius:4px;cursor:pointer;font-size:13px;font-weight:500;background:#dde3ec;color:#333; }}
-  .sp-analyte-btn.active {{ background:#2F5496;color:white; }}
-  .sp-subtab-btn {{ padding:8px 20px;border:none;border-bottom:2px solid transparent;background:transparent;cursor:pointer;font-size:13px;font-weight:500;color:#666;margin-bottom:-2px; }}
-  .sp-subtab-btn:hover {{ color:#2F5496; }}
-  .sp-subtab-active {{ color:#2F5496 !important;border-bottom-color:#2F5496 !important;font-weight:600 !important; }}
-  .sp-autogroup-bar {{ display:flex;gap:8px;align-items:center;margin-bottom:14px;flex-wrap:wrap;
-                       background:#f5f7fb;border:1px solid #e3e8f0;border-radius:6px;padding:8px 12px; }}
-  .sp-autogroup-sel {{ font-size:12px;padding:4px 8px;border:1px solid #c3ccda;border-radius:4px;
-                       background:white;color:#333;cursor:pointer; }}
-  .sp-autogroup-sel:disabled {{ opacity:0.45;cursor:not-allowed; }}
-  .sp-autogroup-sel option:disabled {{ color:#bbb; }}
 </style>
 </head>
 <body>
 
+<div class="topbar">
 <div class="header">
   <h1>MSD 4PL Analysis Report</h1>
   <p>{msd_basename}</p>
@@ -3702,14 +3994,21 @@ def generate_html_report(results, html_path, msd_path, units=None,
   <div style="margin-left:auto;display:flex;align-items:center;gap:8px;padding-right:12px;">
     {excel_btn_html}
     <button class="export-btn" onclick="window.print()">⬇ Export PDF</button>
+    <button class="theme-btn" id="theme-btn" onclick="msdToggleTheme()"
+            title="Toggle light / dark" aria-label="Toggle light or dark theme">◐</button>
   </div>
+</div>
 </div>
 
 <div class="content">
 
   <div id="tab-summary" class="tab-pane active">
+    <h2>Run Summary</h2>
+    {kpi_row_html}
     <h2>Curve Fit Summary</h2>
-    <p style="font-size:12px;color:#555;margin:-8px 0 12px;"><strong>LLOQ Method:</strong> {lloq_method_label}</p>
+    <p class="hint"><strong>LLOQ Method:</strong> {lloq_method_label} &nbsp;·&nbsp;
+       <em>LLOQ Conc</em> is that blank-derived signal read back through the curve;
+       <em>Acc. LLOQ/ULOQ</em> is the range the calibrators themselves reproduce.</p>
     <div class="filter-row">
       <input class="filter-input" type="search" placeholder="🔍  Filter summary…"
              oninput="filterTable(this.value,'summaryTable')">
@@ -3718,18 +4017,18 @@ def generate_html_report(results, html_path, msd_path, units=None,
     <table id="summaryTable" class="data-table">
       <thead><tr>
         <th onclick="sortTable(this)">Plate</th>
-        <th onclick="sortTable(this)">Spot</th>
+        <th class="num" onclick="sortTable(this)">Spot</th>
         <th onclick="sortTable(this)">Group</th>
-        <th onclick="sortTable(this)">Min (a)</th>
-        <th onclick="sortTable(this)">Hill Slope (b)</th>
-        <th onclick="sortTable(this)">EC50 (c)</th>
-        <th onclick="sortTable(this)">Max (d)</th>
-        <th onclick="sortTable(this)" title="Lowest signal distinguishable from blanks, and that signal read back through the curve">LLOQ Signal</th>
-        <th onclick="sortTable(this)">LLOQ Conc</th>
-        <th onclick="sortTable(this)" title="Lowest calibrator that back-calculates within tolerance">Acc. LLOQ</th>
-        <th onclick="sortTable(this)" title="Highest calibrator that back-calculates within tolerance">Acc. ULOQ</th>
-        <th onclick="sortTable(this)" title="Calibrator levels within &plusmn;20% (&plusmn;25% at the range ends)">Cal Pass</th>
-        <th onclick="sortTable(this)">R²</th>
+        <th class="num" onclick="sortTable(this)">Min (a)</th>
+        <th class="num" onclick="sortTable(this)">Hill Slope (b)</th>
+        <th class="num" onclick="sortTable(this)">EC50 (c)</th>
+        <th class="num" onclick="sortTable(this)">Max (d)</th>
+        <th class="num" onclick="sortTable(this)" title="Lowest signal distinguishable from blanks, and that signal read back through the curve">LLOQ Signal</th>
+        <th class="num" onclick="sortTable(this)">LLOQ Conc</th>
+        <th class="num" onclick="sortTable(this)" title="Lowest calibrator that back-calculates within tolerance">Acc. LLOQ</th>
+        <th class="num" onclick="sortTable(this)" title="Highest calibrator that back-calculates within tolerance">Acc. ULOQ</th>
+        <th class="num" onclick="sortTable(this)" title="Calibrator levels within &plusmn;20% (&plusmn;25% at the range ends)">Cal Pass</th>
+        <th class="num" onclick="sortTable(this)">R²</th>
         <th onclick="sortTable(this)">Flags</th>
         <th onclick="sortTable(this)">Status</th>
       </tr></thead>
@@ -3746,7 +4045,7 @@ def generate_html_report(results, html_path, msd_path, units=None,
 
   <div id="tab-curves" class="tab-pane">
     <h2>Standard Curves</h2>
-    <p style="font-size:12px;color:#555;margin:-8px 0 12px;">Uncheck calibrator points below a curve to drop them and re-fit live — R² and Status update here and in the Summary table above.</p>
+    <p class="hint">Uncheck calibrator points below a curve to drop them and re-fit live — R² and Status update here and in the Summary table above.</p>
     <div class="curves-grid">
       {curves_section_html}
     </div>
@@ -3754,10 +4053,21 @@ def generate_html_report(results, html_path, msd_path, units=None,
 
   <div id="tab-heatmap" class="tab-pane">
     <h2>Plate Heatmaps</h2>
-    <p style="font-size:12px;color:#555;margin:-8px 0 12px;">Raw signal and interpolated concentration per well, independent of curve fitting. All plates shown together for live comparison.</p>
-    <div style="display:flex;gap:6px;margin-bottom:14px;">
+    <p class="hint">Raw signal and interpolated concentration per well, independent of curve fitting. All plates share one colour scale so the same colour means the same value on every plate.</p>
+    <div style="display:flex;gap:6px;margin-bottom:10px;">
       <button id="hm-metric-signal" class="sp-subtab-btn sp-subtab-active" onclick="hmSetMetric('signal',this)">Signal</button>
       <button id="hm-metric-conc" class="sp-subtab-btn" onclick="hmSetMetric('conc',this)">Interp. Concentration</button>
+    </div>
+    <div class="hm-scalebar">
+      <span id="hm-scale-toggle" style="display:flex;gap:6px;">
+        <button class="sp-btn sp-btn-icon active-sort" onclick="hmSetShared(true,this)">Shared scale</button>
+        <button class="sp-btn sp-btn-icon" onclick="hmSetShared(false,this)">Per-plate scale</button>
+      </span>
+      <span id="hm-log-toggle" style="display:flex;gap:6px;">
+        <button class="sp-btn sp-btn-icon active-sort" onclick="hmSetLog(true,this)">Log</button>
+        <button class="sp-btn sp-btn-icon" onclick="hmSetLog(false,this)">Linear</button>
+      </span>
+      <span id="hm-scale-legend" style="display:flex;align-items:center;gap:8px;"></span>
     </div>
     <div id="hm-grid" class="hm-grid"></div>
   </div>
@@ -3768,7 +4078,7 @@ def generate_html_report(results, html_path, msd_path, units=None,
       <input class="filter-input" type="search" placeholder="🔍  Filter unknowns…"
              oninput="filterTable(this.value,'unkTable')">
     </div>
-    <div class="table-wrap">
+    <div class="table-wrap tall">
     <table id="unkTable" class="data-table">
       <thead>{unk_hdr_row}</thead>
       <tbody>{''.join(unk_rows_html)}</tbody>
@@ -3943,6 +4253,74 @@ def generate_html_report(results, html_path, msd_path, units=None,
 </div>
 
 <script>
+// Sticky table headers must clear the sticky topbar, whose height depends on how
+// the source filename wraps — so it is measured rather than assumed.
+function msdSyncTopbarHeight() {{
+  var bar = document.querySelector('.topbar');
+  if (!bar) return;
+  document.documentElement.style.setProperty(
+    '--topbar-h', Math.round(bar.getBoundingClientRect().height) + 'px');
+}}
+window.addEventListener('load', msdSyncTopbarHeight);
+window.addEventListener('resize', msdSyncTopbarHeight);
+
+// ── Theme ─────────────────────────────────────────────────────────────────────
+// Plotly figures are given explicit colours at build time, so a CSS-only theme
+// switch would leave every chart on a white card in a dark page. Each toggle
+// therefore restyles the live figures from the same tokens the CSS uses.
+function msdThemeTokens() {{
+  var cs = getComputedStyle(document.documentElement);
+  var get = function(n) {{ return cs.getPropertyValue(n).trim(); }};
+  return {{ surface: get('--surface'), ink: get('--ink'), ink2: get('--ink-2'),
+           muted: get('--ink-muted'), grid: get('--grid') }};
+}}
+
+function msdIsDark() {{
+  var stamp = document.documentElement.getAttribute('data-theme');
+  if (stamp) return stamp === 'dark';
+  return window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches;
+}}
+
+function msdApplyChartTheme() {{
+  if (typeof Plotly === 'undefined') return;
+  var t = msdThemeTokens();
+  document.querySelectorAll('.js-plotly-plot').forEach(function(gd) {{
+    try {{
+      Plotly.relayout(gd, {{
+        paper_bgcolor: t.surface, plot_bgcolor: t.surface,
+        'font.color': t.ink2,
+        'title.font.color': t.ink,
+        'xaxis.gridcolor': t.grid, 'yaxis.gridcolor': t.grid,
+        'xaxis.linecolor': t.grid, 'yaxis.linecolor': t.grid,
+        'xaxis.zerolinecolor': t.grid, 'yaxis.zerolinecolor': t.grid,
+        'xaxis.tickfont.color': t.muted, 'yaxis.tickfont.color': t.muted,
+        'xaxis.title.font.color': t.ink2, 'yaxis.title.font.color': t.ink2,
+        'legend.font.color': t.ink2
+      }});
+    }} catch (e) {{ /* a figure without these axes is fine to skip */ }}
+  }});
+  if (typeof hmChartEntries !== 'undefined' && hmChartEntries.length) hmRenderAll();
+}}
+
+function msdToggleTheme() {{
+  var next = msdIsDark() ? 'light' : 'dark';
+  document.documentElement.setAttribute('data-theme', next);
+  try {{ localStorage.setItem('msdTheme', next); }} catch (e) {{ /* private window */ }}
+  msdApplyChartTheme();
+}}
+
+(function msdInitTheme() {{
+  var saved = null;
+  try {{ saved = localStorage.getItem('msdTheme'); }} catch (e) {{ /* private window */ }}
+  if (saved === 'dark' || saved === 'light') {{
+    document.documentElement.setAttribute('data-theme', saved);
+  }}
+  if (msdIsDark()) {{
+    // Charts are built with light colours; restyle once after Plotly draws them.
+    window.addEventListener('load', msdApplyChartTheme);
+  }}
+}})();
+
 function showTab(name, btn) {{
   document.querySelectorAll('.tab-pane').forEach(p => p.classList.remove('active'));
   document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
@@ -3951,6 +4329,7 @@ function showTab(name, btn) {{
   btn.classList.add('active');
   // Resize all Plotly charts now that their containers are visible
   pane.querySelectorAll('.js-plotly-plot').forEach(el => Plotly.Plots.resize(el));
+  if (msdIsDark()) msdApplyChartTheme();
   if (name === 'sampleplots') spInit();
   if (name === 'qcplots') qpInit();
   if (name === 'heatmap') hmInit();
@@ -5761,7 +6140,65 @@ function hmSetMetric(metric, btn) {{
   hmRenderAll();
 }}
 
+// One colour scale across every plate. Each plate used to autoscale to its own
+// min/max, so two plates whose top wells differ by 23% rendered identically and
+// the side-by-side comparison the tab exists for was misleading.
+var hmShared = true;
+var hmRange = null;
+// Plate signal is strongly skewed — a handful of top standards sit orders of
+// magnitude above the sample wells — so on a linear ramp every sample well
+// lands in the lightest step and the plates stop being distinguishable. A log
+// ramp spreads the low end out, which is where the samples are.
+var hmLog = true;
+
+function hmCollectRange() {{
+  var lo = Infinity, hi = -Infinity;
+  hmChartEntries.forEach(function(e) {{
+    var wells = HEATMAP_DATA.plates[e.plate].spots[e.spot];
+    Object.keys(wells).forEach(function(w) {{
+      var v = (hmMetric === 'signal') ? wells[w].signal : wells[w].conc;
+      if (v != null && isFinite(v)) {{ if (v < lo) lo = v; if (v > hi) hi = v; }}
+    }});
+  }});
+  return (lo <= hi) ? [lo, hi] : null;
+}}
+
+function hmFmt(v) {{
+  if (v == null || !isFinite(v)) return 'N/A';
+  var a = Math.abs(v);
+  if (a >= 1000) return Math.round(v).toLocaleString();
+  return (a >= 1 ? v.toFixed(1) : v.toPrecision(3));
+}}
+
+function hmSetLog(on, btn) {{
+  hmLog = on;
+  document.querySelectorAll('#hm-log-toggle .sp-btn').forEach(function(b) {{
+    b.classList.remove('active-sort');
+  }});
+  if (btn) btn.classList.add('active-sort');
+  hmRenderAll();
+}}
+
+function hmSetShared(on, btn) {{
+  hmShared = on;
+  document.querySelectorAll('#hm-scale-toggle .sp-btn').forEach(function(b) {{
+    b.classList.remove('active-sort');
+  }});
+  if (btn) btn.classList.add('active-sort');
+  hmRenderAll();
+}}
+
 function hmRenderAll() {{
+  hmRange = hmShared ? hmCollectRange() : null;
+  var bar = document.getElementById('hm-scale-legend');
+  if (bar) {{
+    bar.innerHTML = hmRange
+      ? '<span class="hm-ramp-end">' + hmFmt(hmRange[0]) + '</span>' +
+        '<span class="hm-ramp"></span>' +
+        '<span class="hm-ramp-end">' + hmFmt(hmRange[1]) + '</span>' +
+        '<span>shared across all plates' + (hmLog ? ', log scale' : '') + '</span>'
+      : '<span>each plate scaled to its own range \u2014 colours are not comparable between plates</span>';
+  }}
   hmChartEntries.forEach(function(entry) {{ hmRenderOne(entry.plate, entry.spot, entry.chartId); }});
 }}
 
@@ -5793,24 +6230,54 @@ function hmRenderOne(plateNum, spotNum, chartId) {{
     z.push(zRow);
     text.push(textRow);
   }});
-  var colorscale = (hmMetric === 'signal')
-    ? [[0, '#1a2f5c'], [0.5, '#4a90c4'], [1, '#f4d35e']]
-    : [[0, '#f7fbff'], [0.5, '#6baed6'], [1, '#08306b']];
-  var data = [{{
+  // Single-hue sequential ramp, light -> dark. The previous scale ran navy ->
+  // blue -> yellow, which is three hues and reads as a rainbow: it implies
+  // category changes where there is only magnitude.
+  var t = msdThemeTokens();
+  var cs = getComputedStyle(document.documentElement);
+  var seq = ['--seq-0','--seq-1','--seq-2','--seq-3','--seq-4','--seq-5','--seq-6']
+    .map(function(n, i, arr) {{
+      return [i / (arr.length - 1), cs.getPropertyValue(n).trim()];
+    }});
+  var trace = {{
     z: z, x: cols.map(String), y: rows, type: 'heatmap',
     text: text, hoverinfo: 'text',
-    colorscale: colorscale, showscale: true, hoverongaps: false,
+    colorscale: seq, hoverongaps: false,
+    // One shared legend above the grid replaces 12 identical colorbars, which
+    // were each eating ~20% of their cell's width.
+    showscale: !hmShared,
     xgap: 1, ygap: 1
-  }}];
-  var layout = {{
-    title: {{ text: 'Plate ' + plateNum + (multiSpot ? (', Spot ' + spotNum) : ''), font: {{ size: 12 }} }},
-    xaxis: {{ side: 'top', type: 'category', tickfont: {{ size: 9 }} }},
-    yaxis: {{ autorange: 'reversed', type: 'category', tickfont: {{ size: 9 }} }},
-    margin: {{ l: 30, r: 10, t: 36, b: 10 }},
-    height: 320,
-    paper_bgcolor: 'white', plot_bgcolor: 'white'
   }};
-  Plotly.react(chartId, data, layout, {{ responsive: true }});
+  if (hmLog) {{
+    // Colour by log10 while hover text keeps the real values.
+    var floorV = null;
+    z.forEach(function(rw) {{ rw.forEach(function(v) {{
+      if (v != null && isFinite(v) && v > 0 && (floorV === null || v < floorV)) floorV = v;
+    }}); }});
+    if (floorV === null) floorV = 1;
+    trace.z = z.map(function(rw) {{
+      return rw.map(function(v) {{
+        return (v == null || !isFinite(v) || v <= 0) ? null : Math.log10(v);
+      }});
+    }});
+    if (hmShared && hmRange) {{
+      trace.zmin = Math.log10(Math.max(hmRange[0], floorV));
+      trace.zmax = Math.log10(Math.max(hmRange[1], floorV * 10));
+    }}
+  }} else if (hmShared && hmRange) {{
+    trace.zmin = hmRange[0]; trace.zmax = hmRange[1];
+  }}
+  var layout = {{
+    title: {{ text: 'Plate ' + plateNum + (multiSpot ? (', Spot ' + spotNum) : ''),
+             font: {{ size: 12, color: t.ink }} }},
+    xaxis: {{ side: 'top', type: 'category', tickfont: {{ size: 9, color: t.muted }} }},
+    yaxis: {{ autorange: 'reversed', type: 'category', tickfont: {{ size: 9, color: t.muted }} }},
+    margin: {{ l: 30, r: hmShared ? 10 : 60, t: 36, b: 10 }},
+    height: 320,
+    font: {{ color: t.ink2 }},
+    paper_bgcolor: t.surface, plot_bgcolor: t.surface
+  }};
+  Plotly.react(chartId, [trace], layout, {{ responsive: true }});
 }}
 // ── End Plate Heatmap Tab ─────────────────────────────────────────────────────
 
@@ -6119,9 +6586,16 @@ function msdUpdateSummaryRow(key, fit, cd, levels) {{
   row.classList.add('msd-row-modified');
   var cells = row.cells;
   var iStatus = MSD_SUMCOL['Status'];
+  // Status and Cal Pass render as pills, so write into the pill, not the cell.
+  var pill = function(idx, cls) {{
+    var cell = cells[idx];
+    var sp = cell.querySelector('span');
+    if (!sp) {{ sp = document.createElement('span'); cell.textContent = ''; cell.appendChild(sp); }}
+    if (cls !== undefined) sp.className = cls;
+    return sp;
+  }};
   if (!fit) {{
-    cells[iStatus].textContent = 'Failed';
-    cells[iStatus].className = '';
+    pill(iStatus, 'status-fail').textContent = 'Failed';
     return;
   }}
   cells[MSD_SUMCOL['Min (a)']].textContent        = fit.a.toPrecision(4);
@@ -6139,14 +6613,13 @@ function msdUpdateSummaryRow(key, fit, cd, levels) {{
   if (acc) {{
     cells[MSD_SUMCOL['Acc. LLOQ']].textContent = acc.lloq == null ? 'None' : acc.lloq.toPrecision(4);
     cells[MSD_SUMCOL['Acc. ULOQ']].textContent = acc.uloq == null ? 'None' : acc.uloq.toPrecision(4);
-    var cp = cells[MSD_SUMCOL['Cal Pass']];
-    cp.textContent = acc.nPass + '/' + acc.n;
-    cp.className = (acc.nPass === acc.n) ? 'status-good' : 'status-warn';
+    pill(MSD_SUMCOL['Cal Pass'],
+         (acc.nPass === acc.n) ? 'status-good' : 'status-warn')
+      .textContent = acc.nPass + '/' + acc.n;
   }}
   cells[MSD_SUMCOL['Flags']].textContent = msdFlagsFor(fit, acc).join(', ');
   var st = msdStatusFor(fit.r2);
-  cells[iStatus].textContent = st.label;
-  cells[iStatus].className = st.cls;
+  pill(iStatus, st.cls).textContent = st.label;
 }}
 
 function msdResetCurve(key) {{
