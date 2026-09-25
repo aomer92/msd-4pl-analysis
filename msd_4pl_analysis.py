@@ -130,7 +130,7 @@ import copy
 import threading, urllib.request
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 
-__version__ = "1.16.0"
+__version__ = "1.17.0"
 
 # ── Auto-update check ─────────────────────────────────────────────────────────
 _GITHUB_REPO  = "aomer92/msd-4pl-analysis"
@@ -1250,15 +1250,35 @@ def compute_calibrator_accuracy(res, tolerance=CAL_RE_TOLERANCE,
     the criterion that establishes a working range. It is independent of R²,
     which can look excellent while individual levels are well outside tolerance.
 
+    The quantifiable range is derived the way the criterion intends: the LLOQ and
+    ULOQ are the *outermost levels that pass at the anchor tolerance*, and only
+    levels strictly between them are held to the tighter interior tolerance.
+    Assigning the anchor tolerance by position in the calibrator series instead
+    would hold whichever level becomes the range end to the interior tolerance
+    whenever the outermost standard fails — which reports a narrower range than
+    the data supports (it did so on 11 of the 166 curves in this repository,
+    usually by a whole dilution step).
+
+    Levels outside that range are reported as `outside`, not as failures. A
+    calibrator below the LLOQ has not failed a test; it is below the range the
+    test established, and counting it as a failure overstates how bad a curve is
+    — across this repository 70% of calibrators below the blank-derived LLOQ are
+    out of tolerance versus 10% above it, because %RE is measured on
+    concentration while the curve is nearly flat in signal down there, so a small
+    signal error maps to an enormous concentration error.
+
     Returns a dict:
-        levels      list of per-level dicts, ascending by nominal concentration:
-                    conc, n, mean_signal, back_calc, re_pct, passed, tolerance
-        lloq        lowest nominal concentration whose level passed (None if none)
-        uloq        highest nominal concentration whose level passed
-        n_failed    count of levels outside tolerance
-        interior_gap True when a level between lloq and uloq failed, i.e. the
-                    passing levels are not contiguous — reported, never
-                    silently narrowed.
+        levels      per-level dicts, ascending by nominal concentration:
+                    conc, n, mean_signal, back_calc, re_pct, quantifiable,
+                    status ('pass' | 'fail' | 'outside'), tolerance, passed
+        lloq/uloq   the quantifiable range (None when no level anchors it)
+        n_in_range  levels from lloq to uloq inclusive
+        n_pass      in-range levels within tolerance
+        n_failed    in-range levels out of tolerance (holes in the range)
+        n_outside   levels below the LLOQ or above the ULOQ
+        n_below / n_above   how those split
+        interior_gap  True when the passing levels are not contiguous
+        single_level  True when the range rests on one calibrator
     Returns None when there is no fit or no standards to back-calculate.
     """
     params = res.get('params')
@@ -1277,33 +1297,67 @@ def compute_calibrator_accuracy(res, tolerance=CAL_RE_TOLERANCE,
 
     concs = sorted(by_conc)
     levels = []
-    for i, c in enumerate(concs):
+    for c in concs:
         sigs = by_conc[c]
         mean_sig = float(np.mean(sigs))
         try:
             back = inverse_4pl(mean_sig, *params)
         except (ValueError, ZeroDivisionError, OverflowError):
             back = np.nan
-        # The lowest and highest levels anchor the range and get the wider tolerance
-        tol = anchor_tolerance if i in (0, len(concs) - 1) else tolerance
         if back is not None and np.isfinite(back):
             re_pct = (back - c) / c * 100.0
-            passed = abs(re_pct) <= tol
         else:
-            back, re_pct, passed = np.nan, np.nan, False
+            back, re_pct = np.nan, np.nan
+        # Near an asymptote the inverse is numerically meaningless rather than
+        # merely large — %RE runs to 1e70 and beyond. Such a level can still
+        # fail, but its number is not worth printing.
+        quantifiable = bool(np.isfinite(re_pct)) and abs(re_pct) <= 1e4
         levels.append({'conc': c, 'n': len(sigs), 'mean_signal': mean_sig,
                        'back_calc': float(back) if np.isfinite(back) else None,
                        're_pct': float(re_pct) if np.isfinite(re_pct) else None,
-                       'passed': bool(passed), 'tolerance': tol})
+                       'quantifiable': quantifiable,
+                       'status': 'outside', 'tolerance': anchor_tolerance,
+                       'passed': False})
 
-    passing = [lv['conc'] for lv in levels if lv['passed']]
-    lloq = min(passing) if passing else None
-    uloq = max(passing) if passing else None
-    interior_gap = bool(passing) and any(
-        (not lv['passed']) and lloq < lv['conc'] < uloq for lv in levels)
-    return {'levels': levels, 'lloq': lloq, 'uloq': uloq,
-            'n_failed': sum(1 for lv in levels if not lv['passed']),
-            'interior_gap': interior_gap}
+    def _within(level, tol):
+        r = level['re_pct']
+        return r is not None and np.isfinite(r) and abs(r) <= tol
+
+    # Range ends first: the outermost levels that clear the anchor tolerance.
+    lo_i = next((i for i, lv in enumerate(levels) if _within(lv, anchor_tolerance)), None)
+    hi_i = next((i for i in range(len(levels) - 1, -1, -1)
+                 if _within(levels[i], anchor_tolerance)), None)
+
+    if lo_i is None:
+        for lv in levels:
+            lv['tolerance'] = anchor_tolerance
+            lv['status'] = 'outside'
+        return {'levels': levels, 'lloq': None, 'uloq': None,
+                'n_in_range': 0, 'n_pass': 0, 'n_failed': 0,
+                'n_outside': len(levels), 'n_below': 0, 'n_above': 0,
+                'interior_gap': False, 'single_level': False}
+
+    for i, lv in enumerate(levels):
+        if i < lo_i or i > hi_i:
+            lv['status'] = 'outside'
+            lv['tolerance'] = anchor_tolerance
+        else:
+            tol = anchor_tolerance if i in (lo_i, hi_i) else tolerance
+            lv['tolerance'] = tol
+            lv['status'] = 'pass' if _within(lv, tol) else 'fail'
+        lv['passed'] = lv['status'] == 'pass'
+
+    in_range = levels[lo_i:hi_i + 1]
+    n_fail = sum(1 for lv in in_range if lv['status'] == 'fail')
+    return {'levels': levels,
+            'lloq': levels[lo_i]['conc'], 'uloq': levels[hi_i]['conc'],
+            'n_in_range': len(in_range),
+            'n_pass': sum(1 for lv in in_range if lv['status'] == 'pass'),
+            'n_failed': n_fail,
+            'n_outside': len(levels) - len(in_range),
+            'n_below': lo_i, 'n_above': len(levels) - 1 - hi_i,
+            'interior_gap': n_fail > 0,
+            'single_level': lo_i == hi_i}
 
 
 def compute_curve_flags(res, accuracy=None):
@@ -1336,13 +1390,16 @@ def compute_curve_flags(res, accuracy=None):
     # would say nothing. What is worth flagging is structure — a quantifiable
     # range narrower than the calibrators that were run, or one with a hole in it.
     if accuracy and accuracy['lloq'] is not None:
-        levels = accuracy['levels']
-        if accuracy['lloq'] > levels[0]['conc']:
-            flags.append("Range starts above lowest std")
-        if accuracy['uloq'] < levels[-1]['conc']:
-            flags.append("Range ends below highest std")
+        # Calibrators outside the quantifiable range are stated as a count, not
+        # as a failure — they sit below the LLOQ the curve itself established.
+        if accuracy['n_below']:
+            flags.append(f"{accuracy['n_below']} std below range")
+        if accuracy['n_above']:
+            flags.append(f"{accuracy['n_above']} std above range")
         if accuracy['interior_gap']:
             flags.append("Non-contiguous range")
+        if accuracy['single_level']:
+            flags.append("Range rests on one calibrator")
     elif accuracy:
         flags.append("No calibrator within tolerance")
 
@@ -2164,11 +2221,14 @@ def _create_output_inner(wb, tmp_dir, results, output_path, msd_path, raw_plate_
         # LLOQ above, never replacing it — the two answer different questions.
         acc = res.get('accuracy')
         if acc and acc['lloq'] is not None:
-            vals += [round(acc['lloq'], 4), round(acc['uloq'], 4),
-                     f"{len(acc['levels']) - acc['n_failed']}/{len(acc['levels'])}"]
+            # Cal Pass counts the levels inside the quantifiable range; levels
+            # below the LLOQ or above the ULOQ are outside it, not failures.
+            cp = f"{acc['n_pass']}/{acc['n_in_range']}"
+            if acc['n_outside']:
+                cp += f" (+{acc['n_outside']} outside)"
+            vals += [round(acc['lloq'], 4), round(acc['uloq'], 4), cp]
         elif acc:
-            vals += ["None", "None",
-                     f"0/{len(acc['levels'])}"]
+            vals += ["None", "None", f"0/{len(acc['levels'])}"]
         else:
             vals += ["N/A", "N/A", "N/A"]
 
@@ -2321,15 +2381,20 @@ def _create_output_inner(wb, tmp_dir, results, output_path, msd_path, raw_plate_
             # criterion the accuracy-based range on the Summary sheet uses.
             # % Recovery above compares signals; this compares concentrations.
             lvl = acc_by_conc.get(float(sg['conc']))
-            if lvl and lvl['back_calc'] is not None:
+            if lvl and lvl['quantifiable']:
                 ws.cell(row=row, column=6, value=round(lvl['back_calc'], 4))
                 ws.cell(row=row, column=6).number_format = '#,##0.0000'
                 re_cell = ws.cell(row=row, column=7, value=round(lvl['re_pct'], 1))
                 re_cell.number_format = '0.0'
-                re_cell.font = PASS_FONT if lvl['passed'] else FAIL_FONT
+                # Outside the quantifiable range is not a failure, so it is not
+                # coloured as one.
+                re_cell.font = (PASS_FONT if lvl['status'] == 'pass'
+                                else WARN_FONT if lvl['status'] == 'outside'
+                                else FAIL_FONT)
             elif lvl:
-                ws.cell(row=row, column=6, value="N/A")
-                ws.cell(row=row, column=7, value="N/A").font = FAIL_FONT
+                # Signal sits on an asymptote — the inverse is not meaningful.
+                ws.cell(row=row, column=6, value="Not quantifiable")
+                ws.cell(row=row, column=7, value="N/A").font = WARN_FONT
             _style_row(ws, row, 7, fill=STD_FILL)
             row += 1
 
@@ -2900,11 +2965,13 @@ def generate_html_report(results, html_path, msd_path, units=None,
         if _r2v is not None and np.isfinite(_r2v):
             _meta.append(f'<span class="mono">R² {_r2v:.6f}</span>')
         _accm = res.get('accuracy')
-        if _accm:
-            _np = len(_accm['levels']) - _accm['n_failed']
-            _meta.append(f'<span class="mono">{_np}/{len(_accm["levels"])} cal in tol</span>')
-            if _accm['lloq'] is not None:
-                _meta.append(f'<span class="mono">range {_accm["lloq"]:.4g}\u2013{_accm["uloq"]:.4g}</span>')
+        if _accm and _accm['lloq'] is not None:
+            _meta.append(f'<span class="mono">{_accm["n_pass"]}/{_accm["n_in_range"]} cal in tol</span>')
+            _meta.append(f'<span class="mono">range {_accm["lloq"]:.4g}\u2013{_accm["uloq"]:.4g}</span>')
+            if _accm['n_outside']:
+                _meta.append(f'<span class="mono">{_accm["n_outside"]} outside range</span>')
+        elif _accm:
+            _meta.append('<span class="status-fail">No calibrator in tolerance</span>')
         for _fl in (res.get('flags') or []):
             _meta.append(f'<span class="status-warn">{_fl}</span>')
         meta_html = '<div class="curve-card-meta">' + ''.join(_meta) + '</div>'
@@ -3276,10 +3343,14 @@ def generate_html_report(results, html_path, msd_path, units=None,
             acc_lloq = acc_uloq = 'None'
         else:
             acc_lloq = acc_uloq = 'N/A'
-        if acc:
-            n_pass = len(acc['levels']) - acc['n_failed']
-            cal_pass = f"{n_pass}/{len(acc['levels'])}"
-            cal_class = 'status-good' if n_pass == len(acc['levels']) else 'status-warn'
+        if acc and acc['lloq'] is not None:
+            cal_pass = f"{acc['n_pass']}/{acc['n_in_range']}"
+            if acc['n_outside']:
+                cal_pass += f" +{acc['n_outside']}"
+            cal_class = ('status-good' if acc['n_pass'] == acc['n_in_range']
+                         else 'status-warn')
+        elif acc:
+            cal_pass, cal_class = f"0/{len(acc['levels'])}", 'status-fail'
         else:
             cal_pass, cal_class = 'N/A', ''
 
@@ -3308,8 +3379,11 @@ def generate_html_report(results, html_path, msd_path, units=None,
     _n_poor = _n_curves - _n_good - _n_accept
     _flagged = sum(1 for r in results if r.get('flags'))
     _accs = [r['accuracy'] for r in results if r.get('accuracy')]
-    _cal_total = sum(len(a['levels']) for a in _accs)
-    _cal_pass = _cal_total - sum(a['n_failed'] for a in _accs)
+    # Counted over levels inside each curve's quantifiable range; levels outside
+    # it were never in scope for the tolerance test.
+    _cal_total = sum(a['n_in_range'] for a in _accs)
+    _cal_pass = sum(a['n_pass'] for a in _accs)
+    _cal_outside = sum(a['n_outside'] for a in _accs)
 
     def _tile(label, value, sub='', cls=''):
         cls_attr = f" {cls}" if cls else ''
@@ -3330,8 +3404,10 @@ def generate_html_report(results, html_path, msd_path, units=None,
                         else 'is-bad' if _n_poor else 'is-warn'))
     if _cal_total:
         _pct = _cal_pass / _cal_total * 100.0
-        _tiles.append(_tile('Calibrators in tolerance', f'{_cal_pass}/{_cal_total}',
-                            f'{_pct:.0f}% within \u00b120% (\u00b125% at range ends)',
+        _sub = f'{_pct:.0f}% within \u00b120% (\u00b125% at range ends)'
+        if _cal_outside:
+            _sub += f' \u00b7 {_cal_outside} outside range'
+        _tiles.append(_tile('Calibrators in tolerance', f'{_cal_pass}/{_cal_total}', _sub,
                             'is-good' if _pct == 100 else 'is-warn' if _pct >= 80 else 'is-bad'))
     _tiles.append(_tile('Curves flagged', _flagged,
                         'see Flags column' if _flagged else 'none',
@@ -6606,23 +6682,29 @@ var MSD_HILL_MIN = 0.5, MSD_HILL_MAX = 3.0;
 // compute_calibrator_accuracy(). Returns null when nothing can be judged.
 function msdCalAccuracy(fit, levels) {{
   if (!fit || !levels.length) return null;
-  var nPass = 0, passing = [], passFlags = [];
-  for (var i = 0; i < levels.length; i++) {{
-    var c = levels[i].conc;
-    var back = msdInverse4PL(levels[i].meanSignal, fit.a, fit.b, fit.c, fit.d);
-    var tol = (i === 0 || i === levels.length - 1) ? MSD_CAL_TOL_ANCHOR : MSD_CAL_TOL;
-    var ok = isFinite(back) && Math.abs((back - c) / c * 100.0) <= tol;
-    passFlags.push(ok);
-    if (ok) {{ nPass++; passing.push(c); }}
+  // Mirrors compute_calibrator_accuracy(): %RE first, then the range ends are
+  // the outermost levels clearing the anchor tolerance, and only levels
+  // strictly between them face the tighter interior tolerance. Levels outside
+  // the resulting range are outside it — not failures.
+  var re = levels.map(function(l) {{
+    var back = msdInverse4PL(l.meanSignal, fit.a, fit.b, fit.c, fit.d);
+    return isFinite(back) ? (back - l.conc) / l.conc * 100.0 : null;
+  }});
+  var within = function(i, tol) {{ return re[i] !== null && Math.abs(re[i]) <= tol; }};
+  var loI = -1, hiI = -1;
+  for (var i = 0; i < levels.length; i++) {{ if (within(i, MSD_CAL_TOL_ANCHOR)) {{ loI = i; break; }} }}
+  for (var k = levels.length - 1; k >= 0; k--) {{ if (within(k, MSD_CAL_TOL_ANCHOR)) {{ hiI = k; break; }} }}
+  if (loI < 0) return {{ lloq: null, uloq: null, nPass: 0, nInRange: 0, nOutside: levels.length }};
+  var nPass = 0, gap = false;
+  for (var j = loI; j <= hiI; j++) {{
+    var tol = (j === loI || j === hiI) ? MSD_CAL_TOL_ANCHOR : MSD_CAL_TOL;
+    if (within(j, tol)) nPass++; else gap = true;
   }}
-  if (!passing.length) return {{ lloq: null, uloq: null, nPass: 0, n: levels.length }};
-  var lo = Math.min.apply(null, passing), hi = Math.max.apply(null, passing);
-  var gap = false;
-  for (var j = 0; j < levels.length; j++) {{
-    if (!passFlags[j] && levels[j].conc > lo && levels[j].conc < hi) gap = true;
-  }}
-  return {{ lloq: lo, uloq: hi, nPass: nPass, n: levels.length, gap: gap,
-           lowest: levels[0].conc, highest: levels[levels.length - 1].conc }};
+  return {{ lloq: levels[loI].conc, uloq: levels[hiI].conc,
+           nPass: nPass, nInRange: hiI - loI + 1,
+           nBelow: loI, nAbove: levels.length - 1 - hiI,
+           nOutside: loI + (levels.length - 1 - hiI),
+           gap: gap, single: loI === hiI }};
 }}
 
 // Mirror of compute_curve_flags() for a live re-fit, so the Flags column stays
@@ -6638,9 +6720,10 @@ function msdFlagsFor(fit, acc) {{
     if (acc.lloq == null) {{
       flags.push('No calibrator within tolerance');
     }} else {{
-      if (acc.lloq > acc.lowest)  flags.push('Range starts above lowest std');
-      if (acc.uloq < acc.highest) flags.push('Range ends below highest std');
-      if (acc.gap)                flags.push('Non-contiguous range');
+      if (acc.nBelow) flags.push(acc.nBelow + ' std below range');
+      if (acc.nAbove) flags.push(acc.nAbove + ' std above range');
+      if (acc.gap)    flags.push('Non-contiguous range');
+      if (acc.single) flags.push('Range rests on one calibrator');
     }}
   }}
   return flags;
@@ -6680,8 +6763,9 @@ function msdUpdateSummaryRow(key, fit, cd, levels) {{
     cells[MSD_SUMCOL['Acc. LLOQ']].textContent = acc.lloq == null ? 'None' : acc.lloq.toPrecision(4);
     cells[MSD_SUMCOL['Acc. ULOQ']].textContent = acc.uloq == null ? 'None' : acc.uloq.toPrecision(4);
     pill(MSD_SUMCOL['Cal Pass'],
-         (acc.nPass === acc.n) ? 'status-good' : 'status-warn')
-      .textContent = acc.nPass + '/' + acc.n;
+         (acc.nPass === acc.nInRange) ? 'status-good' : 'status-warn')
+      .textContent = acc.nPass + '/' + acc.nInRange +
+                     (acc.nOutside ? ' +' + acc.nOutside : '');
   }}
   cells[MSD_SUMCOL['Flags']].textContent = msdFlagsFor(fit, acc).join(', ');
   var st = msdStatusFor(fit.r2);
