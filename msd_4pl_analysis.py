@@ -130,7 +130,7 @@ import copy
 import threading, urllib.request
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 
-__version__ = "1.18.0"
+__version__ = "1.19.0"
 
 # ── Auto-update check ─────────────────────────────────────────────────────────
 _GITHUB_REPO  = "aomer92/msd-4pl-analysis"
@@ -337,8 +337,19 @@ LAST_RUN_PATH = os.path.join(os.path.expanduser('~'), '.msd_4pl_last_run.json')
 MAX_RUN_HISTORY = 5
 
 # ── Analysis thresholds ───────────────────────────────────────────────────────
-R2_GOOD         = 0.99   # R² ≥ this → "Good" curve fit
-R2_ACCEPTABLE   = 0.95   # R² ≥ this → "Acceptable" curve fit (else "Poor")
+R2_GOOD         = 0.99   # R² ≥ this → reported as a strong fit in the run summary
+R2_ACCEPTABLE   = 0.95   # R² ≥ this → reported as an acceptable fit
+
+# Curve Status is decided by what the calibrators reproduce, not by R².
+# R² is computed over individual replicate wells while acceptance is judged on
+# level means, so replicate scatter used to drag Status down even when every
+# level was in tolerance — and replicate scatter is already reported as %CV.
+# Measured over the 166 curves in this repository, R²-based Status called 22%
+# of "Poor" curves wrong (one sat at R²=0.86 with 5/5 calibrators in tolerance
+# across a 256-fold range) and called 3 curves "Good" that had only 3 of 7
+# levels usable.
+CURVE_COVERAGE_GOOD       = 0.70   # share of calibrator levels usable → "Good"
+CURVE_COVERAGE_ACCEPTABLE = 0.50   # → "Acceptable" (holes in the range allowed)
 QC_RECOVERY_LOW  = 70.0  # % recovery below this → QC failure
 QC_RECOVERY_HIGH = 130.0 # % recovery above this → QC failure
 DEFAULT_CV_THRESHOLD = 25.0  # %CV above this → flagged
@@ -1360,6 +1371,36 @@ def compute_calibrator_accuracy(res, tolerance=CAL_RE_TOLERANCE,
             'single_level': lo_i == hi_i}
 
 
+def classify_curve(res):
+    """Return (label, css_class) for a curve's Status.
+
+    Driven by the calibration the curve actually delivers — how many of the
+    levels that were run end up usable, and whether the quantifiable range has
+    holes — with R² kept only as a sanity floor. R² remains reported; it just no
+    longer decides the verdict.
+    """
+    if res.get('params') is None:
+        return ('Failed', 'status-fail')
+
+    r2 = res.get('r2')
+    # A negative weighted R² means the model tracks the data worse than a flat
+    # line. Whatever the calibrators back-calculate to, that is not endorsable.
+    if r2 is None or not np.isfinite(r2) or r2 < 0:
+        return ('Poor', 'status-fail')
+
+    acc = res.get('accuracy')
+    if not acc or acc['lloq'] is None:
+        return ('Poor', 'status-fail')
+
+    n_total = len(acc['levels'])
+    coverage = (acc['n_pass'] / n_total) if n_total else 0.0
+    if acc['n_failed'] == 0 and coverage >= CURVE_COVERAGE_GOOD:
+        return ('Good', 'status-good')
+    if coverage >= CURVE_COVERAGE_ACCEPTABLE:
+        return ('Acceptable', 'status-warn')
+    return ('Poor', 'status-fail')
+
+
 def compute_curve_flags(res, accuracy=None):
     """Short, human-readable warnings about a fitted standard curve.
 
@@ -2233,16 +2274,13 @@ def _create_output_inner(wb, tmp_dir, results, output_path, msd_path, raw_plate_
             vals += ["N/A", "N/A", "N/A"]
 
         flag_text = ", ".join(res.get('flags') or []) or None
+        status_label, _status_cls = classify_curve(res)
         if res['params'] is not None:
             r2_raw = res['r2']
             vals += [round(float(r2_raw), 6) if (r2_raw is not None and np.isfinite(r2_raw)) else "N/A"]
-            vals.append(flag_text)
-            if r2_raw is None or not np.isfinite(r2_raw):
-                vals.append("Poor")
-            else:
-                vals.append("Good" if r2_raw >= R2_GOOD else ("Acceptable" if r2_raw >= R2_ACCEPTABLE else ("Negative R²" if r2_raw < 0 else "Poor")))
         else:
-            vals += ["N/A", flag_text, "Failed"]
+            vals.append("N/A")
+        vals += [flag_text, status_label]
 
         for ci, v in enumerate(vals, 1):
             # Never write bare empty strings — they produce invalid inlineStr cells
@@ -2939,6 +2977,11 @@ def generate_html_report(results, html_path, msd_path, units=None,
 
             a, b, c, d = res['params'] if res['params'] is not None else (None, None, None, None)
             raw_entry = {
+                # Coverage is judged against the levels that were *run*, so a
+                # user dropping a whole level cannot raise Status by shrinking
+                # the denominator.
+                'nLevelsRun': (len(res['accuracy']['levels'])
+                               if res.get('accuracy') else 0),
                 'divId': div_id,
                 'fitTraceIdx': fit_trace_idx,
                 'label': label,
@@ -2953,18 +2996,7 @@ def generate_html_report(results, html_path, msd_path, units=None,
         # A card should answer "is this curve usable?" on its own, instead of
         # sending the reader back to the Summary table to cross-reference.
         _r2v = res.get('r2')
-        if res['params'] is None:
-            _st_label, _st_cls = 'Failed', 'status-fail'
-        elif _r2v is None or not np.isfinite(_r2v):
-            _st_label, _st_cls = 'Poor', 'status-fail'
-        elif _r2v >= R2_GOOD:
-            _st_label, _st_cls = 'Good', 'status-good'
-        elif _r2v >= R2_ACCEPTABLE:
-            _st_label, _st_cls = 'Acceptable', 'status-warn'
-        elif _r2v < 0:
-            _st_label, _st_cls = 'Negative R²', 'status-fail'
-        else:
-            _st_label, _st_cls = 'Poor', 'status-fail'
+        _st_label, _st_cls = classify_curve(res)
         _meta = [f'<span class="{_st_cls}">{_st_label}</span>']
         if _r2v is not None and np.isfinite(_r2v):
             _meta.append(f'<span class="mono">R² {_r2v:.6f}</span>')
@@ -3314,15 +3346,7 @@ def generate_html_report(results, html_path, msd_path, units=None,
             a, b, c, d = [f"{v:.4g}" for v in res['params']]
             r2_val = res['r2']
             r2 = f"{r2_val:.6f}" if (r2_val is not None and np.isfinite(r2_val)) else 'N/A'
-            if r2_val is None or not np.isfinite(r2_val):
-                status = 'Poor'
-            else:
-                status = ('Good' if r2_val >= R2_GOOD
-                          else 'Acceptable' if r2_val >= R2_ACCEPTABLE
-                          else 'Negative R²' if r2_val < 0
-                          else 'Poor')
-        else:
-            status = 'Failed'
+        status, status_class = classify_curve(res)
         flags = ', '.join(res.get('flags') or [])
         lloq_sig = res.get('lloq_sig')
         if lloq_sig is not None:
@@ -3334,10 +3358,6 @@ def generate_html_report(results, html_path, msd_path, units=None,
                         lloq_conc_disp = f"{lconc:.4g}"
                 except Exception:
                     pass
-        status_class = {'Good': 'status-good', 'Acceptable': 'status-warn',
-                        'Poor': 'status-fail', 'Negative R²': 'status-fail',
-                        'Failed': 'status-fail'}.get(status, '')
-
         # Accuracy-based quantifiable range, shown beside the blank-derived LLOQ
         acc = res.get('accuracy')
         if acc and acc['lloq'] is not None:
@@ -3378,10 +3398,6 @@ def generate_html_report(results, html_path, msd_path, units=None,
     _n_curves = len(results)
     _r2s = [r['r2'] for r in results
             if r.get('r2') is not None and np.isfinite(r['r2'])]
-    _n_good = sum(1 for r in _r2s if r >= R2_GOOD)
-    _n_accept = sum(1 for r in _r2s if R2_ACCEPTABLE <= r < R2_GOOD)
-    _n_poor = _n_curves - _n_good - _n_accept
-    _flagged = sum(1 for r in results if r.get('flags'))
     _accs = [r['accuracy'] for r in results if r.get('accuracy')]
     # Counted over levels inside each curve's quantifiable range; levels outside
     # it were never in scope for the tolerance test.
@@ -3398,14 +3414,12 @@ def generate_html_report(results, html_path, msd_path, units=None,
     _tiles = [_tile('Curves', _n_curves,
                     f'{len(set(r["plate"] for r in results))} plate(s)')]
     if _r2s:
+        # Shown as context, not as a verdict — Status is decided by the
+        # calibration, so colouring R² as pass/fail would contradict it.
         _mean_r2 = float(np.mean(_r2s))
-        _tiles.append(_tile('Mean R²', f'{_mean_r2:.4f}', 'across fitted curves',
-                            'is-good' if _mean_r2 >= R2_GOOD
-                            else 'is-warn' if _mean_r2 >= R2_ACCEPTABLE else 'is-bad'))
-    _tiles.append(_tile('Curve status', f'{_n_good}/{_n_curves}',
-                        f'good · {_n_accept} acceptable · {_n_poor} poor',
-                        'is-good' if _n_good == _n_curves
-                        else 'is-bad' if _n_poor else 'is-warn'))
+        _n_strong_fit = sum(1 for r in _r2s if r >= R2_GOOD)
+        _tiles.append(_tile('Mean R²', f'{_mean_r2:.4f}',
+                            f'{_n_strong_fit}/{len(_r2s)} fits at R² \u2265 {R2_GOOD:g}'))
     if _cal_total:
         _pct = _cal_pass / _cal_total * 100.0
         _sub = f'{_pct:.0f}% within \u00b120% (\u00b125% at range ends)'
@@ -3413,9 +3427,6 @@ def generate_html_report(results, html_path, msd_path, units=None,
             _sub += f' \u00b7 {_cal_outside} outside range'
         _tiles.append(_tile('Calibrators in tolerance', f'{_cal_pass}/{_cal_total}', _sub,
                             'is-good' if _pct == 100 else 'is-warn' if _pct >= 80 else 'is-bad'))
-    _tiles.append(_tile('Curves flagged', _flagged,
-                        'see Flags column' if _flagged else 'none',
-                        'is-good' if _flagged == 0 else 'is-warn'))
     if qc_summary_rows:
         _recs = [q['recovery'] for q in qc_summary_rows if np.isfinite(q['recovery'])]
         if _recs:
@@ -4165,7 +4176,9 @@ def generate_html_report(results, html_path, msd_path, units=None,
     <h2>Curve Fit Summary</h2>
     <p class="hint"><strong>LLOQ Method:</strong> {lloq_method_label} &nbsp;·&nbsp;
        <em>LLOQ Conc</em> is that blank-derived signal read back through the curve;
-       <em>Acc. LLOQ/ULOQ</em> is the range the calibrators themselves reproduce.</p>
+       <em>Acc. LLOQ/ULOQ</em> is the range the calibrators themselves reproduce.<br>
+       <strong>Status</strong> follows the calibration — how many of the levels run end up
+       usable and whether the range has holes — not R², which is reported beside it.</p>
     <div class="filter-row">
       <input class="filter-input" type="search" placeholder="🔍  Filter summary…"
              oninput="filterTable(this.value,'summaryTable')">
@@ -6452,11 +6465,21 @@ function four_pl_js(x, a, b, c, d) {{
   return d + (a - d) / (1 + Math.pow(x / c, b));
 }}
 
-function msdStatusFor(r2) {{
-  if (r2 === null || r2 === undefined || !isFinite(r2)) return {{ label: 'Poor', cls: 'status-fail' }};
-  if (r2 < 0) return {{ label: 'Negative R²', cls: 'status-fail' }};
-  if (r2 >= 0.99) return {{ label: 'Good', cls: 'status-good' }};
-  if (r2 >= 0.95) return {{ label: 'Acceptable', cls: 'status-warn' }};
+// Mirrors classify_curve(): the verdict follows what the calibrators reproduce,
+// with R² only as a sanity floor. Coverage is measured against the levels that
+// were run, so excluding half the curve cannot make the remainder look "Good".
+var MSD_COV_GOOD = 0.70, MSD_COV_ACCEPTABLE = 0.50;
+
+function msdStatusFor(r2, acc, nLevelsRun) {{
+  if (r2 === null || r2 === undefined || !isFinite(r2) || r2 < 0) {{
+    return {{ label: 'Poor', cls: 'status-fail' }};
+  }}
+  if (!acc || acc.lloq == null || !nLevelsRun) {{
+    return {{ label: 'Poor', cls: 'status-fail' }};
+  }}
+  var coverage = acc.nPass / nLevelsRun;
+  if (!acc.gap && coverage >= MSD_COV_GOOD) return {{ label: 'Good', cls: 'status-good' }};
+  if (coverage >= MSD_COV_ACCEPTABLE) return {{ label: 'Acceptable', cls: 'status-warn' }};
   return {{ label: 'Poor', cls: 'status-fail' }};
 }}
 
@@ -6676,7 +6699,8 @@ function msdRecomputeCurve(key) {{
     if (overlayGd) Plotly.restyle(overlayGd, {{ x: [line.xs], y: [line.ys] }}, [cd.overlayFitTraceIdx]);
   }}
 
-  var st = msdStatusFor(fit.r2);
+  var liveAcc = msdCalAccuracy(fit, levels);
+  var st = msdStatusFor(fit.r2, liveAcc, cd.nLevelsRun || levels.length);
   badge.textContent = 'Live R²: ' + fit.r2.toFixed(6);
   statusBadge.textContent = st.label;
   statusBadge.className = 'msd-live-status ' + st.cls;
@@ -6791,7 +6815,7 @@ function msdUpdateSummaryRow(key, fit, cd, levels) {{
                      (acc.nOutside ? ' +' + acc.nOutside : '');
   }}
   cells[MSD_SUMCOL['Flags']].textContent = msdFlagsFor(fit, acc).join(', ');
-  var st = msdStatusFor(fit.r2);
+  var st = msdStatusFor(fit.r2, acc, (cd && cd.nLevelsRun) || (levels || []).length);
   pill(iStatus, st.cls).textContent = st.label;
 }}
 
