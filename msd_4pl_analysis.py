@@ -130,7 +130,7 @@ import copy
 import threading, urllib.request
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 
-__version__ = "1.17.0"
+__version__ = "1.18.0"
 
 # ── Auto-update check ─────────────────────────────────────────────────────────
 _GITHUB_REPO  = "aomer92/msd-4pl-analysis"
@@ -2917,14 +2917,18 @@ def generate_html_report(results, html_path, msd_path, units=None,
                 f"<td class='num'>{s['signal']:,.0f}</td>"
                 f"<td><input type='checkbox' class='msd-cal-cb' checked "
                 f"data-conc='{s['conc']}' data-signal='{s['signal']}' "
+                f"data-well='{s['well']}' "
                 f"onchange=\"msdRecomputeCurve('{curve_key}')\"></td></tr>"
                 for s in std_sorted
             )
             cal_html = f"""
             <div class="msd-cal-wrap">
+              <div class="msd-suggest-panel" style="display:none;"></div>
               <div class="msd-live-row">
                 <span class="msd-live-r2"></span>
                 <span class="msd-live-status"></span>
+                <button class="msd-suggest-btn" onclick="msdSuggestDrops('{curve_key}')"
+                        title="Look for calibrator wells that sit well off the fitted curve">⌕ Suggest drops</button>
                 <button class="msd-reset-btn" onclick="msdResetCurve('{curve_key}')">↺ Reset Calibrators</button>
               </div>
               <table class="msd-cal-table">
@@ -4009,7 +4013,26 @@ def generate_html_report(results, html_path, msd_path, units=None,
   .msd-live-row {{ display: flex; align-items: center; gap: 10px; margin-bottom: 6px; min-height: 20px; }}
   .msd-live-r2 {{ font-size: 12px; font-weight: 600; color: var(--ink); font-variant-numeric: tabular-nums; }}
   .msd-live-status {{ font-size: 11px; font-weight: 600; padding: 2px 9px; border-radius: 11px; }}
-  .msd-reset-btn {{ margin-left: auto; font-size: 11px; padding: 3px 10px;
+  .msd-suggest-btn {{ margin-left: auto; font-size: 11px; padding: 3px 10px;
+                      border: 1px solid var(--rule-strong); border-radius: 6px;
+                      background: var(--surface); color: var(--ink-2); cursor: pointer;
+                      font-family: inherit; }}
+  .msd-suggest-btn:hover {{ background: var(--surface-2); color: var(--ink); }}
+  .msd-suggest-panel {{ border: 1px solid var(--rule-strong); border-left: 3px solid var(--warn);
+                        border-radius: 8px; padding: 10px 12px; margin-bottom: 10px;
+                        background: var(--surface-2); font-size: 11.5px; }}
+  .msd-suggest-head {{ font-weight: 600; color: var(--ink); margin-bottom: 5px; }}
+  .msd-suggest-list {{ margin: 0 0 7px 16px; color: var(--ink-2); line-height: 1.55; }}
+  .msd-suggest-rec {{ color: var(--ink); line-height: 1.55; padding: 6px 8px;
+                      background: var(--surface); border-radius: 6px;
+                      border: 1px solid var(--rule); }}
+  .msd-suggest-detail {{ margin-top: 5px; color: var(--ink-2); font-size: 11px;
+                         font-variant-numeric: tabular-nums; }}
+  .msd-suggest-none {{ color: var(--ink-2); line-height: 1.55; }}
+  .msd-suggest-actions {{ display: flex; gap: 6px; margin-top: 8px; }}
+  .msd-suggest-caveat {{ margin-top: 8px; color: var(--ink-muted); font-size: 11px;
+                         line-height: 1.5; font-style: italic; }}
+  .msd-reset-btn {{ font-size: 11px; padding: 3px 10px;
                      border: 1px solid var(--rule-strong); border-radius: 6px;
                      background: var(--surface); color: var(--ink-2); cursor: pointer;
                      font-family: inherit; }}
@@ -6770,6 +6793,244 @@ function msdUpdateSummaryRow(key, fit, cd, levels) {{
   cells[MSD_SUMCOL['Flags']].textContent = msdFlagsFor(fit, acc).join(', ');
   var st = msdStatusFor(fit.r2);
   pill(iStatus, st.cls).textContent = st.label;
+}}
+
+// ── Suggested calibrator drops ────────────────────────────────────────────────
+// Deliberately conservative. Raising R² is easy — dropping almost any point
+// does it, and dropping the bottom of the curve always does — so R² is not the
+// objective here. A well is only ever a candidate if it is *statistically
+// aberrant*: far off the fitted curve both in absolute terms and relative to
+// how tightly the other calibrators sit. What is then reported is the effect of
+// removing it on the things that matter (calibrators in tolerance, the width of
+// the quantifiable range) with R² as the last tiebreak, and the cost is stated
+// alongside the gain rather than hidden.
+var MSD_OUTLIER_MIN_REL = 0.15;   // at least 15% off its fitted signal
+var MSD_OUTLIER_MULT    = 3.0;    // and at least 3x the typical deviation
+var MSD_MIN_R2_GAIN     = 0.002;  // ignore cosmetic R² movement
+
+function msdReadCalWells(card) {{
+  var wells = [];
+  card.querySelectorAll('.msd-cal-cb').forEach(function(cb, idx) {{
+    wells.push({{ idx: idx, cb: cb, well: cb.dataset.well || ('#' + (idx + 1)),
+                 conc: parseFloat(cb.dataset.conc),
+                 signal: parseFloat(cb.dataset.signal),
+                 on: cb.checked }});
+  }});
+  return wells;
+}}
+
+function msdLevelsFrom(wells, dropIdx) {{
+  var byConc = {{}};
+  wells.forEach(function(w) {{
+    if (!w.on || (dropIdx && dropIdx.has(w.idx))) return;
+    (byConc[w.conc] = byConc[w.conc] || []).push(w.signal);
+  }});
+  return Object.keys(byConc).map(parseFloat).sort(function(x, y) {{ return x - y; }})
+    .map(function(cv) {{
+      var arr = byConc[cv], sum = 0;
+      for (var i = 0; i < arr.length; i++) sum += arr[i];
+      return {{ conc: cv, meanSignal: sum / arr.length, n: arr.length }};
+    }});
+}}
+
+// Fit + score a curve with a given set of wells removed.
+function msdEvaluate(cd, wells, dropIdx) {{
+  var concs = [], sigs = [];
+  wells.forEach(function(w) {{
+    if (!w.on || (dropIdx && dropIdx.has(w.idx))) return;
+    concs.push(w.conc); sigs.push(w.signal);
+  }});
+  if (concs.length < 4) return null;
+  (cd.blanks || []).forEach(function(bl) {{ concs.push(0); sigs.push(bl.signal); }});
+  var fit = js4PLFit(concs, sigs);
+  if (!fit) return null;
+  var levels = msdLevelsFrom(wells, dropIdx);
+  var acc = msdCalAccuracy(fit, levels);
+  return {{ fit: fit, acc: acc, levels: levels,
+           nPass: acc ? acc.nPass : 0,
+           nInRange: acc ? acc.nInRange : 0,
+           r2: fit.r2 }};
+}}
+
+// Wells that sit far enough off the curve to be worth questioning.
+function msdOutlierWells(base, wells) {{
+  var live = wells.filter(function(w) {{ return w.on; }});
+  var rel = live.map(function(w) {{
+    var fitted = four_pl_js(w.conc, base.fit.a, base.fit.b, base.fit.c, base.fit.d);
+    return (isFinite(fitted) && fitted !== 0) ? (w.signal - fitted) / fitted : 0;
+  }});
+  var mags = rel.map(Math.abs).slice().sort(function(x, y) {{ return x - y; }});
+  var med = mags.length ? mags[Math.floor(mags.length / 2)] : 0;
+  var out = [];
+  live.forEach(function(w, i) {{
+    if (Math.abs(rel[i]) >= MSD_OUTLIER_MIN_REL &&
+        Math.abs(rel[i]) >= MSD_OUTLIER_MULT * med) {{
+      out.push({{ w: w, rel: rel[i] }});
+    }}
+  }});
+  out.sort(function(x, y) {{ return Math.abs(y.rel) - Math.abs(x.rel); }});
+  return out.slice(0, 4);
+}}
+
+// Refuse a drop that would empty a level the range depends on: losing the only
+// replicate of an interior level punches a hole in the calibration rather than
+// tightening it. Edge levels may go — that is range truncation, and it is
+// reported as such.
+function msdDropAllowed(base, wells, dropIdx) {{
+  var after = msdLevelsFrom(wells, dropIdx);
+  if (after.length < 4) return false;
+  var have = {{}};
+  after.forEach(function(l) {{ have[l.conc] = true; }});
+  var before = msdLevelsFrom(wells, null);
+  for (var i = 1; i < before.length - 1; i++) {{
+    if (!have[before[i].conc]) return false;   // interior level wiped out
+  }}
+  return true;
+}}
+
+function msdFmtConc(v) {{
+  var a = Math.abs(v);
+  if (a >= 1e5 || (a > 0 && a < 0.01)) return v.toExponential(2);
+  if (a >= 1000) return Math.round(v).toLocaleString();
+  return parseFloat(v.toPrecision(4)).toString();
+}}
+
+function msdSuggestDrops(key) {{
+  var cd = CURVE_DATA[key];
+  var card = document.querySelector('[data-curvekey="' + key + '"]');
+  if (!cd || !card) return;
+  var panel = card.querySelector('.msd-suggest-panel');
+  var wells = msdReadCalWells(card);
+  var base = msdEvaluate(cd, wells, null);
+  panel.style.display = '';
+
+  if (!base) {{
+    panel.innerHTML = '<div class="msd-suggest-none">Not enough calibrators left to fit.</div>';
+    return;
+  }}
+
+  var cands = msdOutlierWells(base, wells);
+  if (!cands.length) {{
+    panel.innerHTML = '<div class="msd-suggest-none">No calibrator stands out — every point sits ' +
+      'within the normal scatter of this curve. Nothing to drop on the evidence.</div>';
+    return;
+  }}
+
+  // Each outlier on its own, then all of them together.
+  var trials = cands.map(function(c) {{ return [c]; }});
+  if (cands.length > 1) trials.push(cands);
+
+  var best = null;
+  trials.forEach(function(set) {{
+    var idx = new Set(set.map(function(c) {{ return c.w.idx; }}));
+    if (!msdDropAllowed(base, wells, idx)) return;
+    var ev = msdEvaluate(cd, wells, idx);
+    if (!ev) return;
+    var gain = (ev.nPass - base.nPass);
+    var rangeCost = (base.nInRange - ev.nInRange);
+    var r2Gain = ev.r2 - base.r2;
+    // Worth reporting only if more calibrators come into tolerance, or the fit
+    // tightens meaningfully without costing range.
+    var worth = (gain > 0 && rangeCost <= 0) ||
+                (gain === 0 && rangeCost <= 0 && r2Gain >= MSD_MIN_R2_GAIN);
+    if (!worth) return;
+    var score = [gain, -rangeCost, r2Gain];
+    if (!best || score[0] > best.score[0] ||
+        (score[0] === best.score[0] && score[1] > best.score[1]) ||
+        (score[0] === best.score[0] && score[1] === best.score[1] && score[2] > best.score[2])) {{
+      best = {{ set: set, ev: ev, score: score, idx: idx }};
+    }}
+  }});
+
+  var rows = cands.map(function(c) {{
+    return '<li><b>' + c.w.well + '</b> at ' + msdFmtConc(c.w.conc) +
+           ' sits <b>' + (c.rel > 0 ? '+' : '') + (c.rel * 100).toFixed(0) +
+           '%</b> off the fitted signal</li>';
+  }}).join('');
+
+  if (!best) {{
+    panel.innerHTML =
+      '<div class="msd-suggest-head">Points worth a look</div>' +
+      '<ul class="msd-suggest-list">' + rows + '</ul>' +
+      '<div class="msd-suggest-none">Dropping any of them does not widen the ' +
+      'quantifiable range or bring another calibrator into tolerance, so this is ' +
+      'a judgement call about the wells themselves, not something the fit argues for.</div>';
+    return;
+  }}
+
+  var names = best.set.map(function(c) {{ return c.w.well; }}).join(', ');
+  var ev = best.ev;
+  var headline = '', effects = [];
+  var haveRanges = base.acc && ev.acc && base.acc.lloq != null && ev.acc.lloq != null;
+  var wider = haveRanges && (ev.acc.lloq < base.acc.lloq || ev.acc.uloq > base.acc.uloq);
+
+  // Lead with the range when it moves. Going from 5/5 over a narrow range to
+  // 6/7 over a range 16x wider is a better assay, but written as a bare ratio
+  // it reads like a regression.
+  if (wider) {{
+    var fold = (ev.acc.uloq / ev.acc.lloq) / (base.acc.uloq / base.acc.lloq);
+    headline = 'extends the quantifiable range to <b>' +
+      msdFmtConc(ev.acc.lloq) + '–' + msdFmtConc(ev.acc.uloq) + '</b>' +
+      (fold >= 1.5 ? ' (' + (fold < 10 ? fold.toFixed(1) : Math.round(fold)) + '× wider)' : '') +
+      ', from ' + msdFmtConc(base.acc.lloq) + '–' + msdFmtConc(base.acc.uloq);
+  }} else if (ev.nPass > base.nPass) {{
+    headline = 'brings <b>' + (ev.nPass - base.nPass) +
+      '</b> more calibrator level(s) into tolerance';
+  }} else {{
+    headline = 'tightens the fit without changing the quantifiable range';
+  }}
+
+  effects.push('R² ' + base.r2.toFixed(6) + ' → <b>' + ev.r2.toFixed(6) + '</b>');
+  effects.push('in tolerance ' + base.nPass + '/' + base.nInRange +
+               ' → <b>' + ev.nPass + '/' + ev.nInRange + '</b> of the levels in range');
+  if (haveRanges && !wider) {{
+    effects.push(base.acc.lloq === ev.acc.lloq && base.acc.uloq === ev.acc.uloq
+      ? 'range unchanged (' + msdFmtConc(ev.acc.lloq) + '–' + msdFmtConc(ev.acc.uloq) + ')'
+      : 'range ' + msdFmtConc(base.acc.lloq) + '–' + msdFmtConc(base.acc.uloq) +
+        ' → <b>' + msdFmtConc(ev.acc.lloq) + '–' + msdFmtConc(ev.acc.uloq) + '</b>');
+  }}
+
+  panel.innerHTML =
+    '<div class="msd-suggest-head">Points worth a look</div>' +
+    '<ul class="msd-suggest-list">' + rows + '</ul>' +
+    '<div class="msd-suggest-rec">Dropping <b>' + names + '</b> ' + headline + '.' +
+      '<div class="msd-suggest-detail">' + effects.join(' · ') + '</div></div>' +
+    '<div class="msd-suggest-actions">' +
+      '<button class="sp-btn sp-btn-primary sp-btn-icon" data-act="apply">Apply</button>' +
+      '<button class="sp-btn sp-btn-icon" data-act="dismiss">Dismiss</button>' +
+    '</div>' +
+    '<div class="msd-suggest-caveat">A calibrator should come out because the well ' +
+      'is wrong — a bubble, a mis-spot, a bad dilution — not because the number ' +
+      'improves. Check the plate before accepting.</div>';
+
+  // Listeners rather than inline onclick: the handler needs the chosen well
+  // indices, and threading those through an HTML attribute means three levels
+  // of quoting inside a Python f-string that emits JS.
+  var dropIdx = best.set.map(function(c) {{ return c.w.idx; }});
+  panel.querySelector('[data-act="apply"]').addEventListener('click', function() {{
+    msdApplySuggestion(key, dropIdx);
+  }});
+  panel.querySelector('[data-act="dismiss"]').addEventListener('click', function() {{
+    msdDismissSuggestion(key);
+  }});
+}}
+
+function msdApplySuggestion(key, dropIdx) {{
+  var card = document.querySelector('[data-curvekey="' + key + '"]');
+  if (!card) return;
+  var want = new Set(dropIdx);
+  card.querySelectorAll('.msd-cal-cb').forEach(function(cb, i) {{
+    if (want.has(i)) cb.checked = false;
+  }});
+  msdRecomputeCurve(key);
+  msdDismissSuggestion(key);
+}}
+
+function msdDismissSuggestion(key) {{
+  var card = document.querySelector('[data-curvekey="' + key + '"]');
+  if (!card) return;
+  var panel = card.querySelector('.msd-suggest-panel');
+  if (panel) {{ panel.style.display = 'none'; panel.innerHTML = ''; }}
 }}
 
 function msdResetCurve(key) {{
