@@ -130,7 +130,7 @@ import copy
 import threading, urllib.request
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 
-__version__ = "1.19.0"
+__version__ = "1.20.0"
 
 # ── Auto-update check ─────────────────────────────────────────────────────────
 _GITHUB_REPO  = "aomer92/msd-4pl-analysis"
@@ -2983,6 +2983,9 @@ def generate_html_report(results, html_path, msd_path, units=None,
                 'nLevelsRun': (len(res['accuracy']['levels'])
                                if res.get('accuracy') else 0),
                 'divId': div_id,
+                # Where this curve's sample scatter sits, so a dilution-factor
+                # edit can move the points without rebuilding the figure.
+                'sampleTraceIdx': (sample_trace_idx if has_samples else None),
                 'fitTraceIdx': fit_trace_idx,
                 'label': label,
                 'lloqSig': (float(lloq_sig) if lloq_sig is not None and np.isfinite(lloq_sig) else None),
@@ -3129,6 +3132,9 @@ def generate_html_report(results, html_path, msd_path, units=None,
             _sample_tidx = len(overlay_fig.data)
             _group_trace_indices[group or ''].append(_sample_tidx)
             _overlay_sample_indices_by_group[group or ''].append(_sample_tidx)
+            _ock = f"p{plate}_s{spot}_{group or 'default'}"
+            if _ock in curve_raw_data:
+                curve_raw_data[_ock]['overlaySampleTraceIdx'] = _sample_tidx
             overlay_fig.add_trace(go.Scatter(
                 x=_unk_xs, y=_unk_ys,
                 mode='markers', name=f'{trace_label} samples',
@@ -3488,6 +3494,11 @@ def generate_html_report(results, html_path, msd_path, units=None,
     _sp_entries = []
     tp_index = defaultdict(int)
     unk_rows_html = []
+    # Registry linking each All Unknowns row to everything a dilution-factor
+    # edit has to move: the curve it belongs to, its own replicate points, its
+    # total protein, and its slot in the Sample Plots data.
+    _unk_rows = []
+    _unk_row_n = 0
     has_group = bool(animal_group_map)   # show Study Group column only when ELISA group #s loaded
     for (sname, group, plate, spot_key), data in sorted(all_unk_groups.items()):
         spot         = data['spot']
@@ -3552,10 +3563,15 @@ def generate_html_report(results, html_path, msd_path, units=None,
                     if tp_val is not None and np.isfinite(corrected) and tp_val != 0
                     else None)
 
+        _row_id = f'unkrow_{_unk_row_n}'
+        _unk_row_n += 1
+        _sp_analyte = group or 'Default'
         if np.isfinite(corrected):
-            _sp_entries.append({'analyte': group or 'Default', 'sample': sname,
+            _sp_entries.append({'analyte': _sp_analyte, 'sample': sname,
                                 'conc': float(corrected),
                                 'norm': float(norm_val) if norm_val is not None else None,
+                                'tp': float(tp_val) if tp_val is not None else None,
+                                'rowId': _row_id,
                                 'flag': flag, 'plate': plate,
                                 'tissue': tissue, 'groupNum': study_group})
 
@@ -3580,15 +3596,38 @@ def generate_html_report(results, html_path, msd_path, units=None,
         excl_td = (f'<td class="msd-excl-cell"><input type="checkbox" class="msd-excl-cb" '
                    f'data-sample="{sname_attr}" onchange="msdToggleExcludeRow(this)" '
                    f'title="Remove {sname_attr} from the Sample Plots charts"></td>')
+        _curve_key = f"p{plate}_s{spot}_{group or 'default'}"
+        # Per-well points this row contributes to the curve's sample scatter,
+        # pre-filtered exactly as the server-side trace filters them so the
+        # client rebuild reproduces the same point set.
+        _row_pts = [[float(r['conc']), float(r['signal'])]
+                    for r in data['reps']
+                    if (np.isfinite(r.get('signal', np.nan)) and r['signal'] > 0
+                        and np.isfinite(r.get('conc', np.nan)) and r['conc'] > 0)]
+        _unk_rows.append({
+            'rowId': _row_id, 'curveKey': _curve_key, 'sample': sname,
+            'avgConc': float(avg_conc) if np.isfinite(avg_conc) else None,
+            'factor': float(factor), 'tp': float(tp_val) if tp_val is not None else None,
+            'isQC': bool(_identify_qc_level(sname)),
+            'pts': _row_pts, 'spAnalyte': _sp_analyte, 'spPlate': plate,
+        })
+        _df_input = (f"<input type='number' class='msd-df-input' step='any' min='0' "
+                     f"value='{factor:g}' data-default='{factor:g}' "
+                     f"data-row='{_row_id}' "
+                     f"oninput=\"msdSetDilution(this)\" "
+                     f"title='Edit to re-apply the dilution factor for this sample'>")
         unk_rows_html.append(
-            f"<tr>{excl_td}<td>{sname}</td><td>{animal_str}</td><td>{tissue_str}</td>"
+            f"<tr id='{_row_id}' data-curvekey='{_curve_key}'>"
+            f"{excl_td}<td>{sname}</td><td>{animal_str}</td><td>{tissue_str}</td>"
             f"{group_td}"
-            f"<td>{plate}</td><td>{spot}</td><td>{group}</td>"
-            f"<td>{', '.join(data['wells'])}</td><td>{avg_sig_str}</td>"
-            f"<td>{avg_conc_str}</td><td class='{cv_class}'>{cv_str}</td>"
-            f"<td class='{flag_class}'>{flag}</td>"
-            f"<td>{factor_str}</td><td>{corr_str}</td>"
-            f"<td>{tp_str}</td><td>{norm_str}</td></tr>"
+            f"<td class='num'>{plate}</td><td class='num'>{spot}</td><td>{group}</td>"
+            f"<td>{', '.join(data['wells'])}</td><td class='num'>{avg_sig_str}</td>"
+            f"<td class='num'>{avg_conc_str}</td><td class='num {cv_class}'>{cv_str}</td>"
+            f"<td><span class='{flag_class}'>{flag}</span></td>"
+            f"<td class='num'>{_df_input}</td>"
+            f"<td class='num'><span class='msd-corr'>{corr_str}</span></td>"
+            f"<td class='num'>{tp_str}</td>"
+            f"<td class='num'><span class='msd-norm'>{norm_str}</span></td></tr>"
         )
 
     # ── Sample plot JSON ──────────────────────────────────────────────────────
@@ -3598,6 +3637,7 @@ def generate_html_report(results, html_path, msd_path, units=None,
     for e in _sp_entries:
         _sp_by_analyte[e['analyte']][(e['sample'], e['plate'])].append(
             {'conc': e['conc'], 'norm': e.get('norm'), 'flag': e['flag'],
+             'tp': e.get('tp'), 'rowId': e.get('rowId'),
              'tissue': e.get('tissue'), 'groupNum': e.get('groupNum')})
 
     _sp_has_norm = any(e.get('norm') is not None for e in _sp_entries)
@@ -3633,9 +3673,14 @@ def generate_html_report(results, html_path, msd_path, units=None,
                 'mean': _sp_mean, 'sd': _sp_sd, 'values': _sp_concs,
                 'normMean': _sp_norm_mean, 'normSd': _sp_norm_sd, 'normValues': _sp_norms,
                 'flags': _sp_flags, 'anyFlagged': _sp_any_flagged,
-                'tissue': _sp_tissue, 'groupNum': _sp_groupnum
+                'tissue': _sp_tissue, 'groupNum': _sp_groupnum,
+                # rowIds/tps are aligned with `values`, so a dilution edit on a
+                # given All Unknowns row can find and recompute its own slot.
+                'rowIds': [_e.get('rowId') for _e in _sp_elist],
+                'tps': [_e.get('tp') for _e in _sp_elist],
             })
     _sp_json = _json.dumps(_sp_data)
+    _unk_rows_json = _json.dumps(_unk_rows)
 
     # ── QC plot JSON (uses qc_data from the same _aggregate_unknowns call) ──────
     _qp_entries = []
@@ -3787,7 +3832,7 @@ def generate_html_report(results, html_path, msd_path, units=None,
         f"<th onclick=\"sortTable(this)\">Avg Interp. Conc.{unit_suffix}</th>"
         "<th onclick=\"sortTable(this)\">%CV</th>"
         "<th onclick=\"sortTable(this)\">Flag</th>"
-        "<th onclick=\"sortTable(this)\">Dilution Factor</th>"
+        "<th class=\"num\" onclick=\"sortTable(this)\" title=\"Editable — re-applies to this sample everywhere\">Dilution Factor</th>"
         f"<th onclick=\"sortTable(this)\">Corrected Avg Conc.{unit_suffix}</th>"
         + tp_headers +
         "</tr>"
@@ -3980,6 +4025,20 @@ def generate_html_report(results, html_path, msd_path, units=None,
   td.flag-cell {{ color: var(--ink-2); font-size: 11.5px; max-width: 260px;
                   white-space: normal; line-height: 1.4; }}
   .cv-bad {{ background: var(--bad-bg) !important; color: var(--bad); font-weight: 600; }}
+  .msd-df-input {{ width: 78px; padding: 3px 6px; font-size: 12px; text-align: right;
+                   border: 1px solid var(--rule-strong); border-radius: 5px;
+                   background: var(--surface); color: var(--ink); font-family: inherit;
+                   font-variant-numeric: tabular-nums; }}
+  .msd-df-input:focus {{ outline: none; border-color: var(--brand-accent);
+                         box-shadow: 0 0 0 3px var(--focus); }}
+  .msd-df-input.msd-df-bad {{ border-color: var(--bad); background: var(--bad-bg); }}
+  tr.msd-row-dil-edited td {{ background: var(--modified-bg) !important; }}
+  tr.msd-row-dil-edited .msd-corr,
+  tr.msd-row-dil-edited .msd-norm {{ font-weight: 700; }}
+  .msd-dil-banner {{ display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+                     border: 1px solid var(--rule-strong); border-left: 3px solid var(--warn);
+                     border-radius: 8px; padding: 8px 12px; margin-bottom: 10px;
+                     background: var(--surface-2); font-size: 12px; color: var(--ink); }}
   .msd-excl-cell {{ text-align: center; }}
   .msd-excl-cb {{ cursor: pointer; width: 15px; height: 15px; accent-color: var(--brand); }}
   tr.msd-row-excluded td {{ opacity: 0.4; text-decoration: line-through; }}
@@ -4207,6 +4266,8 @@ def generate_html_report(results, html_path, msd_path, units=None,
     </div>
     {qc_table_html}
     <h2>Standard Curve Overlay</h2>
+    <p class="hint">Sample points sit at their dilution-corrected concentration; editing a
+       factor in All Unknowns moves them here too.</p>
     <div class="section">
       {_overlay_btns}
       {overlay_div}
@@ -4215,7 +4276,10 @@ def generate_html_report(results, html_path, msd_path, units=None,
 
   <div id="tab-curves" class="tab-pane">
     <h2>Standard Curves</h2>
-    <p class="hint">Uncheck calibrator points below a curve to drop them and re-fit live — R² and Status update here and in the Summary table above.</p>
+    <p class="hint">Uncheck calibrator points below a curve to drop them and re-fit live — R² and Status update here and in the Summary table above.
+       Sample points are plotted at their <em>dilution-corrected</em> concentration, so a
+       factor above 1 moves them to the right of the curve by design — the curve reads
+       concentration in the well, the corrected value is concentration in the original sample.</p>
     <div class="curves-grid">
       {curves_section_html}
     </div>
@@ -4244,6 +4308,13 @@ def generate_html_report(results, html_path, msd_path, units=None,
 
   <div id="tab-unknowns" class="tab-pane">
     <h2>All Unknowns</h2>
+    <p class="hint">Dilution factors are editable. Changing one re-applies it to that
+       sample's corrected and normalized concentration, moves its points on the
+       Standard Curves and the Standard Curve Overlay, and updates its Sample Plots bars.</p>
+    <div id="msd-dil-banner" class="msd-dil-banner" style="display:none;">
+      <span class="msd-dil-count"></span>
+      <button class="sp-btn sp-btn-icon" onclick="msdResetDilutions()">↺ Reset all dilution factors</button>
+    </div>
     <div class="filter-row">
       <input class="filter-input" type="search" placeholder="🔍  Filter unknowns…"
              oninput="filterTable(this.value,'unkTable')">
@@ -4517,8 +4588,16 @@ function sortTable(th) {{
   const dir = asc ? -1 : 1;
   const rows = Array.from(tbody.querySelectorAll('tr'));
   rows.sort((a, b) => {{
-    const av = a.cells[col]?.textContent.trim() ?? '';
-    const bv = b.cells[col]?.textContent.trim() ?? '';
+    // A cell holding an <input> (the editable dilution factor) has no
+    // textContent, so read the live value rather than sorting on empty strings.
+    const cellText = (tr) => {{
+      const cell = tr.cells[col];
+      if (!cell) return '';
+      const field = cell.querySelector('input, select');
+      return (field ? field.value : cell.textContent).trim();
+    }};
+    const av = cellText(a);
+    const bv = cellText(b);
     const an = parseFloat(av.replace(/[,%]/g, ''));
     const bn = parseFloat(bv.replace(/[,%]/g, ''));
     if (!isNaN(an) && !isNaN(bn)) return (an - bn) * dir;
@@ -4578,6 +4657,7 @@ function msdToggleCurveSamples(btn, divId, traceIdx) {{
 var HEATMAP_DATA = {_heatmap_json};
 var CURVE_DATA = {_curve_json};
 var SP_DATA = {_sp_json};
+var UNK_ROWS = {_unk_rows_json};
 var spInitialized = false;
 var spCurrentAnalyte = null;
 // Sample names removed from the chart entirely (shared across Per Group and
@@ -6817,6 +6897,195 @@ function msdUpdateSummaryRow(key, fit, cd, levels) {{
   cells[MSD_SUMCOL['Flags']].textContent = msdFlagsFor(fit, acc).join(', ');
   var st = msdStatusFor(fit.r2, acc, (cd && cd.nLevelsRun) || (levels || []).length);
   pill(iStatus, st.cls).textContent = st.label;
+}}
+
+// ── Editable dilution factors ─────────────────────────────────────────────────
+// Changing a dilution factor changes what a sample's concentration *means*, so
+// every place that concentration appears has to follow: the Corrected and
+// Normalized columns, the sample points on that curve's plot and on the
+// Standard Curve Overlay, and the Sample Plots bars. Leaving any of them stale
+// would have two parts of the same report disagreeing.
+var MSD_UNK_BY_ID = {{}};
+var MSD_UNK_BY_CURVE = {{}};
+(function msdIndexUnkRows() {{
+  (typeof UNK_ROWS === 'undefined' ? [] : UNK_ROWS).forEach(function(r) {{
+    MSD_UNK_BY_ID[r.rowId] = r;
+    (MSD_UNK_BY_CURVE[r.curveKey] = MSD_UNK_BY_CURVE[r.curveKey] || []).push(r);
+  }});
+}})();
+
+function msdFmtG(v, sig) {{
+  if (v === null || v === undefined || !isFinite(v)) return '';
+  var a = Math.abs(v);
+  if (a !== 0 && (a >= 1e6 || a < 1e-4)) return v.toExponential((sig || 4) - 1);
+  return parseFloat(v.toPrecision(sig || 4)).toString();
+}}
+
+// Rebuild the sample scatter for one curve from the rows that feed it.
+// x, y and text are restyled together: the served trace lists its points in
+// well order, and restyling only x would leave the hover labels attached to
+// the wrong points.
+function msdRefreshCurveSamples(curveKey) {{
+  var rows = MSD_UNK_BY_CURVE[curveKey];
+  var cd = (typeof CURVE_DATA === 'undefined') ? null : CURVE_DATA[curveKey];
+  if (!rows || !cd) return;
+  var xs = [], ys = [], names = [];
+  rows.forEach(function(r) {{
+    if (r.isQC) return;                     // QC is not plotted on the curves
+    var tag = (r.factor !== 1) ? (r.sample + ' (\u00d7' + msdFmtG(r.factor, 4) + ')')
+                               : r.sample;
+    r.pts.forEach(function(pt) {{
+      xs.push(pt[0] * r.factor);
+      ys.push(pt[1]);
+      names.push(tag);
+    }});
+  }});
+  if (cd.sampleTraceIdx !== null && cd.sampleTraceIdx !== undefined) {{
+    var gd = document.getElementById(cd.divId);
+    if (gd && gd.data) {{
+      try {{
+        Plotly.restyle(gd, {{ x: [xs], y: [ys], text: [names] }}, [cd.sampleTraceIdx]);
+      }} catch (e) {{ /* figure not drawn yet */ }}
+    }}
+  }}
+  if (cd.overlaySampleTraceIdx !== null && cd.overlaySampleTraceIdx !== undefined) {{
+    var ogd = document.getElementById('overlay_chart');
+    if (ogd && ogd.data) {{
+      try {{
+        Plotly.restyle(ogd, {{ x: [xs], y: [ys], text: [names] }}, [cd.overlaySampleTraceIdx]);
+      }} catch (e) {{ /* overlay not drawn yet */ }}
+    }}
+  }}
+}}
+
+// Push a row's new corrected concentration into the Sample Plots dataset.
+function msdRefreshSamplePlots(rows) {{
+  if (typeof SP_DATA === 'undefined' || !SP_DATA.samples) return false;
+  var touched = false;
+  rows.forEach(function(r) {{
+    var list = SP_DATA.samples[r.spAnalyte];
+    if (!list) return;
+    list.forEach(function(entry) {{
+      if (!entry.rowIds) return;
+      var i = entry.rowIds.indexOf(r.rowId);
+      if (i < 0) return;
+      var conc = (r.avgConc === null) ? null : r.avgConc * r.factor;
+      if (conc === null || !isFinite(conc)) return;
+      entry.values[i] = conc;
+      // normValues is the non-null subset of values/tps, so rebuild it whole
+      // rather than trying to index into it.
+      var nv = [];
+      for (var j = 0; j < entry.values.length; j++) {{
+        var tp = entry.tps ? entry.tps[j] : null;
+        if (tp) nv.push(entry.values[j] / tp);
+      }}
+      entry.normValues = nv;
+      entry.mean = msdMean(entry.values);
+      entry.sd = msdSd(entry.values);
+      entry.normMean = nv.length ? msdMean(nv) : null;
+      entry.normSd = nv.length ? msdSd(nv) : (nv.length ? 0 : null);
+      touched = true;
+    }});
+  }});
+  return touched;
+}}
+
+function msdMean(a) {{
+  var s = 0, n = 0;
+  for (var i = 0; i < a.length; i++) if (isFinite(a[i])) {{ s += a[i]; n++; }}
+  return n ? s / n : 0;
+}}
+function msdSd(a) {{
+  var v = a.filter(function(x) {{ return isFinite(x); }});
+  if (v.length < 2) return 0;
+  var m = msdMean(v), q = 0;
+  for (var i = 0; i < v.length; i++) q += Math.pow(v[i] - m, 2);
+  return Math.sqrt(q / (v.length - 1));
+}}
+
+function msdRedrawSamplePlots() {{
+  try {{
+    if (typeof spRenderChart === 'function' &&
+        document.getElementById('sp-chart') &&
+        document.getElementById('sp-chart').data) {{
+      spRenderChart();
+    }}
+    if (typeof spRenderCollatedChart === 'function' &&
+        document.getElementById('sp-collated-chart') &&
+        document.getElementById('sp-collated-chart').data) {{
+      spRenderCollatedChart();
+    }}
+  }} catch (e) {{ /* tab never opened — it will build from the updated data */ }}
+}}
+
+function msdSetDilution(input) {{
+  var r = MSD_UNK_BY_ID[input.dataset.row];
+  if (!r) return;
+  var raw = input.value.trim();
+  var val = (raw === '') ? 1 : parseFloat(raw);
+  if (!isFinite(val) || val <= 0) {{
+    input.classList.add('msd-df-bad');
+    return;   // keep the previous factor until the entry is valid
+  }}
+  input.classList.remove('msd-df-bad');
+  r.factor = val;
+
+  var tr = document.getElementById(r.rowId);
+  var changed = Math.abs(val - parseFloat(input.dataset.default)) > 1e-12;
+  if (tr) {{
+    tr.classList.toggle('msd-row-dil-edited', changed);
+    var corrected = (r.avgConc === null) ? null : r.avgConc * val;
+    var corrEl = tr.querySelector('.msd-corr');
+    if (corrEl) corrEl.textContent = msdFmtG(corrected, 4);
+    var normEl = tr.querySelector('.msd-norm');
+    if (normEl) {{
+      normEl.textContent = (r.tp && corrected !== null && isFinite(corrected))
+        ? msdFmtG(corrected / r.tp, 6) : '';
+    }}
+  }}
+  msdRefreshCurveSamples(r.curveKey);
+  if (msdRefreshSamplePlots([r])) msdRedrawSamplePlots();
+  msdUpdateDilutionBanner();
+}}
+
+function msdResetDilutions() {{
+  var curves = {{}}, rows = [];
+  document.querySelectorAll('.msd-df-input').forEach(function(inp) {{
+    var r = MSD_UNK_BY_ID[inp.dataset.row];
+    if (!r) return;
+    inp.value = inp.dataset.default;
+    inp.classList.remove('msd-df-bad');
+    r.factor = parseFloat(inp.dataset.default);
+    var tr = document.getElementById(r.rowId);
+    if (tr) tr.classList.remove('msd-row-dil-edited');
+    if (tr) {{
+      var corrected = (r.avgConc === null) ? null : r.avgConc * r.factor;
+      var corrEl = tr.querySelector('.msd-corr');
+      if (corrEl) corrEl.textContent = msdFmtG(corrected, 4);
+      var normEl = tr.querySelector('.msd-norm');
+      if (normEl) normEl.textContent = (r.tp && corrected !== null)
+        ? msdFmtG(corrected / r.tp, 6) : '';
+    }}
+    curves[r.curveKey] = true;
+    rows.push(r);
+  }});
+  Object.keys(curves).forEach(msdRefreshCurveSamples);
+  if (msdRefreshSamplePlots(rows)) msdRedrawSamplePlots();
+  msdUpdateDilutionBanner();
+}}
+
+// The plotted concentrations no longer match the Excel file once a factor is
+// edited, so say so rather than letting the two drift apart silently.
+function msdUpdateDilutionBanner() {{
+  var n = document.querySelectorAll('tr.msd-row-dil-edited').length;
+  var el = document.getElementById('msd-dil-banner');
+  if (!el) return;
+  el.style.display = n ? '' : 'none';
+  var label = el.querySelector('.msd-dil-count');
+  if (label) {{
+    label.textContent = n + (n === 1 ? ' sample has' : ' samples have') +
+      ' an edited dilution factor — the Excel file still holds the original values.';
+  }}
 }}
 
 // ── Suggested calibrator drops ────────────────────────────────────────────────
