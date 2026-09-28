@@ -130,7 +130,7 @@ import copy
 import threading, urllib.request
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 
-__version__ = "1.20.0"
+__version__ = "1.21.0"
 
 # ── Auto-update check ─────────────────────────────────────────────────────────
 _GITHUB_REPO  = "aomer92/msd-4pl-analysis"
@@ -3681,6 +3681,7 @@ def generate_html_report(results, html_path, msd_path, units=None,
             })
     _sp_json = _json.dumps(_sp_data)
     _unk_rows_json = _json.dumps(_unk_rows)
+    _msd_basename_json = _json.dumps(os.path.basename(msd_path))
 
     # ── QC plot JSON (uses qc_data from the same _aggregate_unknowns call) ──────
     _qp_entries = []
@@ -4351,6 +4352,9 @@ def generate_html_report(results, html_path, msd_path, units=None,
           <option value="group">Group Number</option>
           <option value="tissue">Tissue Type</option>
         </select>
+        <button class="sp-btn sp-btn-primary sp-btn-icon" style="margin-left:auto;"
+                onclick="msdExportSampleCSV('single')"
+                title="Download the grouped values behind this chart as CSV">⬇ Download CSV</button>
       </div>
       <div style="display:grid;grid-template-columns:280px 1fr;gap:16px;margin-bottom:16px;">
         <div style="display:flex;flex-direction:column;gap:10px;">
@@ -4410,6 +4414,9 @@ def generate_html_report(results, html_path, msd_path, units=None,
           <option value="group">Group Number</option>
           <option value="tissue">Tissue Type</option>
         </select>
+        <button class="sp-btn sp-btn-primary sp-btn-icon" style="margin-left:auto;"
+                onclick="msdExportSampleCSV('collated')"
+                title="Download the grouped values behind this chart as CSV">⬇ Download CSV</button>
       </div>
       <!-- 2-column layout matching Per Group -->
       <div style="display:grid;grid-template-columns:280px 1fr;gap:16px;margin-bottom:16px;">
@@ -4658,6 +4665,7 @@ var HEATMAP_DATA = {_heatmap_json};
 var CURVE_DATA = {_curve_json};
 var SP_DATA = {_sp_json};
 var UNK_ROWS = {_unk_rows_json};
+var MSD_SOURCE_FILE = {_msd_basename_json};
 var spInitialized = false;
 var spCurrentAnalyte = null;
 // Sample names removed from the chart entirely (shared across Per Group and
@@ -6897,6 +6905,240 @@ function msdUpdateSummaryRow(key, fit, cd, levels) {{
   cells[MSD_SUMCOL['Flags']].textContent = msdFlagsFor(fit, acc).join(', ');
   var st = msdStatusFor(fit.r2, acc, (cd && cd.nLevelsRun) || (levels || []).length);
   pill(iStatus, st.cls).textContent = st.label;
+}}
+
+// ── Sample Plots CSV export ───────────────────────────────────────────────────
+// Wide layout: one column per group, samples stacking down it — the shape
+// GraphPad expects for a grouped/column analysis, so the first block pastes
+// straight in. A wide grid has nowhere to put a per-value status column, so
+// rather than doubling the width the file is written as four selectable blocks:
+// the paste-ready values, the same grid as sample identities (a grid of bare
+// numbers is not auditable), everything held back with its reason, and the
+// context needed to reproduce the selection.
+function msdCsvCell(v) {{
+  if (v === null || v === undefined) return '';
+  var t = String(v);
+  // Quote when the value holds a comma, a quote or a line break. The control
+  // characters come from fromCharCode rather than an escape: this function is
+  // emitted from a Python f-string, where a source-level escape for a newline
+  // collapses into a real one and breaks the JS string literal.
+  var CR = String.fromCharCode(13), LF = String.fromCharCode(10);
+  if (t.indexOf('"') >= 0 || t.indexOf(',') >= 0 ||
+      t.indexOf(CR) >= 0 || t.indexOf(LF) >= 0) {{
+    return '"' + t.replace(/"/g, '""') + '"';
+  }}
+  return t;
+}}
+
+function msdCsvRow(cells) {{
+  return cells.map(msdCsvCell).join(',');
+}}
+
+function msdCsvNum(v) {{
+  if (v === null || v === undefined || !isFinite(v)) return '';
+  return parseFloat(v.toPrecision(6)).toString();
+}}
+
+// Collect the columns behind whichever sub-tab is showing, plus everything
+// deliberately left out of them.
+function msdCollectSampleSelection(which) {{
+  var cols = [], held = [], ctx = {{}};
+
+  if (which === 'collated') {{
+    var analytes = (SP_DATA.analytes || []).filter(function(a) {{ return spCollatedActive.has(a); }});
+    var mode = spCollValueMode;
+    // A sample's collated value is its mean across the active analytes — the
+    // same quantity the group bar is built from.
+    var valueFor = function(sname) {{
+      var vals = [];
+      analytes.forEach(function(a) {{
+        (SP_DATA.samples[a] || []).forEach(function(d) {{
+          if (d.name !== sname) return;
+          var g = (mode === 'normalized' && d.normMean !== null && d.normMean !== undefined)
+            ? d.normMean : d.mean;
+          if (isFinite(g)) vals.push(g);
+        }});
+      }});
+      return vals.length ? msdMean(vals) : null;
+    }};
+    var showU = document.getElementById('sp-coll-show-unassigned');
+    showU = showU ? showU.checked : true;
+    var pushCol = function(name, samples, hiddenReason) {{
+      var rows = [];
+      samples.forEach(function(sname) {{
+        var reason = null;
+        if (spExcludedSamples.has(sname)) reason = 'excluded (\u2715 chip)';
+        else if (hiddenReason) reason = hiddenReason;
+        var v = valueFor(sname);
+        if (v === null) {{
+          held.push([name, sname, '', '', reason || 'no value for the active analytes']);
+          return;
+        }}
+        if (reason) held.push([name, sname, '', msdCsvNum(v), reason]);
+        else rows.push({{ label: sname, value: v }});
+      }});
+      if (rows.length) cols.push({{ name: name, rows: rows }});
+    }};
+    spCollGroups.forEach(function(g) {{
+      pushCol(g.name, g.samples, g.visible ? null : 'group hidden');
+    }});
+    pushCol('Unassigned', spCollUnassigned, showU ? null : 'unassigned hidden');
+    ctx = {{
+      view: 'Collated',
+      analyte: analytes.join(', ') || '(none active)',
+      valueLabel: (mode === 'normalized' ? 'Normalized concentration'
+                   : 'Concentration' + (SP_DATA.units ? ' (' + SP_DATA.units + ')' : '')),
+      grouping: msdAutoGroupLabel('sp-coll-autogroup-1', 'sp-coll-autogroup-2'),
+      note: (analytes.length > 1
+        ? 'Each value is that sample\u2019s mean across the active analytes.'
+        : '')
+    }};
+    return {{ cols: cols, held: held, ctx: ctx }};
+  }}
+
+  // ── Per Group ──
+  var all = SP_DATA.samples[spCurrentAnalyte] || [];
+  var mode2 = spValueMode;
+  var showUn = document.getElementById('sp-show-unassigned');
+  showUn = showUn ? showUn.checked : true;
+  var entriesFor = function(sname) {{
+    return all.filter(function(d) {{ return d.name === sname; }});
+  }};
+  var multiPlate = {{}};
+  all.forEach(function(d) {{ multiPlate[d.name] = (multiPlate[d.name] || 0) + 1; }});
+
+  var pushCol2 = function(name, samples, hiddenReason) {{
+    var rows = [];
+    samples.forEach(function(sname) {{
+      var ents = entriesFor(sname);
+      if (!ents.length) {{
+        held.push([name, sname, '', '', hiddenReason || 'no data for this analyte']);
+        return;
+      }}
+      ents.forEach(function(d) {{
+        var g = (mode2 === 'normalized' && d.normMean !== null && d.normMean !== undefined)
+          ? d.normMean : d.mean;
+        // Label matches the chart's x-axis: plate suffix only when the same
+        // sample was run on more than one plate.
+        var label = (multiPlate[sname] > 1) ? (sname + ' [P' + d.plate + ']') : sname;
+        var reason = null;
+        if (spExcludedSamples.has(sname)) reason = 'excluded (\u2715 chip)';
+        else if (spActivePlates && spActivePlates.size > 0 && !spActivePlates.has(d.plate)) {{
+          reason = 'plate ' + d.plate + ' filtered out';
+        }} else if (hiddenReason) reason = hiddenReason;
+        if (reason) held.push([name, label, d.plate, msdCsvNum(g), reason]);
+        else if (isFinite(g)) rows.push({{ label: label, value: g }});
+        else held.push([name, label, d.plate, '', 'no value']);
+      }});
+    }});
+    if (rows.length) cols.push({{ name: name, rows: rows }});
+  }};
+
+  spGroups.forEach(function(g) {{
+    pushCol2(g.name, g.samples, g.visible ? null : 'group hidden');
+  }});
+  pushCol2('Unassigned', spUnassigned, showUn ? null : 'unassigned hidden');
+
+  ctx = {{
+    view: 'Per Group',
+    analyte: spCurrentAnalyte || '',
+    valueLabel: (mode2 === 'normalized' ? 'Normalized concentration'
+                 : 'Concentration' + (SP_DATA.units ? ' (' + SP_DATA.units + ')' : '')),
+    grouping: msdAutoGroupLabel('sp-autogroup-1', 'sp-autogroup-2'),
+    note: 'One row per plotted bar \u2014 one value per sample and plate.'
+  }};
+  return {{ cols: cols, held: held, ctx: ctx }};
+}}
+
+function msdAutoGroupLabel(id1, id2) {{
+  var label = {{ group: 'Group Number', tissue: 'Tissue Type' }};
+  var modes = spReadAutoModes(id1, id2);
+  return modes.length ? modes.map(function(m) {{ return label[m] || m; }}).join(' \u00b7 ')
+                      : 'Manual (no auto-grouping)';
+}}
+
+function msdExportSampleCSV(which) {{
+  var sel = msdCollectSampleSelection(which);
+  if (!sel.cols.length && !sel.held.length) {{
+    alert('Nothing to export — no samples are currently selected on this chart.');
+    return;
+  }}
+  var lines = [];
+  var headers = sel.cols.map(function(c) {{ return c.name; }});
+  var depth = sel.cols.reduce(function(m, c) {{ return Math.max(m, c.rows.length); }}, 0);
+
+  // Block 1 — values, paste-ready
+  lines.push(msdCsvRow(headers));
+  for (var i = 0; i < depth; i++) {{
+    lines.push(msdCsvRow(sel.cols.map(function(c) {{
+      return i < c.rows.length ? msdCsvNum(c.rows[i].value) : '';
+    }})));
+  }}
+
+  // Block 2 — the same grid as identities, so the numbers above are auditable
+  lines.push('');
+  lines.push('Sample identity (same grid as above)');
+  lines.push(msdCsvRow(headers));
+  for (i = 0; i < depth; i++) {{
+    lines.push(msdCsvRow(sel.cols.map(function(c) {{
+      return i < c.rows.length ? c.rows[i].label : '';
+    }})));
+  }}
+
+  // Block 3 — what was held back, and why
+  lines.push('');
+  if (sel.held.length) {{
+    lines.push('Not included above (' + sel.held.length + ')');
+    lines.push(msdCsvRow(['Group', 'Sample', 'Plate', 'Value', 'Reason']));
+    sel.held.forEach(function(h) {{ lines.push(msdCsvRow(h)); }});
+  }} else {{
+    lines.push('Not included above: none — every sample in the selection is in the grid.');
+  }}
+
+  // Block 4 — how to reproduce this selection
+  lines.push('');
+  lines.push('Export context');
+  lines.push(msdCsvRow(['Field', 'Value']));
+  lines.push(msdCsvRow(['Source', (typeof MSD_SOURCE_FILE !== 'undefined') ? MSD_SOURCE_FILE : '']));
+  lines.push(msdCsvRow(['View', sel.ctx.view]));
+  lines.push(msdCsvRow(['Analyte', sel.ctx.analyte]));
+  lines.push(msdCsvRow(['Values', sel.ctx.valueLabel]));
+  lines.push(msdCsvRow(['Grouped by', sel.ctx.grouping]));
+  sel.cols.forEach(function(c) {{
+    lines.push(msdCsvRow(['n \u2014 ' + c.name, c.rows.length]));
+  }});
+  if (sel.ctx.note) lines.push(msdCsvRow(['Note', sel.ctx.note]));
+  if (document.querySelectorAll('tr.msd-row-dil-edited').length) {{
+    lines.push(msdCsvRow(['Note', 'Includes manually edited dilution factors — '
+      + 'these values differ from the Excel workbook.']));
+  }}
+  lines.push(msdCsvRow(['Generated', new Date().toLocaleString()]));
+
+  var slug = function(t) {{
+    return String(t || '').replace(/[^A-Za-z0-9._-]+/g, '-').replace(/^-+|-+$/g, '') || 'export';
+  }};
+  var fname = [slug(sel.ctx.analyte), slug(sel.ctx.view),
+               (which === 'collated' ? spCollValueMode : spValueMode),
+               new Date().toISOString().slice(0, 10)].join('_') + '.csv';
+  // Leading BOM so Excel reads the UTF-8 group labels (which contain '·')
+  var BOM = String.fromCharCode(0xFEFF);
+  var EOL = String.fromCharCode(13) + String.fromCharCode(10);
+  msdDownloadText(BOM + lines.join(EOL) + EOL, fname, 'text/csv;charset=utf-8');
+}}
+
+function msdDownloadText(text, filename, mime) {{
+  try {{
+    var blob = new Blob([text], {{ type: mime || 'text/plain;charset=utf-8' }});
+    var url = URL.createObjectURL(blob);
+    var a = document.createElement('a');
+    a.href = url; a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    setTimeout(function() {{ URL.revokeObjectURL(url); }}, 2000);
+  }} catch (e) {{
+    alert('Could not start the download: ' + e.message);
+  }}
 }}
 
 // ── Editable dilution factors ─────────────────────────────────────────────────
